@@ -1,0 +1,4 @@
+  numpy
+  omegaconf
+  torch>=1.13.0
+  einops; python_version >= "3.10"
