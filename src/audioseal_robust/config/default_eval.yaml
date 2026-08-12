@@ -19,8 +19,12 @@ batch_size: 8
 n_eval_batches: 20
 output_dir: ./eval_outputs
 
+# See EvalConfig.t_star_grid in config.py for how these were calibrated
+# (mentor's curriculum table: t*=0.3..40 out of T=1000, NOT [0,1] fractions
+# of full strength -- the old [0.0 .. 1.0] grid went ~25x past their "hard
+# regime" and just destroys the audio).
 fpr_target: 0.01
-t_star_grid: [0.0, 0.1, 0.2, 0.3, 0.5, 0.7, 1.0]
+t_star_grid: [0.0, 0.0003, 0.002, 0.006, 0.015, 0.04, 0.08]
 
 eval_attacks: [identity, bigvgan, dac, sgmse]
 held_out_attacks: [diff_erase]
