@@ -25,6 +25,7 @@ graph itself) -- see `build_detector` and `attacks.py` for why gradients
 still reach `x_wm`.
 """
 
+import itertools
 import logging
 import os
 import random
@@ -41,7 +42,7 @@ from .attacks import BigVGANAttack, DACAttack, IdentityAttack, SGMSEAttack, Samp
 from .config import TrainConfig, load_config
 from .data import build_dataloader
 from .device import resolve_device
-from .losses import PsychoacousticMelLoss, detection_loss
+from .losses import PsychoacousticMelLoss, detection_loss_components
 from .tracking import ExperimentTracker, build_tracker
 
 logger = logging.getLogger(__name__)
@@ -141,6 +142,23 @@ def build_perceptual_loss(cfg: TrainConfig, device: torch.device) -> Psychoacous
     ).to(device)
 
 
+def _grad_norm(module: nn.Module) -> float:
+    """L2 norm over all parameters of `module` that currently have a
+    gradient. For a frozen module (requires_grad=False on every param, e.g.
+    `attack` -- see build_attack/build_detector), no leaf tensor ever
+    accumulates .grad regardless of what the backward graph passed through
+    it, so this is always exactly 0.0 -- logging it every step is a running,
+    real-training confirmation of that invariant (the one-shot version of
+    this is tests/test_audioseal_robust.py::test_gradients_flow_to_generator_only's
+    `assert all(p.grad is None for p in detector.parameters())`), not just a
+    number that happens to be small."""
+    total_sq = 0.0
+    for p in module.parameters():
+        if p.grad is not None:
+            total_sq += p.grad.detach().float().norm(2).item() ** 2
+    return total_sq**0.5
+
+
 def train_step(
     generator: AudioSealWM,
     detector: AudioSealDetector,
@@ -166,13 +184,15 @@ def train_step(
     p = presence[:, 1, :].mean(dim=-1)  # presence prob per example, pooled over time
 
     # 4. losses
-    det_loss = detection_loss(p, m_hat, message)
+    det_loss, presence_loss, bit_loss = detection_loss_components(p, m_hat, message)
     perc_loss = perceptual_loss_fn(x, x_wm)  # pre-attack, per spec
     total_loss = cfg.lambda_det * det_loss + cfg.lambda_perc * perc_loss
 
     # 5. backprop through detector + attack (frozen but differentiable) into G_theta
     optimizer.zero_grad(set_to_none=True)
     total_loss.backward()
+    grad_norm_generator = _grad_norm(generator)
+    grad_norm_attack = _grad_norm(attack)  # expected: always 0.0, see _grad_norm's docstring
     if cfg.optim.max_norm is not None:
         torch.nn.utils.clip_grad_norm_(generator.parameters(), cfg.optim.max_norm)
     optimizer.step()
@@ -180,6 +200,49 @@ def train_step(
     return {
         "loss": total_loss.item(),
         "detection_loss": det_loss.item(),
+        "presence_loss": presence_loss.item(),
+        "bit_loss": bit_loss.item(),
+        "perceptual_loss": perc_loss.item(),
+        "presence_prob": p.mean().item(),
+        "grad_norm_generator": grad_norm_generator,
+        "grad_norm_attack": grad_norm_attack,
+        "attack": attack_name,
+    }
+
+
+@torch.no_grad()
+def eval_step(
+    generator: AudioSealWM,
+    detector: AudioSealDetector,
+    attack: SampledReconstructionAttack,
+    perceptual_loss_fn: PsychoacousticMelLoss,
+    batch: torch.Tensor,
+    cfg: TrainConfig,
+    device: torch.device,
+) -> tp.Dict[str, tp.Union[float, str]]:
+    """Same forward computation as train_step (same loss formula, same
+    sampled-attack call), just no backward/optimizer step -- for periodic
+    train-vs-eval loss comparison during training (see TrainConfig.eval_every
+    and DataConfig.valid_dir)."""
+    generator.eval()
+    try:
+        x = batch.to(device)
+        message = random_message(cfg.nbits, x.size(0), device=x.device)
+        x_wm = embed_watermark(generator, x, message, cfg.watermark_snr_db_min, cfg.watermark_snr_db_max)
+        x_att, attack_name = attack(x_wm)
+        presence, m_hat = detector.forward(x_att)
+        p = presence[:, 1, :].mean(dim=-1)
+        det_loss, presence_loss, bit_loss = detection_loss_components(p, m_hat, message)
+        perc_loss = perceptual_loss_fn(x, x_wm)
+        total_loss = cfg.lambda_det * det_loss + cfg.lambda_perc * perc_loss
+    finally:
+        generator.train()  # train_step assumes the generator stays in train() mode
+
+    return {
+        "loss": total_loss.item(),
+        "detection_loss": det_loss.item(),
+        "presence_loss": presence_loss.item(),
+        "bit_loss": bit_loss.item(),
         "perceptual_loss": perc_loss.item(),
         "presence_prob": p.mean().item(),
         "attack": attack_name,
@@ -220,6 +283,21 @@ def train(cfg: TrainConfig) -> None:
         num_workers=cfg.data.num_workers,
     )
 
+    # eval_every=0 (default) disables this entirely; a nonzero value needs
+    # valid_dir set too, since there's nothing to evaluate on otherwise.
+    valid_iter: tp.Optional[tp.Iterator[torch.Tensor]] = None
+    if cfg.eval_every:
+        if not cfg.data.valid_dir:
+            raise ValueError("eval_every is set but data.valid_dir is not -- nothing to evaluate on")
+        valid_dataloader = build_dataloader(
+            cfg.data.valid_dir,
+            sample_rate=cfg.sample_rate,
+            segment_duration=cfg.data.segment_duration,
+            batch_size=cfg.data.batch_size,
+            num_workers=cfg.data.num_workers,
+        )
+        valid_iter = itertools.cycle(valid_dataloader)  # valid set is usually far smaller than epochs*updates
+
     os.makedirs(cfg.checkpoint_dir, exist_ok=True)
 
     step = 0
@@ -229,6 +307,16 @@ def train(cfg: TrainConfig) -> None:
                 metrics = train_step(generator, detector, attack, perceptual_loss_fn, optimizer, batch, cfg, device)
                 scalar_metrics = {k: v for k, v in metrics.items() if isinstance(v, (int, float))}
                 tracker.log(scalar_metrics, step=step)
+                if valid_iter is not None and step % cfg.eval_every == 0:
+                    eval_metrics = eval_step(
+                        generator, detector, attack, perceptual_loss_fn, next(valid_iter), cfg, device
+                    )
+                    eval_scalar_metrics = {
+                        f"eval/{k}": v for k, v in eval_metrics.items() if isinstance(v, (int, float))
+                    }
+                    tracker.log(eval_scalar_metrics, step=step)
+                    if step % cfg.log_every == 0:
+                        logger.info("epoch=%d step=%d eval=%s", epoch, step, eval_metrics)
                 if cfg.tracking.log_audio_every and step % cfg.tracking.log_audio_every == 0:
                     with torch.no_grad():
                         sample_x = batch[:1].to(device)

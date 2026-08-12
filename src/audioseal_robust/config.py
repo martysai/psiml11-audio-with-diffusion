@@ -174,6 +174,11 @@ class TrainConfig:
     epochs: int = 100
     updates_per_epoch: int = 1000
     log_every: int = 50
+    # 0 disables eval-loss logging entirely. When set, every eval_every steps
+    # runs one no-grad forward pass over a batch from data.valid_dir (must
+    # also be set) and logs it under the "eval/" prefix, alongside training
+    # loss -- see train.py:eval_step.
+    eval_every: int = 0
     checkpoint_dir: str = "./checkpoints/audioseal_robust"
     seed: int = 1234
 
