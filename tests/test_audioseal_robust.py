@@ -18,6 +18,7 @@ pretrained checkpoint) so this runs fast and offline.
 import copy
 import os
 import sys
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -45,7 +46,7 @@ from audioseal_robust.attacks import (
 from audioseal_robust.config import load_config, load_eval_config
 from audioseal_robust.evaluate import build_eval_attacks
 from audioseal_robust.losses import PsychoacousticMelLoss, detection_loss
-from audioseal_robust.train import embed_watermark
+from audioseal_robust.train import embed_watermark, validate
 
 
 def _tiny_seanet_config() -> SEANetConfig:
@@ -171,6 +172,49 @@ def test_gradients_flow_to_generator_only():
         assert torch.equal(detector_state_before[key], detector_state_after[key]), (
             f"detector param {key} changed after optimizer.step()"
         )
+
+
+def test_validate_does_not_update_generator_and_restores_train_mode():
+    """Regression test for train.py's in-training validation (data.valid_dir):
+    validate() must never touch generator parameters/gradients (it's a
+    read-only health check, not a second optimizer path) and must leave the
+    generator back in train() mode so the next real training step behaves
+    normally -- even though it puts the generator in eval() internally for
+    the duration of the validation batches."""
+    torch.manual_seed(0)
+    nbits = 4
+
+    generator = _tiny_generator(nbits)
+    generator.train()
+    detector = _tiny_detector(nbits)
+    detector.eval()
+    for p in detector.parameters():
+        p.requires_grad_(False)
+
+    attack = SampledReconstructionAttack({"identity": IdentityAttack()}, {"identity": 1.0})
+    perc_loss_fn = PsychoacousticMelLoss(
+        sample_rate=16_000, n_fft=256, hop_length=64, win_length=256, n_mels=16
+    )
+
+    params_before = [p.detach().clone() for p in generator.parameters()]
+    fake_valid_batches = [torch.randn(2, 1, 4000) for _ in range(3)]
+    cfg = SimpleNamespace(
+        nbits=nbits,
+        watermark_snr_db_min=24.0,
+        watermark_snr_db_max=36.0,
+        lambda_det=1.0,
+        lambda_perc=1.0,
+        valid_batches=2,  # less than len(fake_valid_batches): confirms the cap is honored
+    )
+
+    metrics = validate(generator, detector, attack, perc_loss_fn, fake_valid_batches, cfg, torch.device("cpu"))
+
+    assert generator.training, "validate() must restore train() mode before returning"
+    assert all(p.grad is None for p in generator.parameters()), "validate() must never leave gradients on the generator"
+    assert all(
+        torch.equal(before, after) for before, after in zip(params_before, generator.parameters())
+    ), "validate() must never update generator parameters"
+    assert set(metrics.keys()) == {"loss", "detection_loss", "perceptual_loss", "presence_prob"}
 
 
 def test_sampled_attack_only_picks_enabled_branches():

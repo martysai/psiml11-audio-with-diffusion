@@ -165,6 +165,13 @@ class OptimConfig:
 @dataclass
 class DataConfig:
     train_dir: str = "???"  # directory of 16kHz wav files, set on the CLI
+    # None (default) disables in-training validation. When set, train.py
+    # builds a second, shuffle=False dataloader over this directory and runs
+    # it (no grad, generator.eval()) once per epoch -- see
+    # TrainConfig.valid_batches for how many batches that covers. Should be
+    # audio the generator never trains on (same "held-out" idea as
+    # EvalConfig.eval_dir), otherwise this just measures training-set fit
+    # again under a different name.
     valid_dir: tp.Optional[str] = None
     segment_duration: float = 1.0  # seconds
     batch_size: int = 16
@@ -194,6 +201,12 @@ class TrainConfig:
     log_every: int = 50
     checkpoint_dir: str = "./checkpoints/audioseal_robust"
     seed: int = 1234
+
+    # Caps how many data.valid_dir batches train.py's validate() averages
+    # over at each epoch boundary -- only takes effect if data.valid_dir is
+    # set. Same reasoning as EvalConfig.n_eval_batches: a large valid_dir
+    # shouldn't make every epoch boundary slow.
+    valid_batches: int = 10
 
     # Name of a bundle under config/recipes.yaml's `train:` section (e.g.
     # "diff_erase" or "sgmse"), merged in on top of this schema/default.yaml
