@@ -151,30 +151,42 @@ class SGMSEAttack(nn.Module):
     (multiple reverse-diffusion steps), so backprop through it means
     backprop through every step -- this can be memory-heavy and you may want
     to cap `num_steps` low during training, or backprop through only the
-    last K steps, rather than the full inference-time step count.
+    last K steps, rather than the full inference-time step count. Unlike
+    DiffEraseAttack (held-out, eval-only, always under torch.no_grad()),
+    this one's forward pass is NOT wrapped in no_grad -- it's meant to be
+    trainable-against, so gradients must reach back through it into the
+    generator (frozen params via requires_grad_(False), but the graph stays
+    connected, same "frozen but differentiable" pattern as BigVGAN/DAC).
 
-    TODO(setup): not vendored/installed yet. To enable:
-      1. Get SGMSE source (e.g. github.com/sp-uhh/sgmse) and a pretrained
-         checkpoint (their released checkpoints are usually 16kHz, which
-         matches this pipeline).
-      2. Fill in `_load_backbone` below with model construction + checkpoint
-         loading, and implement `forward` to run the (differentiable) reverse
-         SDE sampler for `num_steps` steps.
-      3. Remove the `NotImplementedError`s.
+    Wired to sp-uhh/sgmse (MIT licensed; vendored under src/sgmse/, see that
+    directory's VENDORED.md), an OU-VE SDE score model for speech
+    enhancement. Its mechanism is structurally different from
+    DiffEraseAttack's DDPM: there's no discrete `q_sample`/`p_sample` step
+    index -- the SDE runs in continuous time t in [t_eps, T=1], and the
+    predictor/corrector sampler always starts from the SDE's own prior at
+    t=T (centered on the input `y`, i.e. `x_wm` treated as "the noisy signal
+    to enhance"). To get a `strength`-parametrized *partial* corruption
+    (matching DiffEraseAttack's t* convention) rather than always running
+    the model's default full enhancement, `forward` manually replicates
+    `sgmse.sampling.get_pc_sampler`'s predictor-corrector loop (see that
+    function for the reference this mirrors) but starts from
+    `t_star = t_eps + strength * (T - t_eps)` instead of `T`, with the
+    initial noisy state built from the SDE's own `marginal_prob(x0=Y, y=Y,
+    t_star)` -- since x0=y=Y here (we only have one signal, not a genuine
+    clean/noisy pair), the mean term collapses to exactly Y and this reduces
+    to "add `std(t_star)`-scaled Gaussian noise to Y, then reverse-diffuse
+    from there," the direct SDE analogue of DiffEraseAttack's
+    `q_sample`-then-`p_sample` loop.
 
-    `strength` (the t* robustness-curve axis, see evaluate.py): SGMSE-style
-    diffusion purification works by forward-diffusing the input up to some
-    starting timestep t*, then reverse-diffusing (denoising) it back down --
-    the further you push t* toward 1, the more the input is corrupted before
-    regeneration, i.e. a *stronger* attack that erases more of the original
-    signal (including the watermark) but also more of the content. t*=0
-    means "no corruption" (should reduce to ~identity); t*=1 means "maximum
-    corruption then full regeneration". During training (see attacks.py's
-    SampledReconstructionAttack, called with strength=None from train.py),
-    sample t* randomly per step instead of fixing it -- that's what should
-    give robustness across attack strengths rather than just at whatever
-    single t* you'd otherwise hardcode; the evaluation robustness curve
-    (detection vs. t*) is the direct measurement of whether that worked.
+    `strength` (the t* robustness-curve axis, see evaluate.py): t*=0 means
+    "no corruption" (~identity); t*=1 means starting from the SDE's full
+    prior (maximum corruption before regeneration). NOTE: `t_star_grid`'s
+    default values in config.py were calibrated against DiffErase's DDPM
+    (T=1000 discrete steps) using the mentor's timestep table -- SGMSE's
+    noise schedule (OU-VE SDE, continuous t in [t_eps, 1]) is a different
+    process, so the same strength fractions likely correspond to a
+    different *qualitative* corruption level here. Not yet recalibrated
+    empirically for SGMSE specifically.
     """
 
     def __init__(
@@ -187,31 +199,97 @@ class SGMSEAttack(nn.Module):
         self.sample_rate = sample_rate
         self.checkpoint = checkpoint
         self.num_steps = num_steps
-        self._backbone: tp.Optional[nn.Module] = None
+        self._model: tp.Optional[nn.Module] = None
         if checkpoint is not None:
-            self._backbone = self._load_backbone(checkpoint)
-            self._backbone.eval()
-            for p in self._backbone.parameters():
-                p.requires_grad_(False)
+            self._load_backbone(checkpoint)
 
-    def _load_backbone(self, checkpoint: str) -> nn.Module:
-        raise NotImplementedError(
-            "SGMSEAttack has no backbone loading implemented yet. Install "
-            "SGMSE and implement the score model + reverse SDE sampler here, "
-            "then pass attack.sgmse.checkpoint=<path> in the config."
-        )
+    def _load_backbone(self, checkpoint: str) -> None:
+        ckpt_path = Path(checkpoint)
+        if not ckpt_path.is_file():
+            raise FileNotFoundError(f"SGMSE checkpoint not found: {ckpt_path}")
+
+        from sgmse.model import ScoreModel
+
+        # weights_only=False: this checkpoint embeds a SpecsDataModule
+        # instance (their data pipeline config, not just tensors), which
+        # PyTorch >=2.6's default weights_only=True unpickler refuses as an
+        # untrusted global. Fine to disable here -- it's a checkpoint we
+        # downloaded directly from the paper authors' own release, not
+        # arbitrary/untrusted input.
+        model = ScoreModel.load_from_checkpoint(str(ckpt_path), map_location="cpu", weights_only=False)
+        # .eval() is not just standard hygiene here -- ScoreModel overrides
+        # train()/eval() to swap in EMA-smoothed weights on eval() (see
+        # sgmse/model.py:ScoreModel.train), the SGMSE-native equivalent of
+        # DiffErase's ema_scope. Skipping this would silently run the raw
+        # (non-EMA) training weights instead.
+        model.eval()
+        for p in model.parameters():
+            p.requires_grad_(False)
+        self._model = model
 
     def forward(self, x: torch.Tensor, strength: tp.Optional[float] = None) -> torch.Tensor:
         """`strength` is t* in [0, 1] (see class docstring); None means
         "sample it randomly", which is what training should do."""
-        if self._backbone is None:
+        if self._model is None:
             raise NotImplementedError(
                 "SGMSEAttack was constructed without a checkpoint (see TODO "
                 "in src/audioseal_robust/attacks.py). Either provide "
                 "attack.sgmse.checkpoint or set attack.weights.sgmse=0 in the "
                 "config to keep it disabled."
             )
-        raise NotImplementedError("SGMSE reverse-diffusion forward pass TODO")
+        if strength is None:
+            strength = random.random()
+        strength = float(min(max(strength, 0.0), 1.0))
+
+        from sgmse.sampling.correctors import CorrectorRegistry
+        from sgmse.sampling.predictors import PredictorRegistry
+        from sgmse.util.other import pad_spec
+
+        device = x.device
+        sde = self._model.sde.copy()
+        sde.N = self.num_steps
+        eps = self._model.t_eps
+        t_star = eps + strength * (sde.T - eps)
+
+        orig_len = x.shape[-1]
+        wav = x.squeeze(1)  # (B, T)
+        # SGMSE's own enhance() normalizes by peak amplitude before STFT and
+        # rescales back afterwards -- its score model was trained on
+        # peak-normalized inputs.
+        norm_factor = wav.abs().amax(dim=-1, keepdim=True).clamp_min(1e-8)
+        wav = wav / norm_factor
+
+        Y = self._model._forward_transform(self._model._stft(wav)).unsqueeze(1)  # (B, 1, F, T_frames)
+        Y = pad_spec(Y)
+
+        # Forward-corrupt Y to t_star via the SDE's own marginal_prob. With
+        # x0=y=Y (see class docstring), the mean term is exactly Y, so this
+        # is "Y plus std(t_star)-scaled Gaussian noise" -- the SDE analogue
+        # of DiffEraseAttack's q_sample.
+        vec_t_star = torch.full((Y.shape[0],), t_star, device=device)
+        mean, std = sde.marginal_prob(Y, Y, vec_t_star)
+        xt = mean + std[:, None, None, None] * torch.randn_like(Y)
+        xt_mean = xt
+
+        predictor = PredictorRegistry.get_by_name("reverse_diffusion")(sde, self._model, probability_flow=False)
+        corrector = CorrectorRegistry.get_by_name("ald")(sde, self._model, snr=0.5, n_steps=1)
+
+        # Mirrors sgmse.sampling.get_pc_sampler's pc_sampler() loop exactly,
+        # just starting from t_star instead of sde.T -- see that function
+        # for the reference this replicates. Deliberately NOT wrapped in
+        # torch.no_grad() (see class docstring: this attack must stay
+        # differentiable for training).
+        timesteps = torch.linspace(t_star, eps, self.num_steps, device=device)
+        for i in range(self.num_steps):
+            t = timesteps[i]
+            stepsize = t - timesteps[i + 1] if i != self.num_steps - 1 else timesteps[-1]
+            vec_t = torch.full((Y.shape[0],), t.item(), device=device)
+            xt, xt_mean = corrector.update_fn(xt, Y, vec_t)
+            xt, xt_mean = predictor.update_fn(xt, Y, vec_t, stepsize)
+
+        x_hat = self._model.to_audio(xt_mean.squeeze(1), orig_len)
+        x_hat = x_hat * norm_factor
+        return x_hat.unsqueeze(1).to(x.dtype)
 
 
 class DiffEraseAttack(nn.Module):
