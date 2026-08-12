@@ -3,6 +3,9 @@
 # audioseal inference package.
 
 torchaudio>=2.1.0
+soundfile               # data.py's WavDirDataset: avoids torchaudio.load's torchcodec/FFmpeg
+                        # requirement (recent torchaudio routes .load() through torchcodec
+                        # unconditionally, which needs a system FFmpeg install)
 mlflow>=2.0.0          # default experiment tracking backend (local, no account needed)
 wandb                  # optional alternative backend: set tracking.backend=wandb
 torchmetrics            # evaluate.py: SI-SNR, PESQ (see metrics.py)
@@ -14,10 +17,13 @@ matplotlib              # evaluate.py: confusion-matrix + robustness-curve plots
 # attacks.py until checkpoints/package versions are picked.
 
 # SGMSEAttack needs src/sgmse/ (vendored, see that directory's VENDORED.md).
-# torch-ema/torchsde/torch-pesq/torchinfo/pystoi are its own inference-time
-# deps beyond what's already listed above; gdown is only needed to fetch a
-# checkpoint from their Google Drive links, not at runtime.
+# pytorch_lightning/torch-ema/torchsde/torch-pesq/torchinfo/pystoi are its own
+# inference-time deps beyond what's already listed above (librosa and scipy
+# are also imported by src/sgmse/model.py, but already pulled in transitively
+# elsewhere in this project); gdown is only needed to fetch a checkpoint from
+# their Google Drive links, not at runtime.
 gdown
+pytorch_lightning
 torch-ema
 torchsde
 torch-pesq
