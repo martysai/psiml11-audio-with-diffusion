@@ -17,6 +17,7 @@ pretrained checkpoint) so this runs fast and offline.
 
 import copy
 
+import pytest
 import torch
 
 from audioseal.builder import (
@@ -28,7 +29,9 @@ from audioseal.builder import (
     create_detector,
     create_generator,
 )
-from audioseal_robust.attacks import IdentityAttack, SampledReconstructionAttack
+from audioseal_robust.attacks import DiffEraseAttack, IdentityAttack, SampledReconstructionAttack
+from audioseal_robust.config import load_eval_config
+from audioseal_robust.evaluate import build_eval_attacks
 from audioseal_robust.losses import PsychoacousticMelLoss, detection_loss
 
 
@@ -146,3 +149,52 @@ def test_sampled_attack_only_picks_enabled_branches():
     for _ in range(20):
         _, name = attack(x)
         assert name == "identity"
+
+
+def test_diff_erase_attack_without_checkpoint_stays_a_stub():
+    attack = DiffEraseAttack()
+    with pytest.raises(NotImplementedError, match="constructed without a checkpoint"):
+        attack(torch.randn(1, 1, 1600))
+
+
+def test_diff_erase_attack_checkpoint_without_config_raises_clear_error(tmp_path):
+    fake_ckpt = tmp_path / "fake.ckpt"
+    fake_ckpt.write_bytes(b"not a real checkpoint")
+    with pytest.raises(NotImplementedError, match="differase_root"):
+        DiffEraseAttack(checkpoint=str(fake_ckpt))
+
+
+def test_diff_erase_attack_missing_differase_root_fails_before_any_import(tmp_path):
+    fake_ckpt = tmp_path / "fake.ckpt"
+    fake_ckpt.write_bytes(b"not a real checkpoint")
+    fake_config = tmp_path / "fake.yaml"
+    fake_config.write_text("preprocessing: {}\n")
+    with pytest.raises(FileNotFoundError, match="DiffErase-latent not found"):
+        DiffEraseAttack(
+            checkpoint=str(fake_ckpt),
+            config=str(fake_config),
+            differase_root=str(tmp_path / "no_such_differase_checkout"),
+        )
+
+
+def test_build_eval_attacks_threads_per_attack_config_through():
+    """Regression test: build_eval_attacks used to construct every attack
+    with zero args, silently ignoring cfg.attack.* entirely (a config field
+    like attack.sgmse.num_steps had no effect). Confirms the fix actually
+    reaches the constructed module."""
+    cfg = load_eval_config(["eval_dir=.", "attack.sgmse.num_steps=7"])
+    attacks, skipped = build_eval_attacks(["identity", "sgmse"], torch.device("cpu"), cfg)
+    assert not skipped
+    assert attacks["sgmse"].num_steps == 7
+
+
+def test_build_eval_attacks_construction_failure_is_skipped_not_fatal():
+    """Regression test: once a real checkpoint path is threaded through (the
+    fix above), a misconfigured attack can now fail inside __init__/
+    _load_backbone instead of only at forward() time -- that must land in
+    the `skipped` dict, not raise and take down the whole eval run."""
+    cfg = load_eval_config(["eval_dir=.", "attack.diff_erase.checkpoint=/nonexistent/fake.ckpt"])
+    attacks, skipped = build_eval_attacks(["identity", "diff_erase"], torch.device("cpu"), cfg)
+    assert "diff_erase" not in attacks
+    assert "differase_root" in skipped["diff_erase"]
+    assert attacks["identity"] is not None

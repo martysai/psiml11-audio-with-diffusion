@@ -59,6 +59,25 @@ class SGMSEAttackConfig:
 
 
 @dataclass
+class DiffEraseAttackConfig:
+    """Wires DiffEraseAttack (attacks.py) to a local checkout of the
+    Differase repo's DiffErase-latent variant -- an external project, not
+    vendored here (same "separate checkout" situation as the AudioCraft/Dora
+    solver mentioned in this module's docstring). All three fields must be
+    set together, or left None (default) to keep the attack disabled."""
+
+    # Path to the Differase repo checkout, e.g. "/path/to/Differase" (the
+    # parent of DiffErase-latent/, DiffErase-mel/).
+    differase_root: tp.Optional[str] = None
+    # DiffErase-latent/data/checkpoints/*.ckpt -- a full LatentDiffusion
+    # checkpoint (VAE + diffusion UNet), NOT the VAE-only checkpoint.
+    checkpoint: tp.Optional[str] = None
+    # DiffErase-latent/audioldm_train/config/**/*.yaml matching `checkpoint`'s
+    # architecture, e.g. .../2023_08_23_reproduce_audioldm/audioldm_original.yaml.
+    config: tp.Optional[str] = None
+
+
+@dataclass
 class AttackWeights:
     # Sampling weight for each of the 4 attack branches (need not sum to 1;
     # normalized internally). A weight of 0 disables that branch. Identity is
@@ -145,6 +164,18 @@ class TrainConfig:
 
 
 @dataclass
+class EvalAttackConfig:
+    """Per-attack extra settings for evaluate.py's attacks (checkpoints etc),
+    separate from TrainConfig's AttackConfig since eval also runs held-out
+    attacks (diff_erase) that training must never see."""
+
+    bigvgan: BigVGANAttackConfig = field(default_factory=BigVGANAttackConfig)
+    dac: DACAttackConfig = field(default_factory=DACAttackConfig)
+    sgmse: SGMSEAttackConfig = field(default_factory=SGMSEAttackConfig)
+    diff_erase: DiffEraseAttackConfig = field(default_factory=DiffEraseAttackConfig)
+
+
+@dataclass
 class EvalConfig:
     """Config for evaluate.py -- deliberately separate from TrainConfig
     (rather than nested inside it) so baseline evaluation is runnable on its
@@ -204,6 +235,7 @@ class EvalConfig:
     compute_sisnr: bool = True
     compute_visqol: bool = False  # needs a separate ViSQOL binary build, see metrics.py
 
+    attack: EvalAttackConfig = field(default_factory=EvalAttackConfig)
     tracking: TrackingConfig = field(default_factory=TrackingConfig)
 
 

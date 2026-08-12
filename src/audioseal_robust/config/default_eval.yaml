@@ -29,6 +29,24 @@ compute_pesq: true
 compute_sisnr: true
 compute_visqol: false
 
+# Per-attack checkpoints -- None/null keeps that attack a stub (see
+# attacks.py). Override on the CLI, e.g.:
+#   attack.diff_erase.differase_root=/path/to/Differase \
+#   attack.diff_erase.checkpoint=/path/to/Differase/DiffErase-latent/data/checkpoints/foo.ckpt \
+#   attack.diff_erase.config=/path/to/Differase/DiffErase-latent/audioldm_train/config/2023_08_23_reproduce_audioldm/audioldm_original.yaml
+attack:
+  bigvgan:
+    checkpoint: null
+  dac:
+    checkpoint: null
+  sgmse:
+    checkpoint: null
+    num_steps: 30
+  diff_erase:
+    differase_root: null
+    checkpoint: null
+    config: null
+
 tracking:
   backend: mlflow
   project: audioseal-robust-eval
