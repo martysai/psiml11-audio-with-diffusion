@@ -32,6 +32,7 @@ BigVGAN/DAC/SGMSE are ordinary neural nets, we don't need that workaround --
 we can and do backprop through them for real.
 """
 
+import functools
 import os
 import random
 import sys
@@ -317,13 +318,22 @@ class DiffEraseAttack(nn.Module):
             raise FileNotFoundError(f"DiffErase-latent checkpoint not found: {ckpt_path}")
 
         original_cwd = os.getcwd()
+        original_torch_load = torch.load
         os.chdir(latent_root)  # get_vocoder() hardcodes a "data/checkpoints" *relative* path
+        # DiffErase-latent's own model construction calls torch.load() in a
+        # few places (e.g. get_vocoder, and AutoencoderKL's own internal
+        # preview-vocoder in __init__) without map_location -- fine on the
+        # GPU boxes those checkpoints were saved on, but on CPU-only/MPS
+        # machines torch.load then tries to restore CUDA tensors and raises.
+        # Patch the default rather than editing their source.
+        torch.load = functools.partial(original_torch_load, map_location="cpu")
         try:
             model = instantiate_from_config(model_config["model"])
-            state = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+            state = original_torch_load(ckpt_path, map_location="cpu", weights_only=False)
             model.load_state_dict(state["state_dict"], strict=False)
             vocoder = get_vocoder(model_config, "cpu", n_mel_channels)
         finally:
+            torch.load = original_torch_load
             os.chdir(original_cwd)
 
         model.eval()
@@ -364,21 +374,44 @@ class DiffEraseAttack(nn.Module):
             mel, *_ = self._stft.mel_spectrogram(wav)  # (B, n_mel, T_frames)
             mel_input = mel.permute(0, 2, 1).unsqueeze(1)  # (B, 1, T_frames, n_mel)
 
-            with self._model.ema_scope("DiffEraseAttack"):
-                posterior = self._model.encode_first_stage(mel_input)
-                z0 = self._model.get_first_stage_encoding(posterior)
+            # Deliberately not using self._model.ema_scope() here: it swaps in
+            # EMA-averaged weights for the duration of the block, but its
+            # bookkeeping (LitEma.copy_to) asserts that every currently-frozen
+            # parameter was ALSO frozen at EMA-construction time -- which
+            # doesn't hold once we (or the caller, e.g. evaluate.py's
+            # build_eval_attacks) freeze this model's parameters post-construction
+            # for inference. Skipping it just means we use the checkpoint's raw
+            # (non-EMA) weights directly, which is a normal, supported choice --
+            # not required for correctness here regardless, since this whole
+            # block already runs under torch.no_grad().
+            posterior = self._model.encode_first_stage(mel_input)
+            z0 = self._model.get_first_stage_encoding(posterior)
 
-                num_timesteps = self._model.num_timesteps
-                noise_timestep = int(num_timesteps * strength)
-                t_noise = torch.full((z0.shape[0],), noise_timestep, device=device, dtype=torch.long)
-                z = self._model.q_sample(x_start=z0, t=t_noise, noise=torch.randn_like(z0))
+            num_timesteps = self._model.num_timesteps
+            noise_timestep = int(num_timesteps * strength)
+            t_noise = torch.full((z0.shape[0],), noise_timestep, device=device, dtype=torch.long)
+            z = self._model.q_sample(x_start=z0, t=t_noise, noise=torch.randn_like(z0))
 
-                cond: tp.Dict[str, tp.Any] = {}  # unconditional generation
-                for t in range(noise_timestep, 0, -1):
-                    t_tensor = torch.full((z.shape[0],), t, device=device, dtype=torch.long)
-                    z = self._model.p_sample(x=z, c=cond, t=t_tensor, clip_denoised=self._model.clip_denoised)
+            # "Unconditional" here does NOT mean an empty cond dict -- the
+            # UNet's FiLM layer (extra_film_condition_dim in the config)
+            # asserts its conditioning input is never None whenever the
+            # model was built with a cond_stage_config at all (see
+            # ddpm.py:UNetModel.forward's `assert (y is not None) == ...`).
+            # The correct null condition is each conditioner's own
+            # classifier-free-guidance "empty" embedding
+            # (get_unconditional_condition -- e.g. CLAP's embedding of an
+            # empty-string prompt), same convention as Stable Diffusion's
+            # empty-prompt embedding. Generic over whatever
+            # cond_stage_config the loaded model was built with.
+            cond: tp.Dict[str, tp.Any] = {
+                key: self._model.cond_stage_models[i].get_unconditional_condition(z0.shape[0])
+                for i, key in enumerate(self._model.conditioning_key)
+            }
+            for t in range(noise_timestep, 0, -1):
+                t_tensor = torch.full((z.shape[0],), t, device=device, dtype=torch.long)
+                z = self._model.p_sample(x=z, c=cond, t=t_tensor, clip_denoised=self._model.clip_denoised)
 
-                mel_out = self._model.decode_first_stage(z)
+            mel_out = self._model.decode_first_stage(z)
             if mel_out.shape[1] == 1:
                 mel_out = mel_out.squeeze(1)  # (B, T_frames, n_mel)
 
