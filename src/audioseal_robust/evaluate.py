@@ -482,18 +482,41 @@ def _print_timing_and_projection(cfg: EvalConfig, results: tp.Dict[str, tp.Any])
     planned = results.get("planned_batches")
     if not planned:
         return
-    per_batch = total / planned
-    print(f"\n~{per_batch:.1f}s per batch across the whole run. Projected totals:")
+
+    # total_seconds is undifferentiated wall clock (perceptual + every
+    # attack's headline + every attack's curve). Split it before projecting:
+    # perceptual and headline cost scale with n_eval_batches, but curve cost
+    # is fixed by n_curve_batches (held constant regardless of
+    # n_eval_batches) -- scaling it along with n_eval_batches, as a single
+    # blended total/planned rate would, wildly overstates a target run's
+    # cost whenever curve dominates the trial run's total (it usually does:
+    # len(t_star_grid) points, each its own reverse-diffusion pass).
+    curve_seconds_total = sum(r.get("curve_seconds", 0.0) for r in results["attacks"].values())
+    # Remainder = perceptual pass + fixed per-run overhead (model/checkpoint
+    # loading) -- both are effectively one-off, not per-eval-batch, but
+    # lumping them into the eval_batches-scaling pool means a short trial
+    # over-estimates a longer run's per-batch rate (safe direction: an
+    # over-estimate, not under).
+    eval_scaling_seconds = total - curve_seconds_total
+    eval_scaling_batches = cfg.n_eval_batches * (1 + len(results["attacks"]))
+    per_batch = eval_scaling_seconds / eval_scaling_batches if eval_scaling_batches else 0.0
+
+    print(f"\n~{per_batch:.1f}s per eval-batch (perceptual + headline only; curve held fixed, see below).")
+    print("Projected totals (headline scaled by n_eval_batches, curve unchanged):")
     for target in (20, 50, 150):
         if target == cfg.n_eval_batches:
             continue
-        scale = target / cfg.n_eval_batches
+        projected_eval_scaling = per_batch * target * (1 + len(results["attacks"]))
         audio_min = target * cfg.batch_size * cfg.segment_duration / 60
         print(
             f"  n_eval_batches={target:<4} (~{audio_min:.0f} min of audio): "
-            f"~{_fmt_duration(total * scale)}"
+            f"~{_fmt_duration(projected_eval_scaling + curve_seconds_total)}"
         )
-    print("(curve points scale with n_curve_batches, which these hold fixed)")
+    print(
+        f"(curve held fixed at {_fmt_duration(curve_seconds_total)} total -- "
+        f"raise n_curve_batches={cfg.n_curve_batches} if you want it more precise, "
+        "that's the only thing that changes its cost)"
+    )
 
 
 def main() -> None:
