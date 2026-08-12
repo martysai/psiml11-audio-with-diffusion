@@ -165,13 +165,12 @@ class OptimConfig:
 @dataclass
 class DataConfig:
     train_dir: str = "???"  # directory of 16kHz wav files, set on the CLI
-    # None (default) disables in-training validation. When set, train.py
-    # builds a second, shuffle=False dataloader over this directory and runs
-    # it (no grad, generator.eval()) once per epoch -- see
-    # TrainConfig.valid_batches for how many batches that covers. Should be
-    # audio the generator never trains on (same "held-out" idea as
-    # EvalConfig.eval_dir), otherwise this just measures training-set fit
-    # again under a different name.
+    # None (default) disables in-training validation. When set together with
+    # TrainConfig.eval_every, train.py cycles through this directory and logs
+    # an "eval/*"-prefixed no-grad forward pass every eval_every steps -- see
+    # train.py:eval_step. Should be audio the generator never trains on (same
+    # "held-out" idea as EvalConfig.eval_dir), otherwise this just measures
+    # training-set fit again under a different name.
     valid_dir: tp.Optional[str] = None
     segment_duration: float = 1.0  # seconds
     batch_size: int = 16
@@ -199,14 +198,13 @@ class TrainConfig:
     epochs: int = 100
     updates_per_epoch: int = 1000
     log_every: int = 50
+    # 0 disables eval-loss logging entirely. When set, every eval_every steps
+    # runs one no-grad forward pass over a batch from data.valid_dir (must
+    # also be set) and logs it under the "eval/" prefix, alongside training
+    # loss -- see train.py:eval_step.
+    eval_every: int = 0
     checkpoint_dir: str = "./checkpoints/audioseal_robust"
     seed: int = 1234
-
-    # Caps how many data.valid_dir batches train.py's validate() averages
-    # over at each epoch boundary -- only takes effect if data.valid_dir is
-    # set. Same reasoning as EvalConfig.n_eval_batches: a large valid_dir
-    # shouldn't make every epoch boundary slow.
-    valid_batches: int = 10
 
     # Name of a bundle under config/recipes.yaml's `train:` section (e.g.
     # "diff_erase" or "sgmse"), merged in on top of this schema/default.yaml
@@ -297,6 +295,20 @@ class EvalConfig:
     segment_duration: float = 3.0
     batch_size: int = 8
     n_eval_batches: int = 20
+    # Batches per *robustness-curve* point (see evaluate.py's t_star_grid
+    # loop), separate from n_eval_batches so the curve doesn't cost
+    # len(t_star_grid)x the headline number. The curve is a shape ("where does
+    # detection fall off along t*"), read off a plot; the headline TPR@FPR is
+    # the number that gets quoted and compared across checkpoints, so that one
+    # keeps the full n_eval_batches. Cheaper here = noisier per point, which
+    # the curve can absorb.
+    n_curve_batches: int = 6
+    # DataLoader worker processes for the eval set. Anything >0 decodes and
+    # resamples the next batch (see data.py:WavDirDataset.__getitem__ --
+    # torchaudio.load + resample per item) while the GPU is busy on the
+    # current one; at 0 that work is serialized with the forward passes on the
+    # main thread, which shows up as a CPU stall between every batch.
+    num_workers: int = 4
 
     # Where the confusion-matrix and robustness-curve PNGs (see plotting.py)
     # get written, one pair per run under f"{label}_*.png".
@@ -322,6 +334,26 @@ class EvalConfig:
     t_star_grid: tp.List[float] = field(
         default_factory=lambda: [0.0, 0.0003, 0.002, 0.006, 0.015, 0.04, 0.08]
     )
+    # The single t* the HEADLINE robustness number is measured at, for the
+    # strength-aware attacks (sgmse, diff_erase -- the rest ignore strength
+    # entirely). 0.04 = t*=40 out of T=1000 = the top of the mentor's
+    # curriculum table, i.e. their "hard regime" (see t_star_grid above).
+    #
+    # Passing no strength at all (what evaluate.py used to do) is NOT a
+    # neutral default -- it leaves strength=None, which makes each attack
+    # sample its own t* ~ U[0, 1] per forward call (see
+    # SGMSEAttack/DiffEraseAttack.forward). Two problems with that:
+    #   1. Cost. DiffEraseAttack's reverse loop runs int(1000 * strength)
+    #      sequential UNet steps, so U[0,1] averages ~500 steps/batch --
+    #      ~12x this setting's 40, and still ~6x past t*=80 (t_star_grid's
+    #      top point, itself already beyond the hard regime). We were paying
+    #      that to measure a regime we don't even claim.
+    #   2. Correctness. evaluate_attack runs positives and negatives through
+    #      two separate forward calls, so they'd each draw a DIFFERENT random
+    #      t*. The FPR threshold would then come from a differently-attacked
+    #      population than the TPR measured against it, which is not a
+    #      meaningful operating point.
+    headline_strength: float = 0.04
 
     # Attacks the generator was (or will be) trained against.
     eval_attacks: tp.List[str] = field(default_factory=lambda: ["identity", "bigvgan", "dac", "diff_erase"])
