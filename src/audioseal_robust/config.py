@@ -60,20 +60,33 @@ class SGMSEAttackConfig:
 
 @dataclass
 class DiffEraseAttackConfig:
-    """Wires DiffEraseAttack (attacks.py) to a local checkout of the
-    Differase repo's DiffErase-latent variant -- an external project, not
-    vendored here (same "separate checkout" situation as the AudioCraft/Dora
-    solver mentioned in this module's docstring). All three fields must be
-    set together, or left None (default) to keep the attack disabled."""
+    """Wires DiffEraseAttack (attacks.py) to pretrained AudioLDM weights.
+    The model *code* (audioldm_train, MIT licensed) is vendored under
+    src/audioldm_train/ -- see that directory's VENDORED.md -- so only the
+    *weights* need to be supplied externally (multi-GB, never belongs in
+    git). Both fields must be set together, or left None (default) to keep
+    the attack disabled.
+    """
 
-    # Path to the Differase repo checkout, e.g. "/path/to/Differase" (the
-    # parent of DiffErase-latent/, DiffErase-mel/).
-    differase_root: tp.Optional[str] = None
-    # DiffErase-latent/data/checkpoints/*.ckpt -- a full LatentDiffusion
-    # checkpoint (VAE + diffusion UNet), NOT the VAE-only checkpoint.
+    # A full LatentDiffusion checkpoint (VAE + diffusion UNet), NOT the
+    # VAE-only checkpoint -- must live at <weights_root>/data/checkpoints/<file>
+    # (see attacks.py:DiffEraseAttack._load_backbone for why: get_vocoder()
+    # and the VAE's reload_from_ckpt both hardcode that relative layout).
+    # E.g. a checkout of github.com/DiffErase/Differase's
+    # DiffErase-latent/data/checkpoints/*.ckpt -- that repo ships no
+    # pretrained checkpoint of its own though (its README is about
+    # *training* one); a generic pretrained AudioLDM checkpoint also works
+    # here -- see DiffEraseAttack's docstring for why.
     checkpoint: tp.Optional[str] = None
-    # DiffErase-latent/audioldm_train/config/**/*.yaml matching `checkpoint`'s
-    # architecture, e.g. .../2023_08_23_reproduce_audioldm/audioldm_original.yaml.
+    # Matching audioldm_train config, e.g. a checkout of Differase's
+    # DiffErase-latent/audioldm_train/config/**/*.yaml
+    # (2023_08_23_reproduce_audioldm/audioldm_original.yaml matches a
+    # standard/small AudioLDM checkpoint's architecture). NOTE: every shipped
+    # LatentDiffusion config in that repo is CLAP-conditioned, which pulls in
+    # its own pretrained sub-checkpoint at model-construction time (e.g.
+    # audioldm_original.yaml needs a `clap_htsat_tiny.pt` next to `checkpoint`,
+    # under the same data/checkpoints/ dir) even though DiffEraseAttack runs
+    # the model fully unconditionally -- confirmed empirically, see attacks.py.
     config: tp.Optional[str] = None
 
 

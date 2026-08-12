@@ -35,7 +35,6 @@ we can and do backprop through them for real.
 import functools
 import os
 import random
-import sys
 import typing as tp
 from pathlib import Path
 
@@ -224,25 +223,28 @@ class DiffEraseAttack(nn.Module):
     attack(s) it was trained against" -- if you add it to the training
     sampler too, you've destroyed the thing this is meant to measure.
 
-    Wired to DiffErase-latent (github.com/<...>/Differase's "Audio Pirates"
-    project, the AudioLDM-style latent-diffusion variant): forward-diffuses
-    a mel-spectrogram of `x` up to timestep `strength * num_timesteps` (same
-    t* convention as SGMSEAttack -- 0 = no corruption, 1 = full
-    noise-then-regenerate), reverse-diffuses it back with the pretrained
-    LatentDiffusion model, and vocodes the result back to a waveform with
-    the accompanying HiFiGAN. This mirrors the reference
+    Wired to DiffErase-latent (github.com/DiffErase/Differase's "Audio
+    Pirates" project, the AudioLDM-style latent-diffusion variant):
+    forward-diffuses a mel-spectrogram of `x` up to timestep
+    `strength * num_timesteps` (same t* convention as SGMSEAttack -- 0 = no
+    corruption, 1 = full noise-then-regenerate), reverse-diffuses it back
+    with the pretrained LatentDiffusion model, and vocodes the result back
+    to a waveform with the accompanying HiFiGAN. This mirrors the reference
     `Differase/remove_differase-latent.py` script's `process_audio_batch`
     exactly, just working on in-memory batched tensors (so it slots into
     evaluate.py's per-batch loop) instead of reading/writing wav files.
 
-    That repo is a separate checkout, not vendored here (same situation as
-    the AudioCraft/Dora solver mentioned in config.py's module docstring),
-    and ships no pretrained checkpoint of its own -- `DiffErase-latent`'s own
-    README is literally about *training* one. So this attack stays disabled
-    (constructing it without a checkpoint keeps raising NotImplementedError,
-    same as before) until you point all three of `checkpoint`, `config`, and
-    `differase_root` at a real checkout + a checkpoint you've trained or
-    otherwise obtained -- see EvalAttackConfig.diff_erase in config.py.
+    Model code (`audioldm_train`, MIT licensed) is vendored under
+    `src/audioldm_train/` -- see that directory's VENDORED.md for provenance
+    and the one intentional local change. Only the actual *weights*
+    (multi-GB, never belongs in git) stay external: point `checkpoint` and
+    `config` at files on disk (e.g. a checkout of the Differase repo's
+    `DiffErase-latent/data/checkpoints/*.ckpt` and
+    `DiffErase-latent/audioldm_train/config/**/*.yaml`) you've trained or
+    otherwise obtained -- DiffErase-latent's own README is literally about
+    *training* one, it ships none. This attack stays disabled (constructing
+    it without a checkpoint keeps raising NotImplementedError) until you do
+    -- see EvalAttackConfig.diff_erase in config.py.
 
     Differentiability isn't required here since eval never backprops (unlike
     SGMSEAttack, which trains against attacks and does need it) -- the whole
@@ -253,14 +255,12 @@ class DiffEraseAttack(nn.Module):
         self,
         checkpoint: tp.Optional[str] = None,
         config: tp.Optional[str] = None,
-        differase_root: tp.Optional[str] = None,
         sample_rate: int = 16_000,
     ):
         super().__init__()
         self.sample_rate = sample_rate
         self.checkpoint = checkpoint
         self.config_path = config
-        self.differase_root = differase_root
         self._model: tp.Optional[nn.Module] = None
         self._vocoder: tp.Optional[nn.Module] = None
         self._stft: tp.Optional[nn.Module] = None
@@ -270,22 +270,28 @@ class DiffEraseAttack(nn.Module):
             self._load_backbone(checkpoint)
 
     def _load_backbone(self, checkpoint: str) -> None:
-        if self.config_path is None or self.differase_root is None:
+        if self.config_path is None:
             raise NotImplementedError(
-                "DiffEraseAttack needs `config` and `differase_root` set "
-                "alongside `checkpoint` -- see EvalAttackConfig.diff_erase "
-                "in src/audioseal_robust/config.py."
+                "DiffEraseAttack needs `config` set alongside `checkpoint` "
+                "-- see EvalAttackConfig.diff_erase in src/audioseal_robust/config.py."
             )
-        differase_root = Path(self.differase_root)
-        latent_root = differase_root / "DiffErase-latent"
-        if not latent_root.is_dir():
-            raise FileNotFoundError(
-                f"DiffErase-latent not found under differase_root={differase_root} "
-                "-- point eval.diff_erase.differase_root at a checkout of the "
-                "Differase repo (the parent of DiffErase-latent/, DiffErase-mel/)."
+
+        ckpt_path = Path(checkpoint).resolve()
+        if not ckpt_path.is_file():
+            raise FileNotFoundError(f"DiffErase-latent checkpoint not found: {ckpt_path}")
+        # get_vocoder() hardcodes a "data/checkpoints" *relative* path (same
+        # convention first_stage_config.reload_from_ckpt uses in the yaml) --
+        # `checkpoint` must live at <weights_root>/data/checkpoints/<file>
+        # so we can cd into <weights_root> for that lookup to resolve.
+        if ckpt_path.parent.name != "checkpoints" or ckpt_path.parent.parent.name != "data":
+            raise ValueError(
+                f"DiffErase-latent checkpoint {ckpt_path} must live at "
+                "<weights_root>/data/checkpoints/<file> -- that's where "
+                "get_vocoder() and the VAE's reload_from_ckpt look for the "
+                "vocoder/VAE weights next to it (see DiffErase-latent's own "
+                "data/checkpoints/ layout)."
             )
-        if str(latent_root) not in sys.path:
-            sys.path.insert(0, str(latent_root))
+        weights_root = ckpt_path.parent.parent.parent
 
         import yaml
 
@@ -313,13 +319,9 @@ class DiffEraseAttack(nn.Module):
             mel_fmax=prep["mel"]["mel_fmax"],
         )
 
-        ckpt_path = Path(checkpoint)
-        if not ckpt_path.is_file():
-            raise FileNotFoundError(f"DiffErase-latent checkpoint not found: {ckpt_path}")
-
         original_cwd = os.getcwd()
         original_torch_load = torch.load
-        os.chdir(latent_root)  # get_vocoder() hardcodes a "data/checkpoints" *relative* path
+        os.chdir(weights_root)
         # DiffErase-latent's own model construction calls torch.load() in a
         # few places (e.g. get_vocoder, and AutoencoderKL's own internal
         # preview-vocoder in __init__) without map_location -- fine on the
@@ -353,8 +355,8 @@ class DiffEraseAttack(nn.Module):
             raise NotImplementedError(
                 "DiffEraseAttack was constructed without a checkpoint (see "
                 "class docstring in src/audioseal_robust/attacks.py). Either "
-                "set eval.diff_erase.{checkpoint,config,differase_root} or "
-                "remove diff_erase from eval.held_out_attacks to skip it."
+                "set eval.diff_erase.{checkpoint,config} or remove diff_erase "
+                "from eval.held_out_attacks to skip it."
             )
         if strength is None:
             strength = random.random()
