@@ -1,0 +1,32 @@
+# Core dependencies for the audioseal package itself (src/audioseal) --
+# watermark generator/detector inference, model cards, checkpoint loading.
+# Everything else in this repo layers on top of this file:
+#   requirements-training.txt    -- src/audioseal_robust (training + eval, identity/sgmse attacks)
+#   requirements-diff-erase.txt  -- the diff_erase held-out attack (AudioLDM)
+#   requirements-mbd.txt         -- the mbd held-out attack (MultiBand Diffusion)
+#
+# Derived from the actual top-level third-party imports across src/audioseal
+# and src/audioseal_robust, not hand-maintained -- rerun
+#   grep -rhoE "^(import|from) [a-zA-Z_][a-zA-Z0-9_]*" --include='*.py' src/audioseal src/audioseal_robust
+# if you add new imports.
+
+torch
+torchaudio
+numpy
+omegaconf
+einops
+typing_extensions
+
+# Lazily imported by src/audioseal/loader.py, only on the branch that
+# resolves a Hugging Face model URI. Guarded with its own "pip install
+# huggingface_hub" message, so it's strictly optional -- but the default
+# generator/detector cards (audioseal_wm_16bits / audioseal_detector_16bits)
+# do pull their checkpoints from HF, so in practice you want it.
+huggingface_hub
+
+# Not a direct import, but torchaudio.load() delegates decoding to TorchCodec
+# from torchaudio 2.9 onwards, and raises ImportError without it. Needed for
+# any dataset that isn't already decoded (both LibriSpeech and VCTK ship
+# .flac -- see WavDirDataset in src/audioseal_robust/data.py, which reads
+# .wav and .flac directly, no pre-conversion step).
+torchcodec

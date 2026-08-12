@@ -63,6 +63,34 @@ _ATTACK_CLASSES: tp.Dict[str, tp.Type[nn.Module]] = {
 }
 
 
+def _reset_peak_memory(device: torch.device) -> None:
+    """No-op off CUDA -- MPS/CPU have no equivalent peak-tracking counter."""
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
+
+
+def _peak_memory_metrics(device: torch.device) -> tp.Dict[str, float]:
+    """Peak GPU memory since the last `_reset_peak_memory`, in GB, plus what
+    fraction of the card that is.
+
+    `reserved` (not `allocated`) is the number to size batches against: it's
+    what the caching allocator actually holds from the GPU, so it's what runs
+    you out of memory. `allocated` is only the live-tensor subset of that, and
+    reads lower than the pressure you'd actually hit.
+
+    Empty dict off CUDA, so callers can just `.update()` it unconditionally.
+    """
+    if device.type != "cuda":
+        return {}
+    total = torch.cuda.get_device_properties(device).total_memory
+    reserved = torch.cuda.max_memory_reserved(device)
+    return {
+        "peak_alloc_gb": torch.cuda.max_memory_allocated(device) / 1e9,
+        "peak_reserved_gb": reserved / 1e9,
+        "peak_reserved_frac": reserved / total,
+    }
+
+
 def load_generator_under_test(checkpoint: str, nbits: int, device: torch.device) -> AudioSealWM:
     """`checkpoint` is either a model card name / HF uri (-> vanilla
     pretrained, the baseline) or a local path to a .pth saved by train.py
@@ -241,9 +269,24 @@ def run(cfg: EvalConfig) -> tp.Dict[str, tp.Any]:
     )
 
     results: tp.Dict[str, tp.Any] = {"label": cfg.label}
+    if device.type == "cuda":
+        props = torch.cuda.get_device_properties(device)
+        results["gpu"] = {"name": props.name, "total_gb": props.total_memory / 1e9}
+        logger.info(
+            "gpu: %s, %.1f GB total | batch_size=%d segment_duration=%.1fs "
+            "-- peak memory is reported per attack below, size batches off the "
+            "largest peak_reserved_gb (attacks differ a lot)",
+            props.name,
+            props.total_memory / 1e9,
+            cfg.batch_size,
+            cfg.segment_duration,
+        )
+
     try:
         logger.info("=== perceptual metrics (no attack) ===")
+        _reset_peak_memory(device)
         perceptual = evaluate_perceptual(generator, dataloader, cfg, device)
+        perceptual.update(_peak_memory_metrics(device))
         results["perceptual"] = perceptual
         tracker.log({f"perceptual/{k}": v for k, v in perceptual.items()}, step=0)
         logger.info("perceptual: %s", perceptual)
@@ -258,7 +301,9 @@ def run(cfg: EvalConfig) -> tp.Dict[str, tp.Any]:
             attack = attacks[name]
             logger.info("=== attack=%s (%s) ===", name, tag)
             try:
+                _reset_peak_memory(device)
                 robustness = evaluate_attack(generator, detector, attack, dataloader, cfg, device)
+                robustness.update(_peak_memory_metrics(device))
                 results["attacks"][name] = {"tag": tag, **robustness}
                 loggable = {k: v for k, v in robustness.items() if k != "confusion"}
                 loggable.update({f"confusion_{k}": v for k, v in robustness["confusion"].items()})
@@ -317,6 +362,31 @@ def main() -> None:
         print(f"confusion matrix plot: {results['confusion_matrix_plot']}")
     if "robustness_curve_plot" in results:
         print(f"robustness curve plot: {results['robustness_curve_plot']}")
+
+    gpu = results.get("gpu")
+    if gpu:
+        peaks = {
+            name: r["peak_reserved_gb"]
+            for name, r in results["attacks"].items()
+            if "peak_reserved_gb" in r
+        }
+        if peaks:
+            worst_name = max(peaks, key=lambda k: peaks[k])
+            worst_gb = peaks[worst_name]
+            print(f"\n=== GPU memory (batch_size={cfg.batch_size}, segment_duration={cfg.segment_duration}s) ===")
+            print(f"{gpu['name']}, {gpu['total_gb']:.1f} GB total")
+            for name in sorted(peaks, key=lambda k: -peaks[k]):
+                print(f"  {name}: {peaks[name]:.2f} GB peak reserved")
+            # Deliberately not printing a "max batch size" number: peak memory
+            # is not purely linear in batch size (fixed model weights sit in
+            # there too, and the diffusion attacks' inner loops allocate their
+            # own buffers), so a naive total/peak*batch_size extrapolation
+            # would over-promise. Headroom ratio is the honest version.
+            print(
+                f"worst attack is {worst_name} at {worst_gb:.2f} GB "
+                f"({worst_gb / gpu['total_gb']:.0%} of the card) -- "
+                f"~{gpu['total_gb'] / worst_gb:.1f}x headroom before it's full"
+            )
 
 
 if __name__ == "__main__":
