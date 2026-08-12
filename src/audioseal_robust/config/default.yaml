@@ -1,0 +1,64 @@
+# Default config for generator-only robustness fine-tuning.
+# Override any field on the CLI, e.g.:
+#   python -m audioseal_robust.train data.train_dir=/path/to/wavs lambda_det=2.0 attack.weights.sgmse=1.0
+
+sample_rate: 16000
+nbits: 16
+device: auto
+epochs: 100
+updates_per_epoch: 1000
+log_every: 50
+checkpoint_dir: ./checkpoints/audioseal_robust
+seed: 1234
+
+lambda_det: 1.0
+lambda_perc: 1.0
+
+generator:
+  checkpoint: audioseal_wm_16bits
+
+detector:
+  checkpoint: audioseal_detector_16bits
+
+attack:
+  weights:
+    identity: 1.0
+    bigvgan: 0.0
+    dac: 0.0
+    sgmse: 0.0
+  bigvgan:
+    checkpoint: null
+  dac:
+    checkpoint: null
+  sgmse:
+    checkpoint: null
+    num_steps: 30
+
+mel_loss:
+  n_fft: 1024
+  hop_length: 256
+  win_length: 1024
+  n_mels: 80
+  f_min: 20.0
+  f_max: null
+
+optim:
+  lr: 5.0e-5
+  betas: [0.5, 0.9]
+  weight_decay: 0.0
+  max_norm: 3.0
+
+data:
+  train_dir: ???
+  valid_dir: null
+  segment_duration: 1.0
+  batch_size: 16
+  num_workers: 4
+
+tracking:
+  backend: mlflow
+  project: audioseal-robust
+  run_name: null
+  mlflow_tracking_uri: null
+  wandb_mode: online
+  log_audio_every: 0

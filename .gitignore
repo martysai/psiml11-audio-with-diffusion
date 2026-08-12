@@ -216,3 +216,9 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# audioseal_robust: local experiment tracking + training artifacts
+mlflow.db
+mlruns/
+wandb/
+checkpoints/

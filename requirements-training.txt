@@ -1,0 +1,18 @@
+# Extra dependencies for src/audioseal_robust (generator-only robustness
+# fine-tuning), on top of requirements.txt. Not needed to use the core
+# audioseal inference package.
+
+torchaudio>=2.1.0
+mlflow>=2.0.0          # default experiment tracking backend (local, no account needed)
+wandb                  # optional alternative backend: set tracking.backend=wandb
+torchmetrics            # evaluate.py: SI-SNR, PESQ (see metrics.py)
+pesq                    # backing library for torchmetrics' PESQ wrapper
+matplotlib              # evaluate.py: confusion-matrix + robustness-curve plots (see plotting.py)
+
+# BigVGAN / DAC / SGMSE attack backbones are NOT listed here -- they are
+# stubbed with NotImplementedError + setup instructions in
+# src/audioseal_robust/attacks.py until checkpoints/package versions are
+# picked.
+
+# ViSQOL is NOT listed here either -- it's a Bazel C++ build, not pip
+# installable. See the TODO in src/audioseal_robust/metrics.py:visqol_score.
