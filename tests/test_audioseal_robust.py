@@ -37,7 +37,12 @@ from audioseal_robust.attacks import (
     SGMSEAttack,
 )
 from audioseal_robust.config import load_eval_config
-from audioseal_robust.evaluate import build_eval_attacks
+from audioseal_robust.evaluate import (
+    build_eval_attacks,
+    evaluate_attack,
+    evaluate_perceptual,
+    prepare_eval_batches,
+)
 from audioseal_robust.losses import PsychoacousticMelLoss, detection_loss
 from audioseal_robust.train import embed_watermark
 
@@ -104,6 +109,65 @@ def test_embed_watermark_hits_target_snr_range_per_example():
     achieved_snr_db = 20 * torch.log10(x.norm(dim=-1) / delta.norm(dim=-1).clamp_min(1e-8))
     assert bool(((achieved_snr_db >= 23.9) & (achieved_snr_db <= 36.1)).all())
     assert x_wm.requires_grad
+
+
+def test_prepare_eval_batches_is_seeded():
+    generator = _tiny_generator(nbits=4).eval()
+    cfg = load_eval_config(["eval_dir=.", "nbits=4", "n_eval_batches=1"])
+    dataloader = [torch.randn(2, 1, 4000), torch.randn(2, 1, 4000)]
+
+    torch.manual_seed(123)
+    first = prepare_eval_batches(generator, dataloader, cfg, torch.device("cpu"))
+    torch.manual_seed(123)
+    second = prepare_eval_batches(generator, dataloader, cfg, torch.device("cpu"))
+
+    assert len(first) == 1  # n_eval_batches caps the dataloader
+    assert all(torch.equal(a, b) for a, b in zip(first[0], second[0]))
+
+
+def test_evaluate_attack_uses_prepared_batches():
+    class Detector(torch.nn.Module):
+        def forward(self, x):
+            detected = (x.abs().sum(dim=(1, 2)) > 0).float()
+            presence = torch.stack([1 - detected, detected], dim=1).unsqueeze(-1)
+            message = (x[:, 0, :4] > 0).float()
+            return presence, message
+
+    message = torch.tensor([[1, 0, 1, 0], [0, 1, 0, 1]])
+    x = torch.zeros(2, 1, 8)
+    x_wm = x.clone()
+    x_wm[:, 0, :4] = message * 2 - 1
+    cfg = load_eval_config(["eval_dir=.", "nbits=4"])
+
+    metrics = evaluate_attack(
+        Detector(),
+        IdentityAttack(),
+        [(x, x_wm, message)],
+        cfg,
+        torch.device("cpu"),
+    )
+
+    assert metrics["bit_accuracy"] == 1.0
+    assert metrics["tpr_at_fpr"] == 1.0
+    assert metrics["confusion"] == {"tp": 2, "fn": 0, "fp": 0, "tn": 2}
+    assert metrics["f1"] == 1.0
+
+
+def test_evaluate_perceptual_aggregates_prepared_batches(monkeypatch):
+    cfg = load_eval_config(["eval_dir=.", "compute_pesq=true", "compute_sisnr=true"])
+    eval_batches = [
+        (torch.zeros(1, 1, 4), torch.ones(1, 1, 4), torch.zeros(1, 4)),
+        (torch.zeros(1, 1, 4), torch.full((1, 1, 4), 3.0), torch.zeros(1, 4)),
+    ]
+    monkeypatch.setattr("audioseal_robust.evaluate.sisnr_score", lambda x, x_wm: x_wm.mean().item())
+    monkeypatch.setattr(
+        "audioseal_robust.evaluate.pesq_score",
+        lambda x, x_wm, sample_rate: 2 * x_wm.mean().item(),
+    )
+
+    metrics = evaluate_perceptual(eval_batches, cfg, torch.device("cpu"))
+
+    assert metrics == {"sisnr": 2.0, "pesq": 4.0}
 
 
 def test_gradients_flow_to_generator_only():
