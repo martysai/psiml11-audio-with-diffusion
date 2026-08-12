@@ -14,26 +14,10 @@ matplotlib              # evaluate.py: confusion-matrix + robustness-curve plots
 # src/audioseal_robust/attacks.py until checkpoints/package versions are
 # picked.
 
-# DiffEraseAttack (the diff_erase held-out attack) is wired to DiffErase-latent,
-# a separate checkout (github.com/<...>/Differase), not vendored/installed here
-# -- same situation as the AudioCraft/Dora solver mentioned in config.py's
-# module docstring. This repo only appends it to sys.path at runtime, when
-# eval.diff_erase.differase_root is set (see attacks.py:DiffEraseAttack).
-#
-# Its README says `pip install poetry && poetry install` inside DiffErase-latent/,
-# but that checkout ships no pyproject.toml/poetry.lock/requirements.txt at all
-# (checked -- nothing under DiffErase-latent/), so there's nothing to `poetry
-# install` from. Its actual import-time dependencies (audioldm_train's), found
-# by running the real import chain until nothing was left unresolved:
-#   scipy librosa pandas pytorch_lightning torchvision h5py torchlibrosa
-#   transformers ftfy braceexpand webdataset wget timm
-# NOT pinned here since they belong to that external checkout, not this
-# package -- install them yourself the same way if you're setting this up
-# fresh. Getting past all of these still isn't enough to run a real DiffErase
-# pass, though: every LatentDiffusion config that repo ships is CLAP/text-
-# conditioned, needing ITS OWN pretrained sub-checkpoint (see the NOTE on
-# DiffEraseAttackConfig.config in config.py) on top of the DiffErase checkpoint
-# itself, and this repo has no checkpoints of any kind (see attacks.py).
+# DiffEraseAttack (the diff_erase held-out attack) needs src/audioldm_train/
+# (vendored, see that directory's VENDORED.md) -- its dependencies are listed
+# separately in requirements-diff-erase.txt, since they're a much heavier,
+# diffusion-model-specific stack that the rest of this project doesn't need.
 
 # ViSQOL is NOT listed here either -- it's a Bazel C++ build, not pip
 # installable. See the TODO in src/audioseal_robust/metrics.py:visqol_score.

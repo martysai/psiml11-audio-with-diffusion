@@ -160,21 +160,21 @@ def test_diff_erase_attack_without_checkpoint_stays_a_stub():
 def test_diff_erase_attack_checkpoint_without_config_raises_clear_error(tmp_path):
     fake_ckpt = tmp_path / "fake.ckpt"
     fake_ckpt.write_bytes(b"not a real checkpoint")
-    with pytest.raises(NotImplementedError, match="differase_root"):
+    with pytest.raises(NotImplementedError, match="needs `config` set"):
         DiffEraseAttack(checkpoint=str(fake_ckpt))
 
 
-def test_diff_erase_attack_missing_differase_root_fails_before_any_import(tmp_path):
-    fake_ckpt = tmp_path / "fake.ckpt"
+def test_diff_erase_attack_checkpoint_wrong_layout_fails_before_any_import(tmp_path):
+    """checkpoint must live at <weights_root>/data/checkpoints/<file> -- that's
+    the relative layout get_vocoder()/reload_from_ckpt hardcode. A checkpoint
+    anywhere else should get a clear error, not a confusing failure deep
+    inside model construction."""
+    fake_ckpt = tmp_path / "fake.ckpt"  # NOT under data/checkpoints/
     fake_ckpt.write_bytes(b"not a real checkpoint")
     fake_config = tmp_path / "fake.yaml"
     fake_config.write_text("preprocessing: {}\n")
-    with pytest.raises(FileNotFoundError, match="DiffErase-latent not found"):
-        DiffEraseAttack(
-            checkpoint=str(fake_ckpt),
-            config=str(fake_config),
-            differase_root=str(tmp_path / "no_such_differase_checkout"),
-        )
+    with pytest.raises(ValueError, match="data/checkpoints"):
+        DiffEraseAttack(checkpoint=str(fake_ckpt), config=str(fake_config))
 
 
 def test_build_eval_attacks_threads_per_attack_config_through():
@@ -196,5 +196,5 @@ def test_build_eval_attacks_construction_failure_is_skipped_not_fatal():
     cfg = load_eval_config(["eval_dir=.", "attack.diff_erase.checkpoint=/nonexistent/fake.ckpt"])
     attacks, skipped = build_eval_attacks(["identity", "diff_erase"], torch.device("cpu"), cfg)
     assert "diff_erase" not in attacks
-    assert "differase_root" in skipped["diff_erase"]
+    assert "config" in skipped["diff_erase"]
     assert attacks["identity"] is not None

@@ -1,0 +1,36 @@
+# Dependencies for the diff_erase held-out attack (DiffEraseAttack in
+# src/audioseal_robust/attacks.py), which runs inference through the
+# vendored src/audioldm_train/ package (see that directory's VENDORED.md).
+# NOT needed for anything else in this project -- separate from
+# requirements-training.txt so the base training/eval flow doesn't need this
+# much heavier, diffusion-model-specific stack.
+#
+# Found by running the real import + model-construction chain for
+# src/audioldm_train/config/2023_08_23_reproduce_audioldm/audioldm_original.yaml
+# until nothing was left unresolved -- not hand-picked from audioldm_train's
+# own (nonexistent) requirements file, it ships none.
+
+scipy
+librosa
+pandas
+pytorch_lightning
+torchvision
+h5py
+torchlibrosa
+transformers
+ftfy
+braceexpand
+webdataset
+wget
+timm
+taming-transformers  # AutoencoderKL's training-time LPIPS loss pulls this in
+                      # unconditionally at import time, even though we only
+                      # ever call encode/decode, never train it
+wandb                 # imported at module level by modules/latent_encoder/autoencoder.py
+
+# Not installed via this file: the actual checkpoints (VAE, HiFiGAN, a
+# LatentDiffusion model, and -- yes, still -- a CLAP checkpoint for the
+# conditioning branch DiffEraseAttack calls get_unconditional_condition() on,
+# see the NOTE on DiffEraseAttackConfig.config in
+# src/audioseal_robust/config.py) are multi-GB binaries, never belong in git,
+# and must be supplied separately via attack.diff_erase.checkpoint/.config.
