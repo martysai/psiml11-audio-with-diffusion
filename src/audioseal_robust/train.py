@@ -7,7 +7,10 @@
 """Generator-only fine-tuning against sampled reconstruction attacks.
 
 Per training step:
-  x --[frozen-except-here G_theta]--> x_wm = x + G_theta(x, m)
+  x --[frozen-except-here G_theta]--> x_wm = x + scale * G_theta(x, m)
+      (scale chosen per-example, see embed_watermark, so the perturbation
+      lands at a target watermark SNR sampled uniformly per example --
+      NOT whatever amplitude G_theta happens to produce unscaled)
   x_wm --[frozen, differentiable, randomly-sampled attack]--> x_att
   x_att --[frozen detector]--> presence p, decoded message m_hat
   total_loss = lambda_det * detection_loss(p, m_hat, m)
@@ -46,6 +49,32 @@ logger = logging.getLogger(__name__)
 
 def random_message(nbits: int, batch_size: int, device: torch.device) -> torch.Tensor:
     return torch.randint(0, 2, (batch_size, nbits), device=device)
+
+
+def embed_watermark(
+    generator: AudioSealWM,
+    x: torch.Tensor,
+    message: torch.Tensor,
+    snr_db_min: float,
+    snr_db_max: float,
+) -> torch.Tensor:
+    """x_wm = x + scale * delta, where delta = generator.get_watermark(x, m)
+    and `scale` is chosen per-example (sampled fresh every call) so that
+    ||scale * delta|| lands at a target SNR (dB) relative to ||x||, drawn
+    uniformly from [snr_db_min, snr_db_max] independently for each item in
+    the batch -- rather than using whatever amplitude get_watermark()
+    happens to produce unscaled. See TrainConfig.watermark_snr_db_{min,max}
+    for how that range was picked.
+
+    x: (B, 1, T). Gradients flow through normally (delta is not detached),
+    same as before this scaling was introduced.
+    """
+    delta = generator.get_watermark(x, message=message)
+    target_snr_db = torch.empty(x.size(0), 1, 1, device=x.device).uniform_(snr_db_min, snr_db_max)
+    x_norm = x.norm(dim=-1, keepdim=True)
+    delta_norm = delta.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+    scale = (x_norm / delta_norm) * (10 ** (-target_snr_db / 20))
+    return x + scale * delta
 
 
 def build_generator(cfg: TrainConfig, device: torch.device) -> AudioSealWM:
@@ -125,9 +154,9 @@ def train_step(
     x = batch.to(device)  # clean audio, (B, 1, T), 16kHz
     message = random_message(cfg.nbits, x.size(0), device=x.device)
 
-    # 1. x_wm = x + G_theta(x, m)
-    watermark = generator.get_watermark(x, message=message)
-    x_wm = x + watermark
+    # 1. x_wm = x + scale * G_theta(x, m), scale set per-example to hit a
+    #    randomly sampled target watermark SNR -- see embed_watermark.
+    x_wm = embed_watermark(generator, x, message, cfg.watermark_snr_db_min, cfg.watermark_snr_db_max)
 
     # 2. sampled reconstruction attack (frozen, graph stays connected)
     x_att, attack_name = attack(x_wm)
@@ -203,8 +232,11 @@ def train(cfg: TrainConfig) -> None:
                 if cfg.tracking.log_audio_every and step % cfg.tracking.log_audio_every == 0:
                     with torch.no_grad():
                         sample_x = batch[:1].to(device)
-                        sample_wm = generator.get_watermark(sample_x, message=random_message(cfg.nbits, 1, device))
-                        tracker.log_audio("x_wm_sample", sample_x + sample_wm, cfg.sample_rate, step=step)
+                        sample_message = random_message(cfg.nbits, 1, device)
+                        sample_x_wm = embed_watermark(
+                            generator, sample_x, sample_message, cfg.watermark_snr_db_min, cfg.watermark_snr_db_max
+                        )
+                        tracker.log_audio("x_wm_sample", sample_x_wm, cfg.sample_rate, step=step)
                 if step % cfg.log_every == 0:
                     logger.info("epoch=%d step=%d %s", epoch, step, metrics)
                 step += 1

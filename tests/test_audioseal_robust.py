@@ -33,6 +33,7 @@ from audioseal_robust.attacks import DiffEraseAttack, IdentityAttack, SampledRec
 from audioseal_robust.config import load_eval_config
 from audioseal_robust.evaluate import build_eval_attacks
 from audioseal_robust.losses import PsychoacousticMelLoss, detection_loss
+from audioseal_robust.train import embed_watermark
 
 
 def _tiny_seanet_config() -> SEANetConfig:
@@ -77,6 +78,26 @@ def _tiny_detector(nbits: int):
         normalizer=False,
     )
     return create_detector(cfg)
+
+
+def test_embed_watermark_hits_target_snr_range_per_example():
+    """Regression test for the mentor-requested SNR-targeting mechanism:
+    each example in the batch should independently land within
+    [snr_db_min, snr_db_max], not just the batch as a whole -- and gradients
+    must still flow (this replaces a plain x + get_watermark(...) that was
+    trivially differentiable)."""
+    torch.manual_seed(0)
+    nbits = 4
+    generator = _tiny_generator(nbits)
+
+    x = torch.randn(8, 1, 4000)
+    message = torch.randint(0, 2, (8, nbits))
+    x_wm = embed_watermark(generator, x, message, snr_db_min=24.0, snr_db_max=36.0)
+
+    delta = x_wm - x
+    achieved_snr_db = 20 * torch.log10(x.norm(dim=-1) / delta.norm(dim=-1).clamp_min(1e-8))
+    assert bool(((achieved_snr_db >= 23.9) & (achieved_snr_db <= 36.1)).all())
+    assert x_wm.requires_grad
 
 
 def test_gradients_flow_to_generator_only():
