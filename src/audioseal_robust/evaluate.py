@@ -30,6 +30,7 @@ to this script.
 """
 
 import logging
+import random
 import typing as tp
 from pathlib import Path
 
@@ -109,6 +110,8 @@ def load_generator_under_test(checkpoint: str, nbits: int, device: torch.device)
 
 _CONSTRUCTION_SKIP_EXCEPTIONS = (NotImplementedError, FileNotFoundError, ModuleNotFoundError)
 
+PreparedEvalBatch = tp.Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+
 
 def build_eval_attacks(
     names: tp.List[str], device: torch.device, cfg: EvalConfig
@@ -147,11 +150,33 @@ def build_eval_attacks(
 
 
 @torch.no_grad()
-def evaluate_attack(
+def prepare_eval_batches(
     generator: AudioSealWM,
+    dataloader,
+    cfg: EvalConfig,
+    device: torch.device,
+) -> tp.List[PreparedEvalBatch]:
+    """Materialize one set of (clean, watermarked, message) batches, held on
+    CPU and reused by every attack and every t* point, so all reported
+    numbers come from identical audio and identical messages."""
+    prepared = []
+    for batch_index, batch in enumerate(dataloader):
+        if batch_index >= cfg.n_eval_batches:
+            break
+        x = batch.to(device)
+        message = random_message(cfg.nbits, x.size(0), device=device)
+        x_wm = x + generator.get_watermark(x, message=message)
+        prepared.append((x.cpu(), x_wm.cpu(), message.cpu()))
+    if not prepared:
+        raise RuntimeError("Evaluation dataloader produced no batches")
+    return prepared
+
+
+@torch.no_grad()
+def evaluate_attack(
     detector: AudioSealDetector,
     attack: nn.Module,
-    dataloader,
+    eval_batches: tp.List[PreparedEvalBatch],
     cfg: EvalConfig,
     device: torch.device,
     strength: tp.Optional[float] = None,
@@ -165,17 +190,10 @@ def evaluate_attack(
     negative_scores = []
     bit_accs = []
 
-    batches = 0
-    for batch in dataloader:
-        if batches >= cfg.n_eval_batches:
-            break
-        batches += 1
-
-        x = batch.to(device)
-        message = random_message(cfg.nbits, x.size(0), device=device)
-
-        watermark = generator.get_watermark(x, message=message)
-        x_wm = x + watermark
+    for x_cpu, x_wm_cpu, message_cpu in eval_batches:
+        x = x_cpu.to(device)
+        x_wm = x_wm_cpu.to(device)
+        message = message_cpu.to(device)
 
         x_att_pos = attack(x_wm, strength=strength)
         x_att_neg = attack(x, strength=strength)
@@ -200,21 +218,15 @@ def evaluate_attack(
 
 @torch.no_grad()
 def evaluate_perceptual(
-    generator: AudioSealWM, dataloader, cfg: EvalConfig, device: torch.device
+    eval_batches: tp.List[PreparedEvalBatch], cfg: EvalConfig, device: torch.device
 ) -> tp.Dict[str, float]:
     """No attack: x vs x_wm only."""
     sisnr_values = []
     pesq_values = []
 
-    batches = 0
-    for batch in dataloader:
-        if batches >= cfg.n_eval_batches:
-            break
-        batches += 1
-
-        x = batch.to(device)
-        message = random_message(cfg.nbits, x.size(0), device=device)
-        x_wm = x + generator.get_watermark(x, message=message)
+    for x_cpu, x_wm_cpu, _ in eval_batches:
+        x = x_cpu.to(device)
+        x_wm = x_wm_cpu.to(device)
 
         if cfg.compute_sisnr:
             sisnr_values.append(sisnr_score(x, x_wm))
@@ -240,6 +252,7 @@ def evaluate_perceptual(
 def run(cfg: EvalConfig) -> tp.Dict[str, tp.Any]:
     device = resolve_device(cfg.device)
     torch.manual_seed(cfg.seed)
+    random.seed(cfg.seed)
 
     generator = load_generator_under_test(cfg.generator_checkpoint, cfg.nbits, device)
     generator.eval()
@@ -258,6 +271,7 @@ def run(cfg: EvalConfig) -> tp.Dict[str, tp.Any]:
         num_workers=0,
         shuffle=False,
     )
+    eval_batches = prepare_eval_batches(generator, dataloader, cfg, device)
 
     tracker = build_tracker(
         backend=cfg.tracking.backend,
@@ -285,7 +299,7 @@ def run(cfg: EvalConfig) -> tp.Dict[str, tp.Any]:
     try:
         logger.info("=== perceptual metrics (no attack) ===")
         _reset_peak_memory(device)
-        perceptual = evaluate_perceptual(generator, dataloader, cfg, device)
+        perceptual = evaluate_perceptual(eval_batches, cfg, device)
         perceptual.update(_peak_memory_metrics(device))
         results["perceptual"] = perceptual
         tracker.log({f"perceptual/{k}": v for k, v in perceptual.items()}, step=0)
@@ -302,7 +316,7 @@ def run(cfg: EvalConfig) -> tp.Dict[str, tp.Any]:
             logger.info("=== attack=%s (%s) ===", name, tag)
             try:
                 _reset_peak_memory(device)
-                robustness = evaluate_attack(generator, detector, attack, dataloader, cfg, device)
+                robustness = evaluate_attack(detector, attack, eval_batches, cfg, device)
                 robustness.update(_peak_memory_metrics(device))
                 results["attacks"][name] = {"tag": tag, **robustness}
                 loggable = {k: v for k, v in robustness.items() if k != "confusion"}
@@ -319,9 +333,7 @@ def run(cfg: EvalConfig) -> tp.Dict[str, tp.Any]:
                 curve = []
                 for t_star in cfg.t_star_grid:
                     try:
-                        point = evaluate_attack(
-                            generator, detector, attack, dataloader, cfg, device, strength=t_star
-                        )
+                        point = evaluate_attack(detector, attack, eval_batches, cfg, device, strength=t_star)
                         curve.append({"t_star": t_star, **point})
                         tracker.log({f"{name}/tpr_at_fpr_vs_t_star": point["tpr_at_fpr"]}, step=int(t_star * 1000))
                     except NotImplementedError:
