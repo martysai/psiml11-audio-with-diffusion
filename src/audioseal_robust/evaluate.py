@@ -18,12 +18,15 @@ Then again after fine-tuning, same eval set, pointing at the checkpoint:
         label=finetuned_epoch10 \\
         generator_checkpoint=./checkpoints/audioseal_robust/generator_epoch10.pth
 
-Attacks that are still stubs (see attacks.py -- currently bigvgan, dac,
-sgmse, diff_erase all raise NotImplementedError until a checkpoint is wired
-up) are individually caught and reported as "skipped", not fatal -- so this
-is runnable today, giving you the identity-attack + perceptual baseline
-immediately, and picks up each attack's real numbers as it gets implemented
-without any change to this script.
+Attacks that are still stubs (see attacks.py -- bigvgan, dac, sgmse raise
+NotImplementedError until a checkpoint is configured; diff_erase is wired to
+DiffErase-latent, see attacks.py's DiffEraseAttack and
+EvalAttackConfig.diff_erase in config.py, but still raises the same way if
+its checkpoint/config/differase_root aren't set) are individually caught and
+reported as "skipped", not fatal -- so this is runnable today, giving you
+the identity-attack + perceptual baseline immediately, and picks up each
+attack's real numbers as its checkpoint gets configured without any change
+to this script.
 """
 
 import logging
@@ -32,6 +35,7 @@ from pathlib import Path
 
 import torch
 import torch.nn as nn
+from omegaconf import OmegaConf
 
 from audioseal import AudioSeal
 from audioseal.loader import load_state_dict as audioseal_load_state_dict
@@ -74,20 +78,43 @@ def load_generator_under_test(checkpoint: str, nbits: int, device: torch.device)
     return AudioSeal.load_generator(checkpoint, nbits=nbits, device=device)
 
 
-def build_eval_attacks(names: tp.List[str], device: torch.device) -> tp.Dict[str, nn.Module]:
-    """Builds one instance per requested attack name, all with checkpoint=None
-    (i.e. the still-stubbed ones) unless/until real checkpoints are wired
-    into config -- see attacks.py TODOs."""
+_CONSTRUCTION_SKIP_EXCEPTIONS = (NotImplementedError, FileNotFoundError, ModuleNotFoundError)
+
+
+def build_eval_attacks(
+    names: tp.List[str], device: torch.device, cfg: EvalConfig
+) -> tp.Tuple[tp.Dict[str, nn.Module], tp.Dict[str, str]]:
+    """Builds one instance per requested attack name, constructed with that
+    attack's `cfg.attack.<name>` sub-config (checkpoint, and whatever else
+    that attack class takes -- see attacks.py). `identity` has no matching
+    sub-config, so it's always built with defaults.
+
+    Unlike `evaluate_attack`'s forward-time failures, a still-stubbed or
+    misconfigured attack (missing checkpoint, missing companion
+    config/differase_root, or a backbone package that isn't installed in
+    this env) can now fail at *construction* time too, since a real
+    checkpoint path is actually threaded through. That's caught here rather
+    than left to crash the whole run: returns `(attacks, skipped)`, the
+    latter mapping name -> error message for run()'s loop to report exactly
+    like a forward-time "skipped" (see `_CONSTRUCTION_SKIP_EXCEPTIONS`).
+    """
     attacks: tp.Dict[str, nn.Module] = {}
+    skipped: tp.Dict[str, str] = {}
     for name in names:
         if name not in _ATTACK_CLASSES:
             raise ValueError(f"Unknown attack {name!r}, expected one of {sorted(_ATTACK_CLASSES)}")
-        module = _ATTACK_CLASSES[name]()
+        attack_cfg = getattr(cfg.attack, name, None)
+        kwargs = tp.cast(tp.Dict[str, tp.Any], OmegaConf.to_container(attack_cfg)) if attack_cfg is not None else {}
+        try:
+            module = _ATTACK_CLASSES[name](**kwargs)
+        except _CONSTRUCTION_SKIP_EXCEPTIONS as e:
+            skipped[name] = str(e)
+            continue
         module.eval()
         for p in module.parameters():
             p.requires_grad_(False)
         attacks[name] = module.to(device)
-    return attacks
+    return attacks, skipped
 
 
 @torch.no_grad()
@@ -191,7 +218,7 @@ def run(cfg: EvalConfig) -> tp.Dict[str, tp.Any]:
     detector.eval()
 
     all_attack_names = list(cfg.eval_attacks) + list(cfg.held_out_attacks)
-    attacks = build_eval_attacks(all_attack_names, device)
+    attacks, skipped_at_construction = build_eval_attacks(all_attack_names, device, cfg)
     held_out = set(cfg.held_out_attacks)
 
     dataloader = build_dataloader(
@@ -221,8 +248,13 @@ def run(cfg: EvalConfig) -> tp.Dict[str, tp.Any]:
         logger.info("perceptual: %s", perceptual)
 
         results["attacks"] = {}
-        for name, attack in attacks.items():
+        for name in all_attack_names:
             tag = "held_out" if name in held_out else "trained"
+            if name in skipped_at_construction:
+                logger.warning("skipping attack=%s (%s): %s", name, tag, skipped_at_construction[name])
+                results["attacks"][name] = {"tag": tag, "skipped": skipped_at_construction[name]}
+                continue
+            attack = attacks[name]
             logger.info("=== attack=%s (%s) ===", name, tag)
             try:
                 robustness = evaluate_attack(generator, detector, attack, dataloader, cfg, device)

@@ -19,18 +19,22 @@ import torchaudio
 from torch.utils.data import Dataset
 
 
+_AUDIO_EXTENSIONS = (".wav", ".flac")
+
+
 class WavDirDataset(Dataset):
-    """Recursively collects .wav files under `root`, and on each __getitem__
-    returns a random `segment_duration`-second mono crop resampled to
-    `sample_rate`. Files shorter than the segment are looped."""
+    """Recursively collects audio files (.wav, .flac -- anything torchaudio.load
+    can decode) under `root`, and on each __getitem__ returns a random
+    `segment_duration`-second mono crop resampled to `sample_rate`. Files
+    shorter than the segment are looped."""
 
     def __init__(self, root: str, sample_rate: int = 16_000, segment_duration: float = 1.0):
         self.root = Path(root)
         self.sample_rate = sample_rate
         self.segment_samples = int(segment_duration * sample_rate)
-        self.files = sorted(self.root.rglob("*.wav"))
+        self.files = sorted(p for ext in _AUDIO_EXTENSIONS for p in self.root.rglob(f"*{ext}"))
         if not self.files:
-            raise RuntimeError(f"No .wav files found under {root}")
+            raise RuntimeError(f"No audio files ({', '.join(_AUDIO_EXTENSIONS)}) found under {root}")
 
     def __len__(self) -> int:
         return len(self.files)
