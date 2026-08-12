@@ -18,7 +18,7 @@ updates_per_epoch: 1000
 log_every: 50
 checkpoint_dir: ./checkpoints/audioseal_robust
 seed: 1234
-valid_batches: 10
+eval_every: 0
 recipe: null
 
 lambda_det: 1.0

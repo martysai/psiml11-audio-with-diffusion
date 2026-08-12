@@ -2,7 +2,6 @@ from multiprocessing.sharedctypes import Value
 import statistics
 import sys
 import os
-from tkinter import E
 
 import torch
 import torch.nn as nn

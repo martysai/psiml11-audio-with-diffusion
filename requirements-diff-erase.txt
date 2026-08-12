@@ -23,10 +23,26 @@ braceexpand
 webdataset
 wget
 timm
-taming-transformers  # AutoencoderKL's training-time LPIPS loss pulls this in
-                      # unconditionally at import time, even though we only
-                      # ever call encode/decode, never train it
 wandb                 # imported at module level by modules/latent_encoder/autoencoder.py
+
+# Also reached during construction/forward -- these came in transitively on
+# the dev machine, so they were easy to miss until every import was verified
+# against sys.modules after a real DiffEraseAttack build + forward pass.
+# Pin-free on purpose; they're all widely-compatible pure-Python packages.
+pyyaml                # `import yaml` in attacks.py:DiffEraseAttack._load_backbone
+soundfile             # modules/latent_{encoder/autoencoder,diffusion/ddpm}.py
+tqdm                  # utilities/tools.py
+pillow                # utilities/model_util.py (log_txt_as_img)
+scikit-learn          # modules/clap/open_clip/loss.py
+requests              # utilities/tools.py
+regex                 # modules/clap/open_clip/tokenizer.py
+
+# taming-transformers is deliberately NOT listed. AutoencoderKL builds a
+# training-time LPIPS perceptual loss in __init__ that would need it, but
+# DiffEraseAttack._load_backbone swaps that lossconfig for a no-op before
+# construction (we only ever call encode/decode, never train the VAE). That
+# also avoids LPIPS downloading a ~500MB vgg.pth into a *relative* path,
+# which fails outright when the weights dir is a read-only mount.
 
 # Not installed via this file: the actual checkpoints (VAE, HiFiGAN, a
 # LatentDiffusion model, and -- yes, still -- a CLAP checkpoint for the

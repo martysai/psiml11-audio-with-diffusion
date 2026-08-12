@@ -6,24 +6,45 @@
 # No checkpoint file to supply: audiocraft downloads its own pretrained
 # weights from HF on first use (set attack.mbd.checkpoint to any non-None
 # value to enable the attack).
-
-# NOTE: install with --no-deps. audiocraft's dependency closure pulls in
+#
+# INSTALL IN TWO STEPS -- audiocraft is deliberately not listed below:
+#
+#   pip install --no-deps audiocraft
+#   pip install -r requirements-mbd.txt
+#
+# audiocraft needs --no-deps because its dependency closure pulls in
 # spacy -> thinc, whose Cython sources fail to build against numpy>=2 on
-# recent toolchains; that whole branch is MusicGen text-conditioning, which
+# recent toolchains. That whole branch is MusicGen text-conditioning, which
 # MBD never touches. The packages below are what MBD actually needs at
-# import/run time, found by running the real import chain:
-#   pip install --no-deps -U audiocraft && pip install -r requirements-mbd.txt
-audiocraft
+# import/run time, found by running the real import chain until nothing was
+# left unresolved -- they install normally, with their own deps.
+
 av
 julius
 num2words
 spacy       # imported at module level by audiocraft.modules.conditioners
 flashy      # imported at module level by audiocraft.quantization.core_vq
 
-# NOT listed: xformers. audiocraft.modules.transformer does
-# `from xformers import ops` unconditionally at import time, but only calls
-# into it when _efficient_attention_backend == 'xformers' (default 'torch').
-# It has no prebuilt wheel for every platform and building from source is
-# slow/fragile; if it's missing in your env, a two-file stub package
-# satisfying just that import is enough (see the comment inside the stub, or
-# install real xformers if your platform has a wheel).
+# audiocraft.modules.transformer does `from xformers import ops` at import
+# time, but only calls into it when _efficient_attention_backend ==
+# 'xformers' (default is 'torch'), so MBD never executes that code -- the
+# import just has to resolve. Prebuilt wheels exist for Linux + CUDA (the
+# A100 box), so this installs cleanly there.
+xformers
+
+# If you're on a platform with no xformers wheel and a failing source build
+# (macOS ARM, as of this writing), drop the line above and satisfy the import
+# with a two-file stub package instead:
+#
+#   SITE=$(python3 -c "import site; print(site.getsitepackages()[0])")
+#   mkdir -p "$SITE/xformers"
+#   echo '__version__ = "0.0.0-stub"' > "$SITE/xformers/__init__.py"
+#   cat > "$SITE/xformers/ops.py" <<'EOF'
+#   def _unavailable(*args, **kwargs):
+#       raise NotImplementedError("xformers is a stub; needs the 'xformers' attention backend, unsupported here.")
+#   unbind = _unavailable
+#   memory_efficient_attention = _unavailable
+#   EOF
+#
+# The stubs raise loudly rather than silently doing the wrong thing, so if
+# that backend ever does get selected you'll get a clear error, not garbage.

@@ -31,6 +31,32 @@ import torch.nn as nn
 import torchaudio
 
 
+def detection_loss_components(
+    p: torch.Tensor,
+    m_hat: torch.Tensor,
+    message: torch.Tensor,
+    presence_target: float = 1.0,
+    eps: float = 1e-6,
+) -> tp.Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Same computation as `detection_loss`, but also returns the two terms
+    separately -- for logging (see train.py's train_step), where "all the
+    losses" means presence and bit-message loss individually, not just their
+    sum.
+
+    Args: same as `detection_loss`.
+
+    Returns:
+        (presence_loss + bit_loss, presence_loss, bit_loss) -- all scalars.
+    """
+    bce = nn.BCELoss()
+    target_presence = torch.full_like(p, presence_target)
+    presence_loss = bce(p.clamp(eps, 1 - eps), target_presence)
+
+    bit_loss = bce(m_hat.clamp(eps, 1 - eps), message.float())
+
+    return presence_loss + bit_loss, presence_loss, bit_loss
+
+
 def detection_loss(
     p: torch.Tensor,
     m_hat: torch.Tensor,
@@ -55,15 +81,12 @@ def detection_loss(
             (which would produce -inf/NaN gradients).
 
     Returns:
-        Scalar loss: presence term + message-bit term.
+        Scalar loss: presence term + message-bit term. Use
+        `detection_loss_components` instead if you also want the two terms
+        separately.
     """
-    bce = nn.BCELoss()
-    target_presence = torch.full_like(p, presence_target)
-    presence_loss = bce(p.clamp(eps, 1 - eps), target_presence)
-
-    bit_loss = bce(m_hat.clamp(eps, 1 - eps), message.float())
-
-    return presence_loss + bit_loss
+    loss, _, _ = detection_loss_components(p, m_hat, message, presence_target, eps)
+    return loss
 
 
 def _absolute_threshold_of_hearing_db(freq_hz: torch.Tensor) -> torch.Tensor:
