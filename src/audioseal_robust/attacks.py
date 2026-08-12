@@ -510,6 +510,106 @@ class DiffEraseAttack(nn.Module):
         return wav_out.unsqueeze(1).to(x.dtype)
 
 
+class MBDAttack(nn.Module):
+    """Held-out attack (same status as DiffEraseAttack -- eval only, NEVER
+    given nonzero weight in AttackConfig.weights during training): Meta's
+    MultiBand Diffusion (github.com/facebookresearch/audiocraft,
+    `docs/MBD.md`), an EnCodec-conditioned diffusion decoder. Per the
+    mentor's plan (2026-08-12 Notion doc), this is the intended replacement/
+    complement for DiffEraseAttack's AudioLDM as "a diffusion model not
+    trained specifically on watermark removal, but that can incidentally
+    remove them due to the neural encoding embedded into the system":
+
+        c = Q(E(x_wm))              -- EnCodec encoder + quantizer -> discrete codes
+        x_hat = F_diffusion(c, z)   -- MBD's diffusion decoder, z ~ N(0, I)
+
+    The new waveform keeps the information contained in `c` (speech
+    content, speaker characteristics) but has different samples/phase/fine
+    structure -- and, hopefully, less of the watermark, which the codec's
+    quantization bottleneck has no reason to preserve.
+
+    Runs natively at 24kHz; `regenerate()` handles the 16kHz<->24kHz
+    resampling internally (see forward below), matching the pipeline in the
+    mentor's plan (upsample -> EnCodec -> MBD -> downsample -> detector).
+
+    `strength`: unlike DiffEraseAttack/SGMSEAttack, MBD has no continuous
+    corruption-level knob -- the closest analogue is bitrate (fewer bits
+    through the EnCodec bottleneck = more information thrown away = a
+    stronger attack). `bandwidth` (1.5/3.0/6.0 kbps, MBD's only supported
+    values) is fixed at construction rather than swept per-call, same
+    reasoning as DACAttack's docstring for why `strength` goes unused here
+    -- wire up a 3-point bitrate-vs-robustness curve if you want one.
+
+    No local checkpoint needed: `get_mbd_24khz()` downloads its own
+    pretrained weights from HF on first use. `checkpoint` here is just the
+    usual enable/disable gate (matching every other attack's config
+    pattern) -- set it to any non-None value (e.g. "auto") to turn this on.
+    """
+
+    def __init__(
+        self,
+        checkpoint: tp.Optional[str] = None,
+        sample_rate: int = 16_000,
+        bandwidth: float = 3.0,
+    ):
+        super().__init__()
+        self.sample_rate = sample_rate
+        self.checkpoint = checkpoint
+        self.bandwidth = bandwidth
+        self._mbd: tp.Optional[tp.Any] = None
+        if checkpoint is not None:
+            self._load_backbone(checkpoint)
+
+    def _load_backbone(self, checkpoint: str) -> None:
+        from audiocraft.models import MultiBandDiffusion
+
+        original_torch_load = torch.load
+        # audiocraft.models.loaders._get_state_dict calls torch.load()
+        # without weights_only=False; the checkpoint embeds an omegaconf
+        # DictConfig (their model config), which PyTorch >=2.6's default
+        # weights_only=True unpickler refuses as an untrusted global. Patch
+        # the default rather than editing their source (same approach as
+        # DiffEraseAttack's torch.load patch).
+        torch.load = functools.partial(original_torch_load, weights_only=False)
+        try:
+            mbd = MultiBandDiffusion.get_mbd_24khz(bw=self.bandwidth)
+        finally:
+            torch.load = original_torch_load
+
+        # mbd itself is a plain wrapper, not an nn.Module -- its component
+        # models (mbd.codec_model, one per mbd.DPs[i].model, one per
+        # frequency band) are NOT auto-registered as submodules of this
+        # class, so the outer freeze/`.to(device)` dance in
+        # evaluate.py:build_eval_attacks never reaches them. Freeze here
+        # explicitly; forward() below re-syncs device on every call for the
+        # same reason.
+        for p in mbd.codec_model.parameters():
+            p.requires_grad_(False)
+        for dp in mbd.DPs:
+            for p in dp.model.parameters():
+                p.requires_grad_(False)
+        self._mbd = mbd
+
+    def forward(self, x: torch.Tensor, strength: tp.Optional[float] = None) -> torch.Tensor:
+        if self._mbd is None:
+            raise NotImplementedError(
+                "MBDAttack was constructed without a checkpoint (see class "
+                "docstring in src/audioseal_robust/attacks.py). Either "
+                "provide attack.mbd.checkpoint (any non-None value -- MBD "
+                "downloads its own weights) or remove mbd from "
+                "eval.held_out_attacks to skip it."
+            )
+        current_device = next(self._mbd.codec_model.parameters()).device
+        if current_device != x.device:
+            self._mbd.codec_model.to(x.device)
+            for dp in self._mbd.DPs:
+                dp.model.to(x.device)
+            self._mbd.device = x.device
+        with torch.no_grad():
+            out = self._mbd.regenerate(x, sample_rate=self.sample_rate)
+        return out[..., : x.shape[-1]].to(x.dtype)
+
+
 class SampledReconstructionAttack(nn.Module):
     """On every forward call, randomly samples ONE of the registered attacks
     (by name, weighted) and applies it. The chosen attack's parameters (if

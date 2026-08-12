@@ -41,7 +41,7 @@ from audioseal import AudioSeal
 from audioseal.loader import load_state_dict as audioseal_load_state_dict
 from audioseal.models import AudioSealDetector, AudioSealWM
 
-from .attacks import BigVGANAttack, DACAttack, DiffEraseAttack, IdentityAttack, SGMSEAttack
+from .attacks import BigVGANAttack, DACAttack, DiffEraseAttack, IdentityAttack, MBDAttack, SGMSEAttack
 from .config import EvalConfig, load_eval_config
 from .data import build_dataloader
 from .device import resolve_device
@@ -59,6 +59,7 @@ _ATTACK_CLASSES: tp.Dict[str, tp.Type[nn.Module]] = {
     "dac": DACAttack,
     "sgmse": SGMSEAttack,
     "diff_erase": DiffEraseAttack,
+    "mbd": MBDAttack,
 }
 
 

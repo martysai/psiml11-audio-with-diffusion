@@ -91,6 +91,22 @@ class DiffEraseAttackConfig:
 
 
 @dataclass
+class MBDAttackConfig:
+    """Wires MBDAttack (attacks.py) -- Meta's MultiBand Diffusion, via the
+    `audiocraft` pip package. Unlike every other attack here, no local
+    weights file is needed: audiocraft downloads its own pretrained
+    checkpoint from HF on first use."""
+
+    # Enable/disable gate only (any non-None value, e.g. "auto", turns the
+    # attack on) -- kept named `checkpoint` for consistency with the other
+    # *AttackConfig classes and evaluate.py's uniform handling.
+    checkpoint: tp.Optional[str] = None
+    # EnCodec bitrate in kbps -- MBD only supports 1.5, 3.0, or 6.0. Lower =
+    # more information discarded by the codec bottleneck = stronger attack.
+    bandwidth: float = 3.0
+
+
+@dataclass
 class AttackWeights:
     # Sampling weight for each of the 4 attack branches (need not sum to 1;
     # normalized internally). A weight of 0 disables that branch. Identity is
@@ -192,12 +208,13 @@ class TrainConfig:
 class EvalAttackConfig:
     """Per-attack extra settings for evaluate.py's attacks (checkpoints etc),
     separate from TrainConfig's AttackConfig since eval also runs held-out
-    attacks (diff_erase) that training must never see."""
+    attacks (diff_erase, mbd) that training must never see."""
 
     bigvgan: BigVGANAttackConfig = field(default_factory=BigVGANAttackConfig)
     dac: DACAttackConfig = field(default_factory=DACAttackConfig)
     sgmse: SGMSEAttackConfig = field(default_factory=SGMSEAttackConfig)
     diff_erase: DiffEraseAttackConfig = field(default_factory=DiffEraseAttackConfig)
+    mbd: MBDAttackConfig = field(default_factory=MBDAttackConfig)
 
 
 @dataclass
@@ -266,7 +283,7 @@ class EvalConfig:
     # during training. This is the generalization probe -- "did robustness
     # transfer to an attack the generator never saw, or did it just
     # memorize the training attacks."
-    held_out_attacks: tp.List[str] = field(default_factory=lambda: ["diff_erase"])
+    held_out_attacks: tp.List[str] = field(default_factory=lambda: ["diff_erase", "mbd"])
 
     # Perceptual (watermarked vs. original, no attack).
     compute_pesq: bool = True
