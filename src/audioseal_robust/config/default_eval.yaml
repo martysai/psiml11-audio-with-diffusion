@@ -17,6 +17,13 @@ eval_dir: ???
 segment_duration: 3.0
 batch_size: 8
 n_eval_batches: 20
+# Batches per robustness-curve point, cheaper than the headline number's
+# n_eval_batches -- the curve is a shape read off a plot, the headline TPR@FPR
+# is the number that gets quoted. See EvalConfig.n_curve_batches in config.py.
+n_curve_batches: 6
+# Eval-set dataloader workers. 0 serializes audio decode+resample with the
+# forward passes on the main thread (a CPU stall between every batch).
+num_workers: 4
 output_dir: ./eval_outputs
 
 # See EvalConfig.t_star_grid in config.py for how these were calibrated
@@ -25,6 +32,13 @@ output_dir: ./eval_outputs
 # regime" and just destroys the audio).
 fpr_target: 0.01
 t_star_grid: [0.0, 0.0003, 0.002, 0.006, 0.015, 0.04, 0.08]
+# The one t* the headline number is measured at for sgmse/diff_erase (the
+# other attacks ignore strength). 0.04 = t*=40 = the mentor table's "hard
+# regime". NOT optional: leaving it unset makes each attack draw its own
+# random t* per forward call, which is both ~12x slower on diff_erase and
+# gives positives/negatives different strengths. See
+# EvalConfig.headline_strength in config.py.
+headline_strength: 0.04
 
 eval_attacks: [identity, bigvgan, dac, sgmse]
 held_out_attacks: [diff_erase, mbd]
@@ -43,8 +57,16 @@ attack:
   dac:
     checkpoint: null
   sgmse:
+    # Eval-only step count (the TRAIN config keeps its own num_steps: 30) --
+    # each step is corrector+predictor = 2 score-model calls, and eval never
+    # backprops through them, so this is the single biggest sgmse lever. Note
+    # the sampler's timesteps linspace always spans num_steps regardless of
+    # t*, so low-t* curve points pay the same per-step cost as high ones.
+    # TODO(sanity-check): confirm on a few batches that TPR@FPR at
+    # num_steps=10 matches num_steps=30 within noise before trusting any
+    # sgmse number quoted from this default; bump it back up if it doesn't.
     checkpoint: null
-    num_steps: 30
+    num_steps: 10
   diff_erase:
     checkpoint: null
     config: null
