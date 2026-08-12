@@ -9,10 +9,20 @@ torchmetrics            # evaluate.py: SI-SNR, PESQ (see metrics.py)
 pesq                    # backing library for torchmetrics' PESQ wrapper
 matplotlib              # evaluate.py: confusion-matrix + robustness-curve plots (see plotting.py)
 
-# BigVGAN / DAC / SGMSE attack backbones are NOT listed here -- they are
-# stubbed with NotImplementedError + setup instructions in
-# src/audioseal_robust/attacks.py until checkpoints/package versions are
-# picked.
+# BigVGAN / DAC attack backbones are NOT listed here -- they are stubbed
+# with NotImplementedError + setup instructions in src/audioseal_robust/
+# attacks.py until checkpoints/package versions are picked.
+
+# SGMSEAttack needs src/sgmse/ (vendored, see that directory's VENDORED.md).
+# torch-ema/torchsde/torch-pesq/torchinfo/pystoi are its own inference-time
+# deps beyond what's already listed above; gdown is only needed to fetch a
+# checkpoint from their Google Drive links, not at runtime.
+gdown
+torch-ema
+torchsde
+torch-pesq
+torchinfo
+pystoi
 
 # DiffEraseAttack (the diff_erase held-out attack) needs src/audioldm_train/
 # (vendored, see that directory's VENDORED.md) -- its dependencies are listed

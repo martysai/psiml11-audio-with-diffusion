@@ -29,7 +29,7 @@ from audioseal.builder import (
     create_detector,
     create_generator,
 )
-from audioseal_robust.attacks import DiffEraseAttack, IdentityAttack, SampledReconstructionAttack
+from audioseal_robust.attacks import DiffEraseAttack, IdentityAttack, SampledReconstructionAttack, SGMSEAttack
 from audioseal_robust.config import load_eval_config
 from audioseal_robust.evaluate import build_eval_attacks
 from audioseal_robust.losses import PsychoacousticMelLoss, detection_loss
@@ -149,6 +149,17 @@ def test_sampled_attack_only_picks_enabled_branches():
     for _ in range(20):
         _, name = attack(x)
         assert name == "identity"
+
+
+def test_sgmse_attack_without_checkpoint_stays_a_stub():
+    attack = SGMSEAttack()
+    with pytest.raises(NotImplementedError, match="constructed without a checkpoint"):
+        attack(torch.randn(1, 1, 1600))
+
+
+def test_sgmse_attack_missing_checkpoint_file_raises_clear_error(tmp_path):
+    with pytest.raises(FileNotFoundError, match="SGMSE checkpoint not found"):
+        SGMSEAttack(checkpoint=str(tmp_path / "no_such_checkpoint.ckpt"))
 
 
 def test_diff_erase_attack_without_checkpoint_stays_a_stub():
