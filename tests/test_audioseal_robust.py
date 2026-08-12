@@ -16,9 +16,15 @@ pretrained checkpoint) so this runs fast and offline.
 """
 
 import copy
+import os
+import sys
 
 import pytest
 import torch
+
+ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if ROOT_DIR not in sys.path:
+    sys.path.insert(0, ROOT_DIR)
 
 from audioseal.builder import (
     AudioSealDetectorConfig,
@@ -36,7 +42,7 @@ from audioseal_robust.attacks import (
     SampledReconstructionAttack,
     SGMSEAttack,
 )
-from audioseal_robust.config import load_eval_config
+from audioseal_robust.config import load_config, load_eval_config
 from audioseal_robust.evaluate import build_eval_attacks
 from audioseal_robust.losses import PsychoacousticMelLoss, detection_loss
 from audioseal_robust.train import embed_watermark
@@ -230,6 +236,46 @@ def test_build_eval_attacks_threads_per_attack_config_through():
     attacks, skipped = build_eval_attacks(["identity", "sgmse"], torch.device("cpu"), cfg)
     assert not skipped
     assert attacks["sgmse"].num_steps == 7
+
+
+def test_train_recipe_diff_erase_sets_weights():
+    """recipe=diff_erase (config/recipes.yaml) should train against
+    DiffErase and zero out the identity-only default.yaml fallback."""
+    cfg = load_config(["recipe=diff_erase", "data.train_dir=."])
+    assert cfg.attack.weights.identity == 0.0
+    assert cfg.attack.weights.diff_erase == 1.0
+    assert cfg.attack.weights.sgmse == 0.0
+
+
+def test_train_recipe_sgmse_sets_weights():
+    """The opposite direction: recipe=sgmse trains against SGMSE instead,
+    leaving diff_erase at its default (disabled) weight."""
+    cfg = load_config(["recipe=sgmse", "data.train_dir=."])
+    assert cfg.attack.weights.identity == 0.0
+    assert cfg.attack.weights.sgmse == 1.0
+    assert cfg.attack.weights.diff_erase == 0.0
+
+
+def test_train_recipe_cli_override_wins_over_recipe():
+    """Regression test for merge order: CLI overrides must be applied AFTER
+    the recipe, so an explicit CLI value for a field the recipe also sets
+    still wins (letting you tweak one field without forking the recipe)."""
+    cfg = load_config(["recipe=diff_erase", "data.train_dir=.", "attack.weights.diff_erase=0.5"])
+    assert cfg.attack.weights.diff_erase == 0.5
+
+
+def test_eval_recipe_after_sgmse_training_swaps_held_out():
+    """The eval-side recipe should report sgmse (not diff_erase) as the
+    trained attack and hold diff_erase out instead -- the reverse of
+    default_eval.yaml's plain fallback."""
+    cfg = load_eval_config(["recipe=after_sgmse_training", "eval_dir=."])
+    assert list(cfg.eval_attacks) == ["identity", "bigvgan", "dac", "sgmse"]
+    assert list(cfg.held_out_attacks) == ["diff_erase", "mbd"]
+
+
+def test_unknown_recipe_raises_with_available_names():
+    with pytest.raises(ValueError, match="Unknown train recipe"):
+        load_config(["recipe=nonexistent", "data.train_dir=."])
 
 
 def test_build_eval_attacks_construction_failure_is_skipped_not_fatal():

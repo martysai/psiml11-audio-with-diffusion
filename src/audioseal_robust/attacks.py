@@ -28,8 +28,9 @@ watermarking solver (`audiocraft/utils/audio_effects.py`,
 copy of the input and reattach the *difference* with a straight-through
 estimator. That is a workaround for compression codecs that have no
 meaningful gradient (external, non-differentiable subprocess calls). Since
-BigVGAN/DAC/SGMSE are ordinary neural nets, we don't need that workaround --
-we can and do backprop through them for real.
+BigVGAN/DAC/SGMSE/DiffErase are ordinary neural nets, we don't need that
+workaround -- we can and do backprop through them for real (DiffErase needs a
+little more care to get there -- see that class's own docstring for why).
 """
 
 import functools
@@ -143,20 +144,24 @@ class DACAttack(nn.Module):
 
 
 class SGMSEAttack(nn.Module):
-    """The actual target attack for this project: a diffusion-based
-    reconstruction (SGMSE, score-based generative model for speech
-    enhancement) run on `x_wm`. This is the attack that motivates the whole
-    fine-tuning setup, so it deserves the most care once wired up: unlike
-    BigVGAN/DAC, SGMSE's forward pass is itself an iterative sampler
-    (multiple reverse-diffusion steps), so backprop through it means
-    backprop through every step -- this can be memory-heavy and you may want
-    to cap `num_steps` low during training, or backprop through only the
-    last K steps, rather than the full inference-time step count. Unlike
-    DiffEraseAttack (held-out, eval-only, always under torch.no_grad()),
-    this one's forward pass is NOT wrapped in no_grad -- it's meant to be
-    trainable-against, so gradients must reach back through it into the
-    generator (frozen params via requires_grad_(False), but the graph stays
-    connected, same "frozen but differentiable" pattern as BigVGAN/DAC).
+    """A diffusion-based reconstruction (SGMSE, score-based generative model
+    for speech enhancement) run on `x_wm`. In this project's current config,
+    this is the held-out attack instead (see `held_out_attacks` in
+    evaluate.py / EvalConfig in config.py) -- DiffEraseAttack (AudioLDM) is
+    the one trained against, and SGMSE measures whether robustness
+    generalizes to it. Its forward pass stays differentiable regardless (see
+    below) in case it's re-enabled for training later -- being differentiable
+    costs nothing extra under evaluate.py's outer `torch.no_grad()`.
+
+    Structurally, SGMSE's forward pass is itself an iterative sampler
+    (multiple reverse-diffusion steps), so backprop through it (were it
+    trained against) means backprop through every step -- this can be
+    memory-heavy and you may want to cap `num_steps` low during training, or
+    backprop through only the last K steps, rather than the full
+    inference-time step count. Its forward pass is NOT wrapped in no_grad --
+    gradients can reach back through it into the generator (frozen params
+    via requires_grad_(False), but the graph stays connected, same "frozen
+    but differentiable" pattern as BigVGAN/DAC/DiffErase).
 
     Wired to sp-uhh/sgmse (MIT licensed; vendored under src/sgmse/, see that
     directory's VENDORED.md), an OU-VE SDE score model for speech
@@ -293,13 +298,16 @@ class SGMSEAttack(nn.Module):
 
 
 class DiffEraseAttack(nn.Module):
-    """Held-out diffusion-based watermark-erasure attack: used ONLY for
-    evaluation (see evaluate.py's `held_out_attacks`), NEVER given nonzero
-    weight in `AttackConfig.weights` during training. The whole point of
-    holding it out is to answer "did robustness generalize to an unseen
-    diffusion attack, or did the generator just memorize the specific
-    attack(s) it was trained against" -- if you add it to the training
-    sampler too, you've destroyed the thing this is meant to measure.
+    """The trained attack in this project variant: given nonzero weight in
+    `AttackConfig.weights.diff_erase` during training (see train.py), so the
+    generator is fine-tuned directly against it. SGMSEAttack plays the
+    held-out role instead here (see `held_out_attacks` in evaluate.py /
+    EvalConfig in config.py) -- the generalization question this setup
+    answers is "did robustness trained against AudioLDM-style
+    latent-diffusion resynthesis transfer to a structurally different
+    diffusion attack (SGMSE's OU-VE SDE) it never saw," rather than the
+    reverse. Do not also give `sgmse` nonzero training weight unless you
+    deliberately want to give up that held-out probe.
 
     Wired to DiffErase-latent (github.com/DiffErase/Differase's "Audio
     Pirates" project, the AudioLDM-style latent-diffusion variant):
@@ -309,24 +317,68 @@ class DiffEraseAttack(nn.Module):
     with the pretrained LatentDiffusion model, and vocodes the result back
     to a waveform with the accompanying HiFiGAN. This mirrors the reference
     `Differase/remove_differase-latent.py` script's `process_audio_batch`
-    exactly, just working on in-memory batched tensors (so it slots into
-    evaluate.py's per-batch loop) instead of reading/writing wav files.
+    algorithm, just working on in-memory batched tensors (so it slots into
+    train.py's/evaluate.py's per-batch loops) instead of reading/writing wav
+    files -- see the "differentiability" paragraph below for the one place
+    this implementation deliberately does NOT call through to the reference
+    library's own convenience methods.
 
     Model code (`audioldm_train`, MIT licensed) is vendored under
     `src/audioldm_train/` -- see that directory's VENDORED.md for provenance
-    and the one intentional local change. Only the actual *weights*
-    (multi-GB, never belongs in git) stay external: point `checkpoint` and
-    `config` at files on disk (e.g. a checkout of the Differase repo's
+    and the one intentional local change (unrelated to gradients -- see
+    below). Only the actual *weights* (multi-GB, never belongs in git) stay
+    external: point `checkpoint` and `config` at files on disk (e.g. a
+    checkout of the Differase repo's
     `DiffErase-latent/data/checkpoints/*.ckpt` and
     `DiffErase-latent/audioldm_train/config/**/*.yaml`) you've trained or
     otherwise obtained -- DiffErase-latent's own README is literally about
     *training* one, it ships none. This attack stays disabled (constructing
     it without a checkpoint keeps raising NotImplementedError) until you do
-    -- see EvalAttackConfig.diff_erase in config.py.
+    -- see AttackConfig.diff_erase / EvalAttackConfig.diff_erase in config.py.
 
-    Differentiability isn't required here since eval never backprops (unlike
-    SGMSEAttack, which trains against attacks and does need it) -- the whole
-    reverse-diffusion loop runs under `torch.no_grad()`.
+    Differentiable, same "frozen but differentiable" pattern as
+    BigVGAN/DAC/SGMSE (see module docstring): its own parameters are frozen
+    via `requires_grad_(False)` and the forward pass here is NOT wrapped in
+    `torch.no_grad()`. That alone is NOT sufficient for this model, though --
+    confirmed by reading `audioldm_train/modules/latent_diffusion/ddpm.py`
+    (the vendored `LatentDiffusion` class actually instantiated by the
+    shipped `audioldm_original*.yaml` configs): `encode_first_stage`,
+    `p_sample` (the conditional overload, i.e. the one taking `c`) and
+    `decode_first_stage` are each individually `@torch.no_grad()`-locked (or
+    wrap their body in `with torch.no_grad():`) *inside the vendored class
+    itself*, independent of whatever context this forward() runs in. Calling
+    them would silently detach the graph no matter what we do here. So this
+    forward calls their own undecorated building blocks directly instead --
+    `first_stage_model.encode`/`.decode` (exactly what
+    `encode_first_stage`/`decode_first_stage` call internally) and
+    `p_mean_variance` (what `p_sample` calls internally, then does its own
+    un-decorated noise-injection algebra, inlined below) -- rather than the
+    no_grad-locked wrappers. These primitives are confirmed differentiable
+    independently of this project: `p_losses` (the model's own training-time
+    loss, in the same vendored file) calls `apply_model` -- which
+    `p_mean_variance` itself wraps -- directly, with no such decorator, since
+    the original AudioLDM training pipeline backprops through it too. This
+    is the same "reimplement the library's own sampler loop with its
+    undecorated primitives instead of its no_grad-locked convenience
+    wrapper" pattern SGMSEAttack already uses, for the same reason -- see
+    that class. We do NOT patch the vendored ddpm.py itself to remove those
+    decorators (that would be a second, riskier local modification beyond
+    VENDORED.md's documented one, and isn't necessary since the undecorated
+    primitives it calls are already reachable directly).
+
+    Backpropagating through the reverse-diffusion loop means backprop
+    through one U-Net forward per step -- expensive. Random `strength`
+    sampling (`strength=None`) is therefore capped at `strength_max`
+    (default 0.08) rather than drawn from the full [0, 1] range:
+    `strength_max=0.08` caps `noise_timestep` at ~80 (out of a typical
+    `num_timesteps=1000`), matching EvalConfig.t_star_grid's own calibrated
+    "hard regime" ceiling (see that field's comment in config.py) rather
+    than an arbitrary cutoff -- going further raises step count (and
+    therefore memory) roughly linearly, well past the point that curve was
+    calibrated against. evaluate.py still wraps every call in
+    `torch.no_grad()` at the call site regardless of this attack's own
+    differentiability, so eval's cost/behavior doesn't change -- only
+    training exercises the backprop path.
     """
 
     def __init__(
@@ -334,11 +386,13 @@ class DiffEraseAttack(nn.Module):
         checkpoint: tp.Optional[str] = None,
         config: tp.Optional[str] = None,
         sample_rate: int = 16_000,
+        strength_max: float = 0.08,
     ):
         super().__init__()
         self.sample_rate = sample_rate
         self.checkpoint = checkpoint
         self.config_path = config
+        self.strength_max = strength_max
         self._model: tp.Optional[nn.Module] = None
         self._vocoder: tp.Optional[nn.Module] = None
         self._stft: tp.Optional[nn.Module] = None
@@ -428,16 +482,22 @@ class DiffEraseAttack(nn.Module):
 
     def forward(self, x: torch.Tensor, strength: tp.Optional[float] = None) -> torch.Tensor:
         """`strength` is t* in [0, 1] (see class docstring); None means
-        "sample it randomly", matching SGMSEAttack's convention."""
+        "sample it randomly", capped at `self.strength_max` (see class
+        docstring for why -- backprop-depth/memory, not a correctness bound:
+        an explicitly-passed `strength` above `strength_max`, e.g. from
+        evaluate.py's t_star_grid, is honored as-is, only clamped to
+        [0, 1])."""
         if self._model is None:
             raise NotImplementedError(
                 "DiffEraseAttack was constructed without a checkpoint (see "
                 "class docstring in src/audioseal_robust/attacks.py). Either "
-                "set eval.diff_erase.{checkpoint,config} or remove diff_erase "
-                "from eval.held_out_attacks to skip it."
+                "set attack.diff_erase.{checkpoint,config} (training) / "
+                "eval.diff_erase.{checkpoint,config} (eval), or set "
+                "attack.weights.diff_erase=0 / remove diff_erase from "
+                "eval_attacks to skip it."
             )
         if strength is None:
-            strength = random.random()
+            strength = random.random() * self.strength_max
         strength = float(min(max(strength, 0.0), 1.0))
 
         device = x.device
@@ -450,58 +510,84 @@ class DiffEraseAttack(nn.Module):
         else:
             wav = wav[..., :target_len]
 
-        with torch.no_grad():
-            mel, *_ = self._stft.mel_spectrogram(wav)  # (B, n_mel, T_frames)
-            mel_input = mel.permute(0, 2, 1).unsqueeze(1)  # (B, 1, T_frames, n_mel)
+        mel, *_ = self._stft.mel_spectrogram(wav)  # (B, n_mel, T_frames)
+        mel_input = mel.permute(0, 2, 1).unsqueeze(1)  # (B, 1, T_frames, n_mel)
 
-            # Deliberately not using self._model.ema_scope() here: it swaps in
-            # EMA-averaged weights for the duration of the block, but its
-            # bookkeeping (LitEma.copy_to) asserts that every currently-frozen
-            # parameter was ALSO frozen at EMA-construction time -- which
-            # doesn't hold once we (or the caller, e.g. evaluate.py's
-            # build_eval_attacks) freeze this model's parameters post-construction
-            # for inference. Skipping it just means we use the checkpoint's raw
-            # (non-EMA) weights directly, which is a normal, supported choice --
-            # not required for correctness here regardless, since this whole
-            # block already runs under torch.no_grad().
-            posterior = self._model.encode_first_stage(mel_input)
-            z0 = self._model.get_first_stage_encoding(posterior)
+        # Deliberately not using self._model.ema_scope() here: it swaps in
+        # EMA-averaged weights for the duration of the block, but its
+        # bookkeeping (LitEma.copy_to) asserts that every currently-frozen
+        # parameter was ALSO frozen at EMA-construction time -- which
+        # doesn't hold once we (or the caller, e.g. evaluate.py's
+        # build_eval_attacks) freeze this model's parameters post-construction
+        # for inference. Skipping it just means we use the checkpoint's raw
+        # (non-EMA) weights directly, which is a normal, supported choice.
+        #
+        # NOTE: calling self._model.first_stage_model.encode(...) directly
+        # rather than self._model.encode_first_stage(...) -- the latter is
+        # @torch.no_grad()-locked inside the vendored LatentDiffusion class
+        # itself (see class docstring's "differentiability" paragraph for
+        # why this whole function bypasses that wrapper and two others).
+        # This call is otherwise identical to what encode_first_stage does
+        # internally.
+        posterior = self._model.first_stage_model.encode(mel_input)
+        z0 = self._model.get_first_stage_encoding(posterior)
 
-            num_timesteps = self._model.num_timesteps
-            # Valid timestep indices are [0, num_timesteps - 1] -- at
-            # strength=1.0 (the top of t_star_grid's default range) the naive
-            # int(num_timesteps * strength) lands exactly on num_timesteps,
-            # one past the end of the precomputed noise-schedule buffers
-            # (sqrt_alphas_cumprod etc.), and q_sample's index_select crashes.
-            noise_timestep = min(int(num_timesteps * strength), num_timesteps - 1)
-            t_noise = torch.full((z0.shape[0],), noise_timestep, device=device, dtype=torch.long)
-            z = self._model.q_sample(x_start=z0, t=t_noise, noise=torch.randn_like(z0))
+        num_timesteps = self._model.num_timesteps
+        # Valid timestep indices are [0, num_timesteps - 1] -- at
+        # strength=1.0 the naive int(num_timesteps * strength) lands exactly
+        # on num_timesteps, one past the end of the precomputed
+        # noise-schedule buffers (sqrt_alphas_cumprod etc.), and q_sample's
+        # index_select crashes.
+        noise_timestep = min(int(num_timesteps * strength), num_timesteps - 1)
+        t_noise = torch.full((z0.shape[0],), noise_timestep, device=device, dtype=torch.long)
+        z = self._model.q_sample(x_start=z0, t=t_noise, noise=torch.randn_like(z0))
 
-            # "Unconditional" here does NOT mean an empty cond dict -- the
-            # UNet's FiLM layer (extra_film_condition_dim in the config)
-            # asserts its conditioning input is never None whenever the
-            # model was built with a cond_stage_config at all (see
-            # ddpm.py:UNetModel.forward's `assert (y is not None) == ...`).
-            # The correct null condition is each conditioner's own
-            # classifier-free-guidance "empty" embedding
-            # (get_unconditional_condition -- e.g. CLAP's embedding of an
-            # empty-string prompt), same convention as Stable Diffusion's
-            # empty-prompt embedding. Generic over whatever
-            # cond_stage_config the loaded model was built with.
-            cond: tp.Dict[str, tp.Any] = {
-                key: self._model.cond_stage_models[i].get_unconditional_condition(z0.shape[0])
-                for i, key in enumerate(self._model.conditioning_key)
-            }
-            for t in range(noise_timestep, 0, -1):
-                t_tensor = torch.full((z.shape[0],), t, device=device, dtype=torch.long)
-                z = self._model.p_sample(x=z, c=cond, t=t_tensor, clip_denoised=self._model.clip_denoised)
+        # "Unconditional" here does NOT mean an empty cond dict -- the
+        # UNet's FiLM layer (extra_film_condition_dim in the config)
+        # asserts its conditioning input is never None whenever the
+        # model was built with a cond_stage_config at all (see
+        # ddpm.py:UNetModel.forward's `assert (y is not None) == ...`).
+        # The correct null condition is each conditioner's own
+        # classifier-free-guidance "empty" embedding
+        # (get_unconditional_condition -- e.g. CLAP's embedding of an
+        # empty-string prompt), same convention as Stable Diffusion's
+        # empty-prompt embedding. Generic over whatever
+        # cond_stage_config the loaded model was built with.
+        cond: tp.Dict[str, tp.Any] = {
+            key: self._model.cond_stage_models[i].get_unconditional_condition(z0.shape[0])
+            for i, key in enumerate(self._model.conditioning_key)
+        }
+        clip_denoised = self._model.clip_denoised
+        for t in range(noise_timestep, 0, -1):
+            t_tensor = torch.full((z.shape[0],), t, device=device, dtype=torch.long)
+            # Inlined body of LatentDiffusion.p_sample (ddpm.py), minus its
+            # @torch.no_grad() decorator -- see class docstring. p_mean_variance
+            # itself is undecorated (confirmed differentiable: the model's own
+            # p_losses calls apply_model, which this wraps, directly, with no
+            # such decorator). noise_like(shape, device, repeat=False) (what
+            # p_sample calls) is exactly torch.randn(shape, device=device) --
+            # see audioldm_train/utilities/diffusion_util.py:noise_like.
+            model_mean, _, model_log_variance = self._model.p_mean_variance(
+                x=z, c=cond, t=t_tensor, clip_denoised=clip_denoised
+            )
+            noise = torch.randn_like(z)
+            nonzero_mask = (
+                (1 - (t_tensor == 0).float())
+                .reshape(z.shape[0], *((1,) * (len(z.shape) - 1)))
+                .contiguous()
+            )
+            z = model_mean + nonzero_mask * (0.5 * model_log_variance).exp() * noise
 
-            mel_out = self._model.decode_first_stage(z)
-            if mel_out.shape[1] == 1:
-                mel_out = mel_out.squeeze(1)  # (B, T_frames, n_mel)
+        # NOTE: first_stage_model.decode(...) directly, not
+        # self._model.decode_first_stage(...) -- same reason as the encode
+        # call above (that wrapper is also @torch.no_grad()-locked). This is
+        # otherwise identical to what decode_first_stage does internally.
+        mel_out = self._model.first_stage_model.decode(z / self._model.scale_factor)
+        if mel_out.shape[1] == 1:
+            mel_out = mel_out.squeeze(1)  # (B, T_frames, n_mel)
 
-            mel_for_vocoder = mel_out.permute(0, 2, 1)  # (B, n_mel, T_frames)
-            wav_out = self._vocoder(mel_for_vocoder).squeeze(1)  # (B, T)
+        mel_for_vocoder = mel_out.permute(0, 2, 1)  # (B, n_mel, T_frames)
+        wav_out = self._vocoder(mel_for_vocoder).squeeze(1)  # (B, T)
 
         if wav_out.shape[-1] < orig_len:
             wav_out = F.pad(wav_out, (0, orig_len - wav_out.shape[-1]))
@@ -511,8 +597,9 @@ class DiffEraseAttack(nn.Module):
 
 
 class MBDAttack(nn.Module):
-    """Held-out attack (same status as DiffEraseAttack -- eval only, NEVER
-    given nonzero weight in AttackConfig.weights during training): Meta's
+    """Held-out attack (same status as SGMSEAttack in this project's current
+    config -- eval only, NEVER given nonzero weight in AttackConfig.weights
+    during training): Meta's
     MultiBand Diffusion (github.com/facebookresearch/audiocraft,
     `docs/MBD.md`), an EnCodec-conditioned diffusion decoder. Per the
     mentor's plan (2026-08-12 Notion doc), this is the intended replacement/

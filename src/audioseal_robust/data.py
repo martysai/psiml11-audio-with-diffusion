@@ -14,6 +14,7 @@ import random
 import typing as tp
 from pathlib import Path
 
+import soundfile as sf
 import torch
 import torchaudio
 from torch.utils.data import Dataset
@@ -23,7 +24,7 @@ _AUDIO_EXTENSIONS = (".wav", ".flac")
 
 
 class WavDirDataset(Dataset):
-    """Recursively collects audio files (.wav, .flac -- anything torchaudio.load
+    """Recursively collects audio files (.wav, .flac -- anything soundfile
     can decode) under `root`, and on each __getitem__ returns a random
     `segment_duration`-second mono crop resampled to `sample_rate`. Files
     shorter than the segment are looped."""
@@ -41,7 +42,16 @@ class WavDirDataset(Dataset):
 
     def __getitem__(self, idx: int) -> torch.Tensor:
         path = self.files[idx]
-        wav, sr = torchaudio.load(str(path))
+        # soundfile rather than torchaudio.load: recent torchaudio (>=2.9)
+        # routes torchaudio.load through torchcodec unconditionally (the
+        # `backend=` kwarg no longer has a non-torchcodec option), which
+        # needs a system FFmpeg install to load its shared libraries --
+        # unavailable on plain dev boxes. soundfile decodes wav/flac
+        # directly with no FFmpeg dependency at all; only the resample step
+        # below still goes through torchaudio, which is a pure tensor op
+        # (no decoding backend involved) and works either way.
+        data, sr = sf.read(str(path), dtype="float32", always_2d=True)  # (frames, channels)
+        wav = torch.from_numpy(data.T)  # (channels, frames)
         if wav.size(0) > 1:
             wav = wav.mean(dim=0, keepdim=True)
         if sr != self.sample_rate:
