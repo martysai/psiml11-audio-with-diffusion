@@ -200,6 +200,75 @@ def train_step(
     }
 
 
+@torch.no_grad()
+def validate_step(
+    generator: AudioSealWM,
+    detector: AudioSealDetector,
+    attack: SampledReconstructionAttack,
+    perceptual_loss_fn: PsychoacousticMelLoss,
+    batch: torch.Tensor,
+    cfg: TrainConfig,
+    device: torch.device,
+) -> tp.Dict[str, float]:
+    """Same forward computation as train_step, minus backward/optimizer.step
+    -- @torch.no_grad() covers that (no graph gets built at all, so there's
+    nothing to backward through even by mistake). Caller is responsible for
+    generator.eval()/.train() around the validation loop; this function
+    doesn't touch train/eval mode itself so it stays usable either way."""
+    x = batch.to(device)
+    message = random_message(cfg.nbits, x.size(0), device=x.device)
+
+    x_wm = embed_watermark(generator, x, message, cfg.watermark_snr_db_min, cfg.watermark_snr_db_max)
+    x_att, _ = attack(x_wm)
+    presence, m_hat = detector.forward(x_att)
+    p = presence[:, 1, :].mean(dim=-1)
+
+    det_loss = detection_loss(p, m_hat, message)
+    perc_loss = perceptual_loss_fn(x, x_wm)
+    total_loss = cfg.lambda_det * det_loss + cfg.lambda_perc * perc_loss
+
+    return {
+        "loss": total_loss.item(),
+        "detection_loss": det_loss.item(),
+        "perceptual_loss": perc_loss.item(),
+        "presence_prob": p.mean().item(),
+    }
+
+
+def validate(
+    generator: AudioSealWM,
+    detector: AudioSealDetector,
+    attack: SampledReconstructionAttack,
+    perceptual_loss_fn: PsychoacousticMelLoss,
+    dataloader: torch.utils.data.DataLoader,
+    cfg: TrainConfig,
+    device: torch.device,
+) -> tp.Dict[str, float]:
+    """Averages validate_step over up to cfg.valid_batches batches of
+    cfg.data.valid_dir -- capped the same way EvalConfig.n_eval_batches caps
+    evaluate.py's loops, so a large valid_dir doesn't make every epoch
+    boundary slow. Puts the generator in eval() for the duration (dropout/
+    batchnorm-style layers, if any, should see validation the same way
+    inference would) and always restores train() before returning, even if
+    a step raises -- this runs once per epoch inside the main training loop,
+    so leaving the generator stuck in eval() would silently break every
+    subsequent training step's semantics for the rest of the run."""
+    generator.eval()
+    try:
+        totals: tp.Dict[str, float] = {}
+        n = 0
+        for i, batch in enumerate(dataloader):
+            if i >= cfg.valid_batches:
+                break
+            metrics = validate_step(generator, detector, attack, perceptual_loss_fn, batch, cfg, device)
+            for k, v in metrics.items():
+                totals[k] = totals.get(k, 0.0) + v
+            n += 1
+    finally:
+        generator.train()
+    return {k: v / n for k, v in totals.items()} if n else {}
+
+
 def build_experiment_tracker(cfg: TrainConfig) -> ExperimentTracker:
     config_dict = OmegaConf.to_container(cfg, resolve=True, throw_on_missing=False)
     assert isinstance(config_dict, dict)
@@ -234,6 +303,23 @@ def train(cfg: TrainConfig) -> None:
         num_workers=cfg.data.num_workers,
     )
 
+    # None (default) disables in-training validation entirely -- data.valid_dir
+    # was, until now, a declared-but-unused config field (see git history).
+    # shuffle=False + a fixed cfg.valid_batches cap mirrors evaluate.py's own
+    # eval dataloader: validation should look at the same examples every
+    # epoch, not a moving random sample, so epoch-to-epoch numbers are
+    # actually comparable.
+    valid_dataloader = None
+    if cfg.data.valid_dir:
+        valid_dataloader = build_dataloader(
+            cfg.data.valid_dir,
+            sample_rate=cfg.sample_rate,
+            segment_duration=cfg.data.segment_duration,
+            batch_size=cfg.data.batch_size,
+            num_workers=0,
+            shuffle=False,
+        )
+
     os.makedirs(cfg.checkpoint_dir, exist_ok=True)
 
     step = 0
@@ -256,6 +342,12 @@ def train(cfg: TrainConfig) -> None:
                 step += 1
                 if step % cfg.updates_per_epoch == 0:
                     break
+
+            if valid_dataloader is not None:
+                valid_metrics = validate(generator, detector, attack, perceptual_loss_fn, valid_dataloader, cfg, device)
+                if valid_metrics:
+                    tracker.log({f"valid/{k}": v for k, v in valid_metrics.items()}, step=step)
+                    logger.info("epoch=%d step=%d validation %s", epoch, step, valid_metrics)
 
             ckpt_path = f"{cfg.checkpoint_dir}/generator_epoch{epoch}.pth"
             torch.save({"model": generator.state_dict(), "xp.cfg": cfg}, ckpt_path)
