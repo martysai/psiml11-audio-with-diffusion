@@ -30,14 +30,24 @@ set +e
 # (full_1h_audioldm_confusion.png etc.) don't silently read as "the real
 # DiffErase model" later -- swap this if a genuine DiffErase checkpoint ever
 # replaces the one below.
+#
+# tracking.backend left at its default (mlflow, local) instead of "none" --
+# this is the real baseline number, meant to sit in the same mlflow
+# experiment as later post-fine-tuning runs for a same-dashboard comparison
+# (see evaluate.py's module docstring).
+#
+# n_curve_batches=20 (up from the config default of 6): curve cost doesn't
+# scale with n_eval_batches (see EvalConfig.n_curve_batches), so this only
+# adds a couple minutes total, but roughly 3x's the sample count backing
+# each t_star_grid point -- worth it for a number going in front of mentors.
 PYTHONUNBUFFERED=1 MPLBACKEND=Agg PYTHONPATH=src python3 -m audioseal_robust.evaluate \
   eval_dir=/data/datasets/LibriSpeech/test-clean \
   label=full_1h_audioldm \
   n_eval_batches=150 \
+  n_curve_batches=20 \
   device=cuda \
   eval_attacks=[] \
   held_out_attacks=[diff_erase] \
-  tracking.backend=none \
   attack.diff_erase.checkpoint=/data/checkpoints/diff_erase_root/data/checkpoints/audioldm-full-s-v2.ckpt \
   attack.diff_erase.config=src/audioldm_train/config/2023_08_23_reproduce_audioldm/audioldm_original.yaml \
   2>&1 | tee "$LOG"
