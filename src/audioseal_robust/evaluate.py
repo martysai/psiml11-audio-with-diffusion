@@ -30,12 +30,14 @@ to this script.
 """
 
 import logging
+import time
 import typing as tp
 from pathlib import Path
 
 import torch
 import torch.nn as nn
 from omegaconf import OmegaConf
+from tqdm import tqdm
 
 from audioseal import AudioSeal
 from audioseal.loader import load_state_dict as audioseal_load_state_dict
@@ -164,6 +166,7 @@ def evaluate_attack(
     device: torch.device,
     strength: tp.Optional[float] = None,
     n_batches: tp.Optional[int] = None,
+    progress_desc: str = "attack",
 ) -> tp.Dict[str, float]:
     """Robustness metrics for one attack (optionally at one fixed t*
     strength): bit accuracy and TPR@FPR, where the "negative" (unwatermarked)
@@ -180,6 +183,10 @@ def evaluate_attack(
 
     `n_batches` defaults to `cfg.n_eval_batches`; the robustness-curve loop
     overrides it with the smaller `cfg.n_curve_batches`.
+
+    `progress_desc` labels this call's progress bar -- the diffusion attacks
+    run for minutes per batch, so without it a long run is indistinguishable
+    from a hung one.
     """
     if n_batches is None:
         n_batches = cfg.n_eval_batches
@@ -189,10 +196,12 @@ def evaluate_attack(
     bit_accs = []
 
     batches = 0
+    progress = tqdm(total=n_batches, desc=progress_desc, unit="batch", leave=False)
     for batch in dataloader:
         if batches >= n_batches:
             break
         batches += 1
+        progress.update(1)
 
         x = batch.to(device)
         message = random_message(cfg.nbits, x.size(0), device=device)
@@ -209,6 +218,8 @@ def evaluate_attack(
         positive_scores.append(presence_pos[:, 1, :].mean(dim=-1).cpu())
         negative_scores.append(presence_neg[:, 1, :].mean(dim=-1).cpu())
         bit_accs.append(bit_accuracy(m_hat, message))
+
+    progress.close()
 
     positive_cat = torch.cat(positive_scores)
     negative_cat = torch.cat(negative_scores)
@@ -230,10 +241,12 @@ def evaluate_perceptual(
     pesq_values = []
 
     batches = 0
+    progress = tqdm(total=cfg.n_eval_batches, desc="perceptual", unit="batch", leave=False)
     for batch in dataloader:
         if batches >= cfg.n_eval_batches:
             break
         batches += 1
+        progress.update(1)
 
         x = batch.to(device)
         message = random_message(cfg.nbits, x.size(0), device=device)
@@ -246,6 +259,8 @@ def evaluate_perceptual(
                 pesq_values.append(pesq_score(x, x_wm, cfg.sample_rate))
             except Exception as e:  # pesq raises on "no speech detected" for some segments
                 logger.warning("pesq_score failed on a batch, skipping it: %s", e)
+
+    progress.close()
 
     metrics: tp.Dict[str, float] = {}
     if sisnr_values:
@@ -305,6 +320,35 @@ def run(cfg: EvalConfig) -> tp.Dict[str, tp.Any]:
             cfg.segment_duration,
         )
 
+    # Up-front plan, so a small trial run can be sanity-checked (and its cost
+    # extrapolated) before committing to the full one -- see the projection
+    # printed by main() at the end.
+    n_curve_attacks = sum(1 for n in all_attack_names if n in _STRENGTH_AWARE_ATTACKS and n in attacks)
+    planned_batches = (
+        cfg.n_eval_batches  # perceptual
+        + len(attacks) * cfg.n_eval_batches  # headline, per attack
+        + n_curve_attacks * len(cfg.t_star_grid) * cfg.n_curve_batches  # curve points
+    )
+    logger.info(
+        "plan: %d attack(s) [%s], %d skipped | %d batches total "
+        "(perceptual %d + headline %dx%d + curve %dx%dx%d) "
+        "| batch_size=%d -> %.1f min of audio per full pass",
+        len(attacks),
+        ", ".join(attacks) or "-",
+        len(skipped_at_construction),
+        planned_batches,
+        cfg.n_eval_batches,
+        len(attacks),
+        cfg.n_eval_batches,
+        n_curve_attacks,
+        len(cfg.t_star_grid),
+        cfg.n_curve_batches,
+        cfg.batch_size,
+        cfg.n_eval_batches * cfg.batch_size * cfg.segment_duration / 60,
+    )
+    results["planned_batches"] = planned_batches
+    run_started = time.perf_counter()
+
     try:
         logger.info("=== perceptual metrics (no attack) ===")
         _reset_peak_memory(device)
@@ -330,9 +374,18 @@ def run(cfg: EvalConfig) -> tp.Dict[str, tp.Any]:
                 # for why (cost, and positives/negatives otherwise landing at
                 # different strengths). None for the attacks that ignore it.
                 headline_strength = cfg.headline_strength if name in _STRENGTH_AWARE_ATTACKS else None
+                attack_started = time.perf_counter()
                 robustness = evaluate_attack(
-                    generator, detector, attack, dataloader, cfg, device, strength=headline_strength
+                    generator,
+                    detector,
+                    attack,
+                    dataloader,
+                    cfg,
+                    device,
+                    strength=headline_strength,
+                    progress_desc=f"{name} (headline)",
                 )
+                robustness["seconds"] = time.perf_counter() - attack_started
                 robustness.update(_peak_memory_metrics(device))
                 results["attacks"][name] = {"tag": tag, **robustness}
                 loggable = {k: v for k, v in robustness.items() if k != "confusion"}
@@ -352,7 +405,8 @@ def run(cfg: EvalConfig) -> tp.Dict[str, tp.Any]:
             # EvalConfig.n_curve_batches.
             if name in _STRENGTH_AWARE_ATTACKS:
                 curve = []
-                for t_star in cfg.t_star_grid:
+                curve_started = time.perf_counter()
+                for i, t_star in enumerate(cfg.t_star_grid, start=1):
                     try:
                         point = evaluate_attack(
                             generator,
@@ -363,6 +417,7 @@ def run(cfg: EvalConfig) -> tp.Dict[str, tp.Any]:
                             device,
                             strength=t_star,
                             n_batches=cfg.n_curve_batches,
+                            progress_desc=f"{name} curve t*={t_star:g} ({i}/{len(cfg.t_star_grid)})",
                         )
                         curve.append({"t_star": t_star, **point})
                         tracker.log({f"{name}/tpr_at_fpr_vs_t_star": point["tpr_at_fpr"]}, step=int(t_star * 1000))
@@ -370,6 +425,7 @@ def run(cfg: EvalConfig) -> tp.Dict[str, tp.Any]:
                         break  # strength not wired up yet either; identical failure at every t*
                 if curve:
                     results["attacks"][name]["robustness_curve"] = curve
+                    results["attacks"][name]["curve_seconds"] = time.perf_counter() - curve_started
                     logger.info("%s robustness curve (detection vs t*): %s", name, curve)
 
         out_dir = Path(cfg.output_dir)
@@ -384,10 +440,60 @@ def run(cfg: EvalConfig) -> tp.Dict[str, tp.Any]:
             results["robustness_curve_plot"] = str(curve_path)
             tracker.log_figure(curve_path)
             logger.info("robustness curve plot: %s", curve_path)
+        results["total_seconds"] = time.perf_counter() - run_started
     finally:
         tracker.finish()
 
     return results
+
+
+def _fmt_duration(seconds: float) -> str:
+    if seconds < 90:
+        return f"{seconds:.0f}s"
+    if seconds < 5400:
+        return f"{seconds / 60:.1f} min"
+    return f"{seconds / 3600:.1f} h"
+
+
+def _print_timing_and_projection(cfg: EvalConfig, results: tp.Dict[str, tp.Any]) -> None:
+    """Per-attack wall clock, plus what the same config would cost at a
+    larger `n_eval_batches`.
+
+    This is the point of running a small fraction first: cost is dominated by
+    the diffusion attacks' per-batch work, which scales linearly in batch
+    count, so a trial run's seconds-per-batch extrapolates. Model construction
+    and checkpoint loading are one-off and NOT excluded here, so short trials
+    over-estimate slightly -- the projection is a safe upper bound, which is
+    the direction you want before committing to a long run.
+    """
+    total = results.get("total_seconds")
+    if total is None:
+        return
+
+    timed = {n: r["seconds"] for n, r in results["attacks"].items() if "seconds" in r}
+    print(f"\n=== Timing (n_eval_batches={cfg.n_eval_batches}, n_curve_batches={cfg.n_curve_batches}) ===")
+    for name in sorted(timed, key=lambda k: -timed[k]):
+        r = results["attacks"][name]
+        curve_s = r.get("curve_seconds")
+        curve_note = f"  (+ curve {_fmt_duration(curve_s)})" if curve_s else ""
+        print(f"  {name}: {_fmt_duration(timed[name])} headline{curve_note}")
+    print(f"total: {_fmt_duration(total)}")
+
+    planned = results.get("planned_batches")
+    if not planned:
+        return
+    per_batch = total / planned
+    print(f"\n~{per_batch:.1f}s per batch across the whole run. Projected totals:")
+    for target in (20, 50, 150):
+        if target == cfg.n_eval_batches:
+            continue
+        scale = target / cfg.n_eval_batches
+        audio_min = target * cfg.batch_size * cfg.segment_duration / 60
+        print(
+            f"  n_eval_batches={target:<4} (~{audio_min:.0f} min of audio): "
+            f"~{_fmt_duration(total * scale)}"
+        )
+    print("(curve points scale with n_curve_batches, which these hold fixed)")
 
 
 def main() -> None:
@@ -400,6 +506,8 @@ def main() -> None:
     print(f"perceptual: {results.get('perceptual')}")
     for name, r in results["attacks"].items():
         print(f"attack={name} ({r.get('tag')}): {r}")
+
+    _print_timing_and_projection(cfg, results)
     if "confusion_matrix_plot" in results:
         print(f"confusion matrix plot: {results['confusion_matrix_plot']}")
     if "robustness_curve_plot" in results:

@@ -13,6 +13,7 @@ wandb                  # optional alternative backend: set tracking.backend=wand
 torchmetrics            # evaluate.py: SI-SNR, PESQ (see metrics.py)
 pesq                    # backing library for torchmetrics' PESQ wrapper
 matplotlib              # evaluate.py: confusion-matrix + robustness-curve plots (see plotting.py)
+tqdm                    # evaluate.py: per-attack progress bars (diffusion attacks run minutes per batch)
 
 # BigVGAN / DAC attack backbones are NOT listed here -- they are stubbed
 # with NotImplementedError + setup instructions in src/audioseal_robust/
