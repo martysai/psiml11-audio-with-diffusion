@@ -397,6 +397,22 @@ class DiffEraseAttack(nn.Module):
             mel_fmax=prep["mel"]["mel_fmax"],
         )
 
+        # Disable the VAE's training-time perceptual loss before constructing
+        # anything. AutoencoderKL.__init__ does `self.loss =
+        # instantiate_from_config(lossconfig)` unconditionally, and the
+        # configured LPIPSWithDiscriminator pulls in taming-transformers'
+        # LPIPS, whose __init__ downloads a ~500MB vgg.pth to the *relative*
+        # path "taming/modules/autoencoder/lpips/" -- i.e. into whatever the
+        # CWD happens to be, which is `weights_root` thanks to the chdir
+        # below, and which blows up with a read-only-filesystem OSError when
+        # the weights live on a read-only mount (e.g. a container volume).
+        # `self.loss` is only ever touched by training_step/validation_step/
+        # configure_optimizers -- never by the encode/decode path this attack
+        # uses -- so swapping it for a no-op is safe, and skips both the
+        # download and the taming-transformers dependency entirely.
+        first_stage_params = model_config["model"]["params"]["first_stage_config"]["params"]
+        first_stage_params["lossconfig"] = {"target": "torch.nn.Identity"}
+
         original_cwd = os.getcwd()
         original_torch_load = torch.load
         os.chdir(weights_root)
