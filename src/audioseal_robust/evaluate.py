@@ -63,6 +63,14 @@ _ATTACK_CLASSES: tp.Dict[str, tp.Type[nn.Module]] = {
     "mbd": MBDAttack,
 }
 
+# Attacks with a meaningful `strength` (t*) axis: these are the ones that get
+# a pinned `cfg.headline_strength` for the headline number and a
+# `cfg.t_star_grid` sweep for the robustness curve. Every other attack's
+# forward() takes `strength` and ignores it (see attacks.py -- identity is a
+# no-op, and bigvgan/dac/mbd have no natural single corruption-level knob), so
+# they're left at strength=None.
+_STRENGTH_AWARE_ATTACKS = ("sgmse", "diff_erase")
+
 
 def _reset_peak_memory(device: torch.device) -> None:
     """No-op off CUDA -- MPS/CPU have no equivalent peak-tracking counter."""
@@ -158,7 +166,8 @@ def prepare_eval_batches(
 ) -> tp.List[PreparedEvalBatch]:
     """Materialize one set of (clean, watermarked, message) batches, held on
     CPU and reused by every attack and every t* point, so all reported
-    numbers come from identical audio and identical messages."""
+    numbers come from identical audio and identical messages. The curve
+    points read a prefix of this list (see `cfg.n_curve_batches`)."""
     prepared = []
     for batch_index, batch in enumerate(dataloader):
         if batch_index >= cfg.n_eval_batches:
@@ -180,17 +189,32 @@ def evaluate_attack(
     cfg: EvalConfig,
     device: torch.device,
     strength: tp.Optional[float] = None,
+    n_batches: tp.Optional[int] = None,
 ) -> tp.Dict[str, float]:
     """Robustness metrics for one attack (optionally at one fixed t*
     strength): bit accuracy and TPR@FPR, where the "negative" (unwatermarked)
     examples are ALSO run through the same attack, so the false-positive
     rate reflects the detector's behavior on attacked-but-clean audio, not
-    on unrealistically pristine audio."""
+    on unrealistically pristine audio.
+
+    `strength` is forwarded to the attack's forward() as its t*. Leave it None
+    only for attacks that ignore it -- for a strength-aware one (see
+    `_STRENGTH_AWARE_ATTACKS`) None means "sample a fresh random t* per
+    forward call", which would give the positives and the negatives below
+    *different* attack strengths and make the resulting operating point
+    meaningless. Callers should pass `cfg.headline_strength` or a grid point.
+
+    `n_batches` defaults to `cfg.n_eval_batches`; the robustness-curve loop
+    overrides it with the smaller `cfg.n_curve_batches`.
+    """
+    if n_batches is None:
+        n_batches = cfg.n_eval_batches
+
     positive_scores = []
     negative_scores = []
     bit_accs = []
 
-    for x_cpu, x_wm_cpu, message_cpu in eval_batches:
+    for x_cpu, x_wm_cpu, message_cpu in eval_batches[:n_batches]:
         x = x_cpu.to(device)
         x_wm = x_wm_cpu.to(device)
         message = message_cpu.to(device)
@@ -268,7 +292,7 @@ def run(cfg: EvalConfig) -> tp.Dict[str, tp.Any]:
         sample_rate=cfg.sample_rate,
         segment_duration=cfg.segment_duration,
         batch_size=cfg.batch_size,
-        num_workers=0,
+        num_workers=cfg.num_workers,
         shuffle=False,
     )
     eval_batches = prepare_eval_batches(generator, dataloader, cfg, device)
@@ -316,7 +340,14 @@ def run(cfg: EvalConfig) -> tp.Dict[str, tp.Any]:
             logger.info("=== attack=%s (%s) ===", name, tag)
             try:
                 _reset_peak_memory(device)
-                robustness = evaluate_attack(detector, attack, eval_batches, cfg, device)
+                # Pin t* for the headline number instead of letting each
+                # forward call draw its own -- see EvalConfig.headline_strength
+                # for why (cost, and positives/negatives otherwise landing at
+                # different strengths). None for the attacks that ignore it.
+                headline_strength = cfg.headline_strength if name in _STRENGTH_AWARE_ATTACKS else None
+                robustness = evaluate_attack(
+                    detector, attack, eval_batches, cfg, device, strength=headline_strength
+                )
                 robustness.update(_peak_memory_metrics(device))
                 results["attacks"][name] = {"tag": tag, **robustness}
                 loggable = {k: v for k, v in robustness.items() if k != "confusion"}
@@ -329,11 +360,24 @@ def run(cfg: EvalConfig) -> tp.Dict[str, tp.Any]:
                 continue
 
             # Robustness curve: detection vs. t* (only for strength-aware attacks).
-            if name in ("sgmse", "diff_erase"):
+            # Deliberately cheaper per point than the headline number above
+            # (cfg.n_curve_batches, not cfg.n_eval_batches): this is one full
+            # pos+neg pass per grid point, so at equal batch counts the curve
+            # alone would cost len(t_star_grid)x the headline. See
+            # EvalConfig.n_curve_batches.
+            if name in _STRENGTH_AWARE_ATTACKS:
                 curve = []
                 for t_star in cfg.t_star_grid:
                     try:
-                        point = evaluate_attack(detector, attack, eval_batches, cfg, device, strength=t_star)
+                        point = evaluate_attack(
+                            detector,
+                            attack,
+                            eval_batches,
+                            cfg,
+                            device,
+                            strength=t_star,
+                            n_batches=cfg.n_curve_batches,
+                        )
                         curve.append({"t_star": t_star, **point})
                         tracker.log({f"{name}/tpr_at_fpr_vs_t_star": point["tpr_at_fpr"]}, step=int(t_star * 1000))
                     except NotImplementedError:
