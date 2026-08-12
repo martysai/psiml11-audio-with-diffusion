@@ -390,7 +390,12 @@ class DiffEraseAttack(nn.Module):
             z0 = self._model.get_first_stage_encoding(posterior)
 
             num_timesteps = self._model.num_timesteps
-            noise_timestep = int(num_timesteps * strength)
+            # Valid timestep indices are [0, num_timesteps - 1] -- at
+            # strength=1.0 (the top of t_star_grid's default range) the naive
+            # int(num_timesteps * strength) lands exactly on num_timesteps,
+            # one past the end of the precomputed noise-schedule buffers
+            # (sqrt_alphas_cumprod etc.), and q_sample's index_select crashes.
+            noise_timestep = min(int(num_timesteps * strength), num_timesteps - 1)
             t_noise = torch.full((z0.shape[0],), noise_timestep, device=device, dtype=torch.long)
             z = self._model.q_sample(x_start=z0, t=t_noise, noise=torch.randn_like(z0))
 
