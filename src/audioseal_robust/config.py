@@ -1,0 +1,231 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the license found in the
+# LICENSE file in the root directory of this source tree.
+
+"""Config schema for generator-only robustness fine-tuning.
+
+This project vendors a standalone training script rather than a Dora
+solver (see discussion in the conversation that produced this module: the
+Dora solver lives in a *separate* AudioCraft checkout on this machine, not in
+this repo, and pulling in Dora's full env/SLURM/xp-management stack for a
+single vendored script would be disproportionate). Config is instead handled
+with OmegaConf directly: a structured dataclass schema (this file) merged
+with `config/default.yaml` and then with CLI overrides
+(`python -m audioseal_robust.train lambda_det=2.0 attack.weights.sgmse=1.0`),
+which is the same override mechanism Dora/Hydra are themselves built on.
+
+`lambda_det` and `lambda_perc` are ordinary config fields here -- see the
+`total_loss` computation in `train.py` -- never hardcoded.
+"""
+
+import typing as tp
+from dataclasses import dataclass, field
+from pathlib import Path
+
+from omegaconf import OmegaConf
+
+
+@dataclass
+class GeneratorConfig:
+    # Model card name (see src/audioseal/cards/) or path/HF uri to a
+    # checkpoint, passed to audioseal.AudioSeal.load_generator.
+    checkpoint: str = "audioseal_wm_16bits"
+
+
+@dataclass
+class DetectorConfig:
+    # Model card name or path/HF uri, passed to audioseal.AudioSeal.load_detector.
+    # This model is always frozen (see train.py:build_detector) -- never
+    # placed in the optimizer, never taken out of eval().
+    checkpoint: str = "audioseal_detector_16bits"
+
+
+@dataclass
+class BigVGANAttackConfig:
+    checkpoint: tp.Optional[str] = None  # TODO: fill in once BigVGAN is installed
+
+
+@dataclass
+class DACAttackConfig:
+    checkpoint: tp.Optional[str] = None  # TODO: fill in once DAC is installed
+
+
+@dataclass
+class SGMSEAttackConfig:
+    checkpoint: tp.Optional[str] = None  # TODO: fill in once SGMSE is installed
+    num_steps: int = 30
+
+
+@dataclass
+class AttackWeights:
+    # Sampling weight for each of the 4 attack branches (need not sum to 1;
+    # normalized internally). A weight of 0 disables that branch. Identity is
+    # the only branch guaranteed to work without extra setup -- see
+    # attacks.py for what's needed to enable the other three.
+    identity: float = 1.0
+    bigvgan: float = 0.0
+    dac: float = 0.0
+    sgmse: float = 0.0
+
+
+@dataclass
+class AttackConfig:
+    weights: AttackWeights = field(default_factory=AttackWeights)
+    bigvgan: BigVGANAttackConfig = field(default_factory=BigVGANAttackConfig)
+    dac: DACAttackConfig = field(default_factory=DACAttackConfig)
+    sgmse: SGMSEAttackConfig = field(default_factory=SGMSEAttackConfig)
+
+
+@dataclass
+class MelLossConfig:
+    n_fft: int = 1024
+    hop_length: int = 256
+    win_length: int = 1024
+    n_mels: int = 80
+    f_min: float = 20.0
+    f_max: tp.Optional[float] = None
+
+
+@dataclass
+class OptimConfig:
+    lr: float = 5e-5
+    betas: tp.Tuple[float, float] = (0.5, 0.9)
+    weight_decay: float = 0.0
+    max_norm: tp.Optional[float] = 3.0
+
+
+@dataclass
+class DataConfig:
+    train_dir: str = "???"  # directory of 16kHz wav files, set on the CLI
+    valid_dir: tp.Optional[str] = None
+    segment_duration: float = 1.0  # seconds
+    batch_size: int = 16
+    num_workers: int = 4
+
+
+@dataclass
+class TrackingConfig:
+    # "mlflow" (default: local ./mlruns, no account/network needed),
+    # "wandb" (needs `pip install wandb` + login or wandb_mode=offline),
+    # or "none" (console logging only). See tracking.py.
+    backend: str = "mlflow"
+    project: str = "audioseal-robust"
+    run_name: tp.Optional[str] = None
+    mlflow_tracking_uri: tp.Optional[str] = None  # None -> local ./mlruns
+    wandb_mode: str = "online"  # "online" | "offline" | "disabled"
+    log_audio_every: int = 0  # 0 disables; else log one x_wm sample every N steps
+
+
+@dataclass
+class TrainConfig:
+    sample_rate: int = 16_000
+    nbits: int = 16
+    device: str = "auto"  # "auto" (cuda > mps > cpu), or an explicit "cuda"/"mps"/"cpu"
+    epochs: int = 100
+    updates_per_epoch: int = 1000
+    log_every: int = 50
+    checkpoint_dir: str = "./checkpoints/audioseal_robust"
+    seed: int = 1234
+
+    # Loss weights -- exposed as config, see module docstring in losses.py
+    # for exactly which existing AudioCraft solver losses these would
+    # overlap with if that solver were used instead/also.
+    lambda_det: float = 1.0
+    lambda_perc: float = 1.0
+
+    generator: GeneratorConfig = field(default_factory=GeneratorConfig)
+    detector: DetectorConfig = field(default_factory=DetectorConfig)
+    attack: AttackConfig = field(default_factory=AttackConfig)
+    mel_loss: MelLossConfig = field(default_factory=MelLossConfig)
+    optim: OptimConfig = field(default_factory=OptimConfig)
+    data: DataConfig = field(default_factory=DataConfig)
+    tracking: TrackingConfig = field(default_factory=TrackingConfig)
+
+
+@dataclass
+class EvalConfig:
+    """Config for evaluate.py -- deliberately separate from TrainConfig
+    (rather than nested inside it) so baseline evaluation is runnable on its
+    own from day 1, without needing an unrelated training data dir.
+
+    Typical use:
+        # day 1, before any fine-tuning:
+        python -m audioseal_robust.evaluate eval_dir=/path/to/heldout/wavs label=baseline
+
+        # after fine-tuning, same eval set, pointing at the checkpoint:
+        python -m audioseal_robust.evaluate eval_dir=/path/to/heldout/wavs \\
+            label=finetuned_epoch10 generator_checkpoint=./checkpoints/audioseal_robust/generator_epoch10.pth
+
+    Both runs land in the same tracking project/experiment (see
+    tracking.py), so "detection after attack went from X to Y at comparable
+    PESQ" is a same-dashboard comparison, not eyeballed printouts.
+    """
+
+    sample_rate: int = 16_000
+    nbits: int = 16
+    device: str = "auto"
+    seed: int = 1234
+
+    # "audioseal_wm_16bits" (vanilla pretrained -- the baseline) or a path to
+    # a fine-tuned checkpoint saved by train.py (a .pth with a "model" key).
+    generator_checkpoint: str = "audioseal_wm_16bits"
+    detector_checkpoint: str = "audioseal_detector_16bits"
+    label: str = "baseline"  # run label: "baseline", "finetuned_epoch10", ...
+
+    eval_dir: str = "???"  # held-out wavs, never trained on
+    segment_duration: float = 3.0
+    batch_size: int = 8
+    n_eval_batches: int = 20
+
+    # Where the confusion-matrix and robustness-curve PNGs (see plotting.py)
+    # get written, one pair per run under f"{label}_*.png".
+    output_dir: str = "./eval_outputs"
+
+    # Robustness (measured after the attack).
+    fpr_target: float = 0.01  # TPR@FPR operating point
+    # Robustness curve: detection vs. attack strength t* (diffusion
+    # purification starting point -- 0 = no corruption, 1 = full
+    # noise-then-regenerate). Only meaningful for attacks that implement a
+    # `strength` axis (currently sgmse, diff_erase) -- see attacks.py.
+    t_star_grid: tp.List[float] = field(default_factory=lambda: [0.0, 0.1, 0.2, 0.3, 0.5, 0.7, 1.0])
+
+    # Attacks the generator was (or will be) trained against.
+    eval_attacks: tp.List[str] = field(default_factory=lambda: ["identity", "bigvgan", "dac", "sgmse"])
+    # Held out on purpose: NEVER given nonzero weight in AttackConfig.weights
+    # during training. This is the generalization probe -- "did robustness
+    # transfer to an attack the generator never saw, or did it just
+    # memorize the training attacks."
+    held_out_attacks: tp.List[str] = field(default_factory=lambda: ["diff_erase"])
+
+    # Perceptual (watermarked vs. original, no attack).
+    compute_pesq: bool = True
+    compute_sisnr: bool = True
+    compute_visqol: bool = False  # needs a separate ViSQOL binary build, see metrics.py
+
+    tracking: TrackingConfig = field(default_factory=TrackingConfig)
+
+
+_DEFAULT_YAML = Path(__file__).parent / "config" / "default.yaml"
+_DEFAULT_EVAL_YAML = Path(__file__).parent / "config" / "default_eval.yaml"
+
+
+def load_config(cli_args: tp.Optional[tp.List[str]] = None) -> TrainConfig:
+    """Build the effective config: structured schema <- config/default.yaml
+    <- CLI overrides (`key=value`, dotlist form, e.g. `optim.lr=1e-4`)."""
+    schema = OmegaConf.structured(TrainConfig)
+    file_cfg = OmegaConf.load(_DEFAULT_YAML) if _DEFAULT_YAML.exists() else OmegaConf.create({})
+    cli_cfg = OmegaConf.from_cli(cli_args)
+    cfg = OmegaConf.merge(schema, file_cfg, cli_cfg)
+    return tp.cast(TrainConfig, cfg)
+
+
+def load_eval_config(cli_args: tp.Optional[tp.List[str]] = None) -> EvalConfig:
+    """Same override mechanism as load_config: structured schema <-
+    config/default_eval.yaml <- CLI overrides."""
+    schema = OmegaConf.structured(EvalConfig)
+    file_cfg = OmegaConf.load(_DEFAULT_EVAL_YAML) if _DEFAULT_EVAL_YAML.exists() else OmegaConf.create({})
+    cli_cfg = OmegaConf.from_cli(cli_args)
+    cfg = OmegaConf.merge(schema, file_cfg, cli_cfg)
+    return tp.cast(EvalConfig, cfg)

@@ -1,0 +1,38 @@
+# Default config for evaluate.py (baseline / post-fine-tuning evaluation).
+# Override on the CLI, e.g.:
+#   python -m audioseal_robust.evaluate eval_dir=/path/to/heldout/wavs label=baseline
+#   python -m audioseal_robust.evaluate eval_dir=/path/to/heldout/wavs label=finetuned_epoch10 \
+#       generator_checkpoint=./checkpoints/audioseal_robust/generator_epoch10.pth
+
+sample_rate: 16000
+nbits: 16
+device: auto
+seed: 1234
+
+generator_checkpoint: audioseal_wm_16bits
+detector_checkpoint: audioseal_detector_16bits
+label: baseline
+
+eval_dir: ???
+segment_duration: 3.0
+batch_size: 8
+n_eval_batches: 20
+output_dir: ./eval_outputs
+
+fpr_target: 0.01
+t_star_grid: [0.0, 0.1, 0.2, 0.3, 0.5, 0.7, 1.0]
+
+eval_attacks: [identity, bigvgan, dac, sgmse]
+held_out_attacks: [diff_erase]
+
+compute_pesq: true
+compute_sisnr: true
+compute_visqol: false
+
+tracking:
+  backend: mlflow
+  project: audioseal-robust-eval
+  run_name: null
+  mlflow_tracking_uri: null
+  wandb_mode: online
+  log_audio_every: 0
