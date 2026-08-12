@@ -14,6 +14,12 @@ seed: 1234
 lambda_det: 1.0
 lambda_perc: 1.0
 
+# Per-example watermark SNR (dB), sampled uniformly per training step -- see
+# TrainConfig.watermark_snr_db_{min,max} in config.py for how this range was
+# picked (measured against stock AudioSeal on our own data, per mentor's plan).
+watermark_snr_db_min: 24.0
+watermark_snr_db_max: 36.0
+
 generator:
   checkpoint: audioseal_wm_16bits
 

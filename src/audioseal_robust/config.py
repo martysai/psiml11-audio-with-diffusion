@@ -167,6 +167,18 @@ class TrainConfig:
     lambda_det: float = 1.0
     lambda_perc: float = 1.0
 
+    # Per-example watermark SNR (dB) is sampled uniformly from this range
+    # every training step (see train.py:embed_watermark) rather than using
+    # whatever amplitude generator.get_watermark() happens to produce
+    # unscaled. Range per mentor's plan (2026-08-12 Notion doc); centered
+    # near what we actually measured for stock/unscaled AudioSeal on our own
+    # VCTK data (mean=30.65dB, std=2.73dB over 30 samples, p225) -- his
+    # estimate landed almost exactly on our measured mean, so kept as-is
+    # rather than recentered (see his own note: "measure stock AudioSeal on
+    # your own data first and recenter if it lands somewhere else").
+    watermark_snr_db_min: float = 24.0
+    watermark_snr_db_max: float = 36.0
+
     generator: GeneratorConfig = field(default_factory=GeneratorConfig)
     detector: DetectorConfig = field(default_factory=DetectorConfig)
     attack: AttackConfig = field(default_factory=AttackConfig)
