@@ -233,7 +233,20 @@ class EvalConfig:
     # purification starting point -- 0 = no corruption, 1 = full
     # noise-then-regenerate). Only meaningful for attacks that implement a
     # `strength` axis (currently sgmse, diff_erase) -- see attacks.py.
-    t_star_grid: tp.List[float] = field(default_factory=lambda: [0.0, 0.1, 0.2, 0.3, 0.5, 0.7, 1.0])
+    # Fractions of num_timesteps (attack-agnostic -- each strength-aware
+    # attack maps this through its own T, see SGMSEAttack/DiffEraseAttack
+    # docstrings). Calibrated against the mentor's curriculum table (linear
+    # schedule, T=1000): actual timesteps t*={0.3, 2, 6, 15, 40} correspond
+    # to noise floors lambda_dB={50, 36, 30, 24, 18} -- 50dB is "barely an
+    # attack" (warmup) and 18dB/t*=40 is already their "hard regime". The
+    # OLD default here went up to strength=1.0 (t*=1000, the full schedule)
+    # -- ~25x past their hard regime, and empirically destroys the audio
+    # rather than measuring a realistic robustness curve. Recentered to
+    # their actual range, plus one point (0.08 = t*=80) past their hard
+    # regime to see where detection fully saturates.
+    t_star_grid: tp.List[float] = field(
+        default_factory=lambda: [0.0, 0.0003, 0.002, 0.006, 0.015, 0.04, 0.08]
+    )
 
     # Attacks the generator was (or will be) trained against.
     eval_attacks: tp.List[str] = field(default_factory=lambda: ["identity", "bigvgan", "dac", "sgmse"])
