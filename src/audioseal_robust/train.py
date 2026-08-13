@@ -25,6 +25,7 @@ graph itself) -- see `build_detector` and `attacks.py` for why gradients
 still reach `x_wm`.
 """
 
+import contextlib
 import itertools
 import logging
 import os
@@ -58,6 +59,22 @@ logger = logging.getLogger(__name__)
 
 def random_message(nbits: int, batch_size: int, device: torch.device) -> torch.Tensor:
     return torch.randint(0, 2, (batch_size, nbits), device=device)
+
+
+def _autocast(device: torch.device) -> tp.ContextManager[None]:
+    """bf16 autocast for the forward pass -- halves activation memory (on
+    top of attacks.py's activation checkpointing, which reduces step COUNT
+    held live, not per-step size) and speeds up matmul-heavy ops, with none
+    of fp16's overflow risk (bf16 keeps fp32's exponent range, just less
+    mantissa) so no GradScaler is needed. Numerically sensitive ops
+    (BCELoss inside detection_loss_components, log()/exp() in SGMSE's
+    _spec_fwd/_spec_back) are auto-promoted back to fp32 by autocast's own
+    op-casting policy, not something callers need to special-case.
+    cuda/cpu only -- MPS's bf16 autocast support is inconsistent across
+    torch versions, and this project's real training runs on cuda anyway."""
+    if device.type in ("cuda", "cpu"):
+        return torch.autocast(device_type=device.type, dtype=torch.bfloat16)
+    return contextlib.nullcontext()
 
 
 def embed_watermark(
@@ -195,42 +212,48 @@ def train_step(
     x = batch.to(device)  # clean audio, (B, 1, T), 16kHz
     message = random_message(cfg.nbits, x.size(0), device=x.device)
 
-    # 1. x_wm = x + scale * G_theta(x, m), scale set per-example to hit a
-    #    randomly sampled target watermark SNR -- see embed_watermark.
-    x_wm = embed_watermark(generator, x, message, cfg.watermark_snr_db_min, cfg.watermark_snr_db_max)
+    # 1-4 under bf16 autocast (see _autocast's docstring): forward through
+    # the generator, attack, and detector, plus loss computation. Backward
+    # (below) stays outside -- autocast only needs to cover the forward pass,
+    # and the hooks registered on x_wm/x_att fire during backward regardless
+    # of which context the tensors were originally produced under.
+    with _autocast(device):
+        # 1. x_wm = x + scale * G_theta(x, m), scale set per-example to hit a
+        #    randomly sampled target watermark SNR -- see embed_watermark.
+        x_wm = embed_watermark(generator, x, message, cfg.watermark_snr_db_min, cfg.watermark_snr_db_max)
 
-    # Activation-gradient probes: register_hook fires during backward() with
-    # the gradient AT that point in the graph, before it continues further
-    # back. x_wm sits right at the generator/attack boundary -- its grad norm
-    # is the actual signal reaching the generator after passing back through
-    # the whole frozen detector+attack backbone, so if it's ~0 the backbone
-    # is killing the gradient regardless of what grad_norm_generator (the
-    # PARAMETER gradient, downstream of this) shows. x_att (attack/detector
-    # boundary) isolates which half of the backbone is responsible: compare
-    # against x_wm's norm -- a big drop across attack vs across detector
-    # tells you which one is the vanishing point.
-    activation_grad_norms: tp.Dict[str, float] = {}
+        # Activation-gradient probes: register_hook fires during backward() with
+        # the gradient AT that point in the graph, before it continues further
+        # back. x_wm sits right at the generator/attack boundary -- its grad norm
+        # is the actual signal reaching the generator after passing back through
+        # the whole frozen detector+attack backbone, so if it's ~0 the backbone
+        # is killing the gradient regardless of what grad_norm_generator (the
+        # PARAMETER gradient, downstream of this) shows. x_att (attack/detector
+        # boundary) isolates which half of the backbone is responsible: compare
+        # against x_wm's norm -- a big drop across attack vs across detector
+        # tells you which one is the vanishing point.
+        activation_grad_norms: tp.Dict[str, float] = {}
 
-    def _capture_activation_grad_norm(name: str) -> tp.Callable[[torch.Tensor], None]:
-        def hook(grad: torch.Tensor) -> None:
-            activation_grad_norms[name] = grad.detach().float().norm(2).item()
+        def _capture_activation_grad_norm(name: str) -> tp.Callable[[torch.Tensor], None]:
+            def hook(grad: torch.Tensor) -> None:
+                activation_grad_norms[name] = grad.detach().float().norm(2).item()
 
-        return hook
+            return hook
 
-    x_wm.register_hook(_capture_activation_grad_norm("x_wm"))
+        x_wm.register_hook(_capture_activation_grad_norm("x_wm"))
 
-    # 2. sampled reconstruction attack (frozen, graph stays connected)
-    x_att, attack_name = attack(x_wm)
-    x_att.register_hook(_capture_activation_grad_norm("x_att"))
+        # 2. sampled reconstruction attack (frozen, graph stays connected)
+        x_att, attack_name = attack(x_wm)
+        x_att.register_hook(_capture_activation_grad_norm("x_att"))
 
-    # 3. frozen detector: presence (B,2,T) softmax probs, message (B,nbits) sigmoid probs
-    presence, m_hat = detector.forward(x_att)
-    p = presence[:, 1, :].mean(dim=-1)  # presence prob per example, pooled over time
+        # 3. frozen detector: presence (B,2,T) softmax probs, message (B,nbits) sigmoid probs
+        presence, m_hat = detector.forward(x_att)
+        p = presence[:, 1, :].mean(dim=-1)  # presence prob per example, pooled over time
 
-    # 4. losses
-    det_loss, presence_loss, bit_loss = detection_loss_components(p, m_hat, message)
-    perc_loss = perceptual_loss_fn(x, x_wm)  # pre-attack, per spec
-    total_loss = cfg.lambda_det * det_loss + cfg.lambda_perc * perc_loss
+        # 4. losses
+        det_loss, presence_loss, bit_loss = detection_loss_components(p, m_hat, message)
+        perc_loss = perceptual_loss_fn(x, x_wm)  # pre-attack, per spec
+        total_loss = cfg.lambda_det * det_loss + cfg.lambda_perc * perc_loss
 
     # 5. backprop through detector + attack (frozen but differentiable) into G_theta
     optimizer.zero_grad(set_to_none=True)
@@ -274,13 +297,14 @@ def eval_step(
     try:
         x = batch.to(device)
         message = random_message(cfg.nbits, x.size(0), device=x.device)
-        x_wm = embed_watermark(generator, x, message, cfg.watermark_snr_db_min, cfg.watermark_snr_db_max)
-        x_att, attack_name = attack(x_wm)
-        presence, m_hat = detector.forward(x_att)
-        p = presence[:, 1, :].mean(dim=-1)
-        det_loss, presence_loss, bit_loss = detection_loss_components(p, m_hat, message)
-        perc_loss = perceptual_loss_fn(x, x_wm)
-        total_loss = cfg.lambda_det * det_loss + cfg.lambda_perc * perc_loss
+        with _autocast(device):
+            x_wm = embed_watermark(generator, x, message, cfg.watermark_snr_db_min, cfg.watermark_snr_db_max)
+            x_att, attack_name = attack(x_wm)
+            presence, m_hat = detector.forward(x_att)
+            p = presence[:, 1, :].mean(dim=-1)
+            det_loss, presence_loss, bit_loss = detection_loss_components(p, m_hat, message)
+            perc_loss = perceptual_loss_fn(x, x_wm)
+            total_loss = cfg.lambda_det * det_loss + cfg.lambda_perc * perc_loss
     finally:
         generator.train()  # train_step assumes the generator stays in train() mode
 
