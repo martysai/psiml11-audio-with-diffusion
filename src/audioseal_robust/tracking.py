@@ -70,6 +70,17 @@ class ConsoleTracker(ExperimentTracker):
         logger.info("step=%d %s", step, metrics)
 
 
+class NullTracker(ExperimentTracker):
+    """Discards everything. Used on non-zero ranks under DDP: a tracker is a
+    process-external side effect, so letting all 4 ranks build a real one
+    creates 4 runs per training run -- three of them holding metrics from a
+    single shard. Unlike ConsoleTracker this stays silent, since those ranks
+    are sharing rank 0's terminal."""
+
+    def log(self, metrics: tp.Dict[str, float], step: int) -> None:
+        pass
+
+
 class MLflowTracker(ExperimentTracker):
     def __init__(
         self,
