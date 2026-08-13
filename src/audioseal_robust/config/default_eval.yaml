@@ -3,11 +3,22 @@
 #   python -m audioseal_robust.evaluate eval_dir=/path/to/heldout/wavs label=baseline
 #   python -m audioseal_robust.evaluate eval_dir=/path/to/heldout/wavs label=finetuned_epoch10 \
 #       generator_checkpoint=./checkpoints/audioseal_robust/generator_epoch10.pth
+#
+# After fine-tuning with a train-time recipe (see config/recipes.yaml), pair
+# it with the matching eval recipe so the report/held-out labeling matches
+# which attack was actually trained against:
+#   python -m audioseal_robust.evaluate recipe=after_diff_erase_training eval_dir=... label=finetuned_diff_erase \
+#       generator_checkpoint=./checkpoints/audioseal_robust/generator_epochN.pth \
+#       attack.diff_erase.checkpoint=... attack.diff_erase.config=... attack.sgmse.checkpoint=...
+#   python -m audioseal_robust.evaluate recipe=after_sgmse_training eval_dir=... label=finetuned_sgmse \
+#       generator_checkpoint=./checkpoints/audioseal_robust/generator_epochN.pth \
+#       attack.sgmse.checkpoint=... attack.diff_erase.checkpoint=... attack.diff_erase.config=...
 
 sample_rate: 16000
 nbits: 16
 device: auto
 seed: 1234
+recipe: null
 
 generator_checkpoint: audioseal_wm_16bits
 detector_checkpoint: audioseal_detector_16bits
@@ -40,8 +51,11 @@ t_star_grid: [0.0, 0.0003, 0.002, 0.006, 0.015, 0.04, 0.08]
 # EvalConfig.headline_strength in config.py.
 headline_strength: 0.04
 
-eval_attacks: [identity, bigvgan, dac, sgmse]
-held_out_attacks: [diff_erase, mbd]
+# Fallback used only when no `recipe=...` is given (see recipes.yaml's
+# after_diff_erase_training/after_sgmse_training, which override both of
+# these together to match whichever attack was actually trained against).
+eval_attacks: [identity, bigvgan, dac, diff_erase]
+held_out_attacks: [sgmse, mbd]
 
 compute_pesq: true
 compute_sisnr: true
@@ -70,6 +84,7 @@ attack:
   diff_erase:
     checkpoint: null
     config: null
+    strength_max: 0.08
   # MBD needs no local weights file (audiocraft downloads its own) -- set
   # checkpoint to any non-None value, e.g. attack.mbd.checkpoint=auto, to enable.
   mbd:

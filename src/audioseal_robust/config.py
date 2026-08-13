@@ -88,6 +88,16 @@ class DiffEraseAttackConfig:
     # under the same data/checkpoints/ dir) even though DiffEraseAttack runs
     # the model fully unconditionally -- confirmed empirically, see attacks.py.
     config: tp.Optional[str] = None
+    # Caps the strength (t*) DiffEraseAttack samples when `strength=None` is
+    # passed in (random.random() * strength_max otherwise) -- see
+    # DiffEraseAttack.forward and its class docstring. Backprop through the
+    # full DDPM reverse loop (up to num_timesteps, commonly ~1000, steps at
+    # strength=1.0) is not memory-tractable during training; 0.08 matches
+    # EvalConfig.t_star_grid's own calibrated "hard regime" ceiling (see that
+    # field's comment below) rather than the naive full [0, 1] range other
+    # attacks use. Only affects random sampling -- an explicit `strength`
+    # (e.g. from evaluate.py's t_star_grid) is unaffected.
+    strength_max: float = 0.08
 
 
 @dataclass
@@ -108,14 +118,21 @@ class MBDAttackConfig:
 
 @dataclass
 class AttackWeights:
-    # Sampling weight for each of the 4 attack branches (need not sum to 1;
-    # normalized internally). A weight of 0 disables that branch. Identity is
-    # the only branch guaranteed to work without extra setup -- see
-    # attacks.py for what's needed to enable the other three.
+    # Sampling weight for each attack branch (need not sum to 1; normalized
+    # internally). A weight of 0 disables that branch. Identity is the only
+    # branch guaranteed to work without extra setup -- see attacks.py for
+    # what's needed to enable the others.
+    #
+    # This project's current config trains against `diff_erase` (AudioLDM)
+    # and holds `sgmse` out for evaluation only (see EvalConfig in this file
+    # / evaluate.py's held_out_attacks) -- do not also give `sgmse` nonzero
+    # weight here unless you deliberately want to give up that held-out
+    # generalization probe (see DiffEraseAttack's docstring in attacks.py).
     identity: float = 1.0
     bigvgan: float = 0.0
     dac: float = 0.0
     sgmse: float = 0.0
+    diff_erase: float = 0.0
 
 
 @dataclass
@@ -124,6 +141,7 @@ class AttackConfig:
     bigvgan: BigVGANAttackConfig = field(default_factory=BigVGANAttackConfig)
     dac: DACAttackConfig = field(default_factory=DACAttackConfig)
     sgmse: SGMSEAttackConfig = field(default_factory=SGMSEAttackConfig)
+    diff_erase: DiffEraseAttackConfig = field(default_factory=DiffEraseAttackConfig)
 
 
 @dataclass
@@ -147,6 +165,12 @@ class OptimConfig:
 @dataclass
 class DataConfig:
     train_dir: str = "???"  # directory of 16kHz wav files, set on the CLI
+    # None (default) disables in-training validation. When set together with
+    # TrainConfig.eval_every, train.py cycles through this directory and logs
+    # an "eval/*"-prefixed no-grad forward pass every eval_every steps -- see
+    # train.py:eval_step. Should be audio the generator never trains on (same
+    # "held-out" idea as EvalConfig.eval_dir), otherwise this just measures
+    # training-set fit again under a different name.
     valid_dir: tp.Optional[str] = None
     segment_duration: float = 1.0  # seconds
     batch_size: int = 16
@@ -181,6 +205,14 @@ class TrainConfig:
     eval_every: int = 0
     checkpoint_dir: str = "./checkpoints/audioseal_robust"
     seed: int = 1234
+
+    # Name of a bundle under config/recipes.yaml's `train:` section (e.g.
+    # "diff_erase" or "sgmse"), merged in on top of this schema/default.yaml
+    # but below explicit CLI overrides -- see load_config and recipes.yaml's
+    # own header comment for what these set and why. None (default): no
+    # recipe applied, falls back to whatever attack.weights.* default.yaml
+    # sets (identity-only, i.e. no attack fine-tuning at all).
+    recipe: tp.Optional[str] = None
 
     # Loss weights -- exposed as config, see module docstring in losses.py
     # for exactly which existing AudioCraft solver losses these would
@@ -245,6 +277,13 @@ class EvalConfig:
     nbits: int = 16
     device: str = "auto"
     seed: int = 1234
+
+    # Name of a bundle under config/recipes.yaml's `eval:` section (e.g.
+    # "after_diff_erase_training" or "after_sgmse_training") -- same merge
+    # position/semantics as TrainConfig.recipe (see load_eval_config). None
+    # (default): no recipe applied, falls back to default_eval.yaml's plain
+    # eval_attacks/held_out_attacks.
+    recipe: tp.Optional[str] = None
 
     # "audioseal_wm_16bits" (vanilla pretrained -- the baseline) or a path to
     # a fine-tuned checkpoint saved by train.py (a .pth with a "model" key).
@@ -317,12 +356,18 @@ class EvalConfig:
     headline_strength: float = 0.04
 
     # Attacks the generator was (or will be) trained against.
-    eval_attacks: tp.List[str] = field(default_factory=lambda: ["identity", "bigvgan", "dac", "sgmse"])
+    eval_attacks: tp.List[str] = field(default_factory=lambda: ["identity", "bigvgan", "dac", "diff_erase"])
     # Held out on purpose: NEVER given nonzero weight in AttackConfig.weights
     # during training. This is the generalization probe -- "did robustness
     # transfer to an attack the generator never saw, or did it just
-    # memorize the training attacks."
-    held_out_attacks: tp.List[str] = field(default_factory=lambda: ["diff_erase", "mbd"])
+    # memorize the training attacks." `sgmse` is held out here (rather than
+    # trained against, as in the original design) -- this project variant
+    # trains on `diff_erase` (AudioLDM) instead, so `sgmse` is the
+    # generalization probe: does robustness against latent-diffusion
+    # resynthesis transfer to SGMSE's structurally different OU-VE SDE
+    # attack. `mbd` remains held out either way (never wired into
+    # AttackConfig.weights at all).
+    held_out_attacks: tp.List[str] = field(default_factory=lambda: ["sgmse", "mbd"])
 
     # Perceptual (watermarked vs. original, no attack).
     compute_pesq: bool = True
@@ -335,23 +380,48 @@ class EvalConfig:
 
 _DEFAULT_YAML = Path(__file__).parent / "config" / "default.yaml"
 _DEFAULT_EVAL_YAML = Path(__file__).parent / "config" / "default_eval.yaml"
+_RECIPES_YAML = Path(__file__).parent / "config" / "recipes.yaml"
+
+
+def _load_recipe(section: str, name: str) -> tp.Any:
+    """Look up recipes.yaml's `<section>.<name>` bundle (section is "train"
+    or "eval") -- see that file's header comment and TrainConfig.recipe /
+    EvalConfig.recipe for what this is and why. Raises with the available
+    names on a typo rather than merging in nothing silently."""
+    if not _RECIPES_YAML.exists():
+        raise FileNotFoundError(f"recipe={name!r} requested but {_RECIPES_YAML} does not exist")
+    recipes = OmegaConf.load(_RECIPES_YAML)
+    section_cfg = recipes.get(section)
+    if section_cfg is None or name not in section_cfg:
+        available = sorted(section_cfg.keys()) if section_cfg is not None else []
+        raise ValueError(f"Unknown {section} recipe {name!r}, expected one of {available}")
+    return section_cfg[name]
 
 
 def load_config(cli_args: tp.Optional[tp.List[str]] = None) -> TrainConfig:
     """Build the effective config: structured schema <- config/default.yaml
-    <- CLI overrides (`key=value`, dotlist form, e.g. `optim.lr=1e-4`)."""
+    <- recipe (if `recipe=<name>` is set, from either default.yaml or the
+    CLI -- see TrainConfig.recipe / config/recipes.yaml) <- CLI overrides
+    (`key=value`, dotlist form, e.g. `optim.lr=1e-4`). CLI overrides are
+    merged in last specifically so they can still override anything a
+    recipe set, without having to fork the recipe."""
     schema = OmegaConf.structured(TrainConfig)
     file_cfg = OmegaConf.load(_DEFAULT_YAML) if _DEFAULT_YAML.exists() else OmegaConf.create({})
     cli_cfg = OmegaConf.from_cli(cli_args)
-    cfg = OmegaConf.merge(schema, file_cfg, cli_cfg)
+    recipe_name = cli_cfg.get("recipe", None) or file_cfg.get("recipe", None)
+    recipe_cfg = _load_recipe("train", recipe_name) if recipe_name else OmegaConf.create({})
+    cfg = OmegaConf.merge(schema, file_cfg, recipe_cfg, cli_cfg)
     return tp.cast(TrainConfig, cfg)
 
 
 def load_eval_config(cli_args: tp.Optional[tp.List[str]] = None) -> EvalConfig:
-    """Same override mechanism as load_config: structured schema <-
-    config/default_eval.yaml <- CLI overrides."""
+    """Same override mechanism as load_config (including the recipe step --
+    see that function and EvalConfig.recipe / config/recipes.yaml), just
+    against config/default_eval.yaml."""
     schema = OmegaConf.structured(EvalConfig)
     file_cfg = OmegaConf.load(_DEFAULT_EVAL_YAML) if _DEFAULT_EVAL_YAML.exists() else OmegaConf.create({})
     cli_cfg = OmegaConf.from_cli(cli_args)
-    cfg = OmegaConf.merge(schema, file_cfg, cli_cfg)
+    recipe_name = cli_cfg.get("recipe", None) or file_cfg.get("recipe", None)
+    recipe_cfg = _load_recipe("eval", recipe_name) if recipe_name else OmegaConf.create({})
+    cfg = OmegaConf.merge(schema, file_cfg, recipe_cfg, cli_cfg)
     return tp.cast(EvalConfig, cfg)
