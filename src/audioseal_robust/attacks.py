@@ -303,79 +303,96 @@ class SGMSEAttack(nn.Module):
         from sgmse.util.other import pad_spec
 
         device = x.device
-        batch_size = x.shape[0]
-        sde = self._model.sde.copy()
-        sde.N = self.num_steps
-        eps = self._model.t_eps
+        in_dtype = x.dtype
 
-        if strength is None:
-            strengths = torch.rand(batch_size, device=device)
-        else:
-            strengths = torch.full(
-                (batch_size,), float(min(max(strength, 0.0), 1.0)), device=device
-            )
-        t_star = eps + strengths * (sde.T - eps)  # (B,)
+        # Forces fp32 regardless of any ambient bf16 autocast (see train.py's
+        # _autocast): NCSN++'s upfirdn2d up/downsampling (backbones/ncsnpp_utils/
+        # op/upfirdn2d.py) goes through a hand-written CUDA kernel on GPU (the
+        # CPU path has a pure-PyTorch fallback, but that's not this path) that
+        # only has a fp32 dispatch -- "upfirdn2d_cuda" not implemented for
+        # 'BFloat16'. Activation checkpointing above is unaffected; this only
+        # gives up the *dtype* half of the memory savings for this attack, not
+        # the step-count half, which was the actual fix for the OOM.
+        # enabled=False alone only stops NEW ops in this block from being cast
+        # to bf16 -- it does not undo the dtype `x` already arrived in (bf16,
+        # since it's the output of embed_watermark/attack's own bf16-autocast
+        # forward in train_step). Cast explicitly, or the same op sees the
+        # same bf16 tensor either way.
+        with torch.autocast(device_type=device.type, enabled=False):
+            x = x.float()
+            batch_size = x.shape[0]
+            sde = self._model.sde.copy()
+            sde.N = self.num_steps
+            eps = self._model.t_eps
 
-        orig_len = x.shape[-1]
-        wav = x.squeeze(1)  # (B, T)
-        # SGMSE's own enhance() normalizes by peak amplitude before STFT and
-        # rescales back afterwards -- its score model was trained on
-        # peak-normalized inputs.
-        norm_factor = wav.abs().amax(dim=-1, keepdim=True).clamp_min(1e-8)
-        wav = wav / norm_factor
-
-        Y = self._spec_fwd(self._model._stft(wav)).unsqueeze(1)  # (B, 1, F, T_frames)
-        Y = pad_spec(Y)
-
-        # Forward-corrupt Y to t_star via the SDE's own marginal_prob. With
-        # x0=y=Y (see class docstring), the mean term is exactly Y, so this
-        # is "Y plus std(t_star)-scaled Gaussian noise" -- the SDE analogue
-        # of AudioLDMAttack's q_sample.
-        mean, std = sde.marginal_prob(Y, Y, t_star)
-        xt = mean + std[:, None, None, None] * torch.randn_like(Y)
-        xt_mean = xt
-
-        predictor = PredictorRegistry.get_by_name("reverse_diffusion")(sde, self._model, probability_flow=False)
-        corrector = CorrectorRegistry.get_by_name("ald")(sde, self._model, snr=0.5, n_steps=1)
-
-        # Mirrors sgmse.sampling.get_pc_sampler's pc_sampler() loop exactly,
-        # just starting from t_star instead of sde.T -- see that function
-        # for the reference this replicates. Deliberately NOT wrapped in
-        # torch.no_grad() (see class docstring: this attack must stay
-        # differentiable for training).
-        # (B, num_steps): row b is that example's own linspace(t_star[b], eps).
-        ramp = torch.linspace(1.0, 0.0, self.num_steps, device=device)
-        timesteps = eps + (t_star[:, None] - eps) * ramp[None, :]
-
-        def _pc_step(
-            xt: torch.Tensor, xt_mean: torch.Tensor, Y: torch.Tensor, vec_t: torch.Tensor, stepsize: torch.Tensor
-        ) -> tp.Tuple[torch.Tensor, torch.Tensor]:
-            xt, xt_mean = corrector.update_fn(xt, Y, vec_t)
-            xt, xt_mean = predictor.update_fn(xt, Y, vec_t, stepsize)
-            return xt, xt_mean
-
-        for i in range(self.num_steps):
-            vec_t = timesteps[:, i]
-            if i != self.num_steps - 1:
-                stepsize = vec_t - timesteps[:, i + 1]
+            if strength is None:
+                strengths = torch.rand(batch_size, device=device)
             else:
-                stepsize = timesteps[:, -1]  # from eps to 0, as in the reference
-            # Activation checkpointing: this loop is a differentiable
-            # multi-step sampler (see class docstring's "can be memory-heavy"
-            # note) -- without it, autograd holds every step's activations
-            # (score-model forward, twice per step via corrector+predictor)
-            # live simultaneously for backward, num_steps=30 by default. This
-            # trades that for one recomputed forward per step during
-            # backward instead. use_reentrant=False: the modern
-            # checkpoint API, correctly threads gradients to Y (reused every
-            # step, not just the loop-carried xt/xt_mean).
-            xt, xt_mean = torch.utils.checkpoint.checkpoint(
-                _pc_step, xt, xt_mean, Y, vec_t, stepsize, use_reentrant=False
-            )
+                strengths = torch.full(
+                    (batch_size,), float(min(max(strength, 0.0), 1.0)), device=device
+                )
+            t_star = eps + strengths * (sde.T - eps)  # (B,)
 
-        x_hat = self._model._istft(self._spec_back(xt_mean.squeeze(1)), orig_len)
-        x_hat = x_hat * norm_factor
-        return x_hat.unsqueeze(1).to(x.dtype)
+            orig_len = x.shape[-1]
+            wav = x.squeeze(1)  # (B, T)
+            # SGMSE's own enhance() normalizes by peak amplitude before STFT and
+            # rescales back afterwards -- its score model was trained on
+            # peak-normalized inputs.
+            norm_factor = wav.abs().amax(dim=-1, keepdim=True).clamp_min(1e-8)
+            wav = wav / norm_factor
+
+            Y = self._spec_fwd(self._model._stft(wav)).unsqueeze(1)  # (B, 1, F, T_frames)
+            Y = pad_spec(Y)
+
+            # Forward-corrupt Y to t_star via the SDE's own marginal_prob. With
+            # x0=y=Y (see class docstring), the mean term is exactly Y, so this
+            # is "Y plus std(t_star)-scaled Gaussian noise" -- the SDE analogue
+            # of AudioLDMAttack's q_sample.
+            mean, std = sde.marginal_prob(Y, Y, t_star)
+            xt = mean + std[:, None, None, None] * torch.randn_like(Y)
+            xt_mean = xt
+
+            predictor = PredictorRegistry.get_by_name("reverse_diffusion")(sde, self._model, probability_flow=False)
+            corrector = CorrectorRegistry.get_by_name("ald")(sde, self._model, snr=0.5, n_steps=1)
+
+            # Mirrors sgmse.sampling.get_pc_sampler's pc_sampler() loop exactly,
+            # just starting from t_star instead of sde.T -- see that function
+            # for the reference this replicates. Deliberately NOT wrapped in
+            # torch.no_grad() (see class docstring: this attack must stay
+            # differentiable for training).
+            # (B, num_steps): row b is that example's own linspace(t_star[b], eps).
+            ramp = torch.linspace(1.0, 0.0, self.num_steps, device=device)
+            timesteps = eps + (t_star[:, None] - eps) * ramp[None, :]
+
+            def _pc_step(
+                xt: torch.Tensor, xt_mean: torch.Tensor, Y: torch.Tensor, vec_t: torch.Tensor, stepsize: torch.Tensor
+            ) -> tp.Tuple[torch.Tensor, torch.Tensor]:
+                xt, xt_mean = corrector.update_fn(xt, Y, vec_t)
+                xt, xt_mean = predictor.update_fn(xt, Y, vec_t, stepsize)
+                return xt, xt_mean
+
+            for i in range(self.num_steps):
+                vec_t = timesteps[:, i]
+                if i != self.num_steps - 1:
+                    stepsize = vec_t - timesteps[:, i + 1]
+                else:
+                    stepsize = timesteps[:, -1]  # from eps to 0, as in the reference
+                # Activation checkpointing: this loop is a differentiable
+                # multi-step sampler (see class docstring's "can be memory-heavy"
+                # note) -- without it, autograd holds every step's activations
+                # (score-model forward, twice per step via corrector+predictor)
+                # live simultaneously for backward, num_steps=30 by default. This
+                # trades that for one recomputed forward per step during
+                # backward instead. use_reentrant=False: the modern
+                # checkpoint API, correctly threads gradients to Y (reused every
+                # step, not just the loop-carried xt/xt_mean).
+                xt, xt_mean = torch.utils.checkpoint.checkpoint(
+                    _pc_step, xt, xt_mean, Y, vec_t, stepsize, use_reentrant=False
+                )
+
+            x_hat = self._model._istft(self._spec_back(xt_mean.squeeze(1)), orig_len)
+            x_hat = x_hat * norm_factor
+            return x_hat.unsqueeze(1).to(in_dtype)
 
 
 class AudioLDMAttack(nn.Module):
