@@ -1,0 +1,39 @@
+# Everything in this repo that executes does so on Linux -- locally in a
+# container, and on the AzureML A100 nodes via azureml/aml_run.sh.
+#
+# On Linux a CRLF line ending is a syntax error, not whitespace. bash reads
+#     set -euo pipefail\r
+# as the invalid option name "pipefail\r" and dies on the first line, and a
+# `<<'EOF'` heredoc whose terminator arrives as "EOF\r" never matches, so the
+# block swallows the rest of the file.
+#
+# This matters more than usual here because the AzureML job snapshot
+# (`code: ../..` in azureml/jobs/*.yaml) uploads the *working tree* verbatim.
+# A Windows clone defaults to core.autocrlf=true, which writes CRLF into the
+# working tree on checkout even though the blobs are stored LF -- so the bug is
+# invisible in `git diff` and ships straight to the GPU node. Pinning eol=lf
+# here overrides autocrlf and keeps the two in sync on every platform.
+
+*.sh        text eol=lf
+*.py        text eol=lf
+*.yaml      text eol=lf
+*.yml       text eol=lf
+*.txt       text eol=lf
+*.cfg       text eol=lf
+*.ini       text eol=lf
+*.toml      text eol=lf
+*.json      text eol=lf
+*.md        text eol=lf
+Dockerfile  text eol=lf
+.gitignore  text eol=lf
+.amlignore  text eol=lf
+
+# Binary assets: never touch these.
+*.pth       binary
+*.ckpt      binary
+*.pt        binary
+*.wav       binary
+*.flac      binary
+*.png       binary
+*.jpg       binary
+*.pdf       binary
