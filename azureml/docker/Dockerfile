@@ -93,20 +93,37 @@ RUN python3 -m pip install -c /tmp/constraints.txt \
         -r /tmp/reqs/requirements-mbd.txt
 
 # Fail the *image build* rather than the GPU job if the stack is
-# inconsistent. Every import below is one this project actually performs:
-# the audioldm_train chain for the audioldm attack, the sgmse chain, and
-# audiocraft.models.MultiBandDiffusion for mbd (attacks.py:667).
-RUN python3 -m pip check && python3 - <<'PY'
-import numpy, torch, torchaudio, torchvision
-import soundfile, librosa, scipy, pandas, h5py
-import pytorch_lightning, torchlibrosa, transformers, timm, ftfy
-import webdataset, braceexpand, wget, sklearn, regex, PIL, yaml, tqdm
-import torch_ema, torchsde, torchinfo, pystoi
-import torchmetrics, pesq, matplotlib, mlflow, wandb
-import xformers, julius, num2words, av, flashy, spacy
-from audiocraft.models import MultiBandDiffusion  # attacks.py:667
+# inconsistent.
+#
+# pip check is filtered rather than trusted wholesale. audiocraft is installed
+# --no-deps on purpose (see requirements-mbd.txt), so it permanently reports
+# its own unmet metadata: torch==2.1.0, torchvision==0.16.0, xformers<0.0.23,
+# av==11.0.0, plus MusicGen-only extras (demucs, encodec, gradio, hydra-core,
+# sentencepiece, torchtext) that the MBD import chain never touches. Honouring
+# those pins would mean downgrading torch three minor versions for a held-out
+# eval attack. Anything NOT from audiocraft is still fatal.
+RUN conflicts="$(python3 -m pip check | grep -v '^audiocraft ' || true)"; \
+    if [ -n "$conflicts" ]; then \
+        echo "unexpected (non-audiocraft) dependency conflicts:" >&2; \
+        echo "$conflicts" >&2; \
+        exit 1; \
+    fi; \
+    echo "pip check: only the expected audiocraft --no-deps mismatches"
 
-assert numpy.__version__.startswith("1."), f"numpy 2.x breaks this stack: {numpy.__version__}"
-print("torch", torch.__version__, "| torchaudio", torchaudio.__version__,
-      "| numpy", numpy.__version__, "| xformers", xformers.__version__)
-PY
+# Every import here is one this project actually performs: the audioldm_train
+# chain for the audioldm attack, the sgmse chain, and
+# audiocraft.models.MultiBandDiffusion for mbd (attacks.py:667).
+#
+# Deliberately `python3 -c` on one line rather than a heredoc: this Dockerfile
+# can reach the daemon with CRLF endings, and a `<<'PY'` terminator arriving as
+# "PY\r" never matches, so the heredoc swallows the rest of the build.
+RUN python3 -c "\
+import numpy, torch, torchaudio, torchvision, soundfile, librosa, scipy, pandas, h5py; \
+import pytorch_lightning, torchlibrosa, transformers, timm, ftfy; \
+import webdataset, braceexpand, wget, sklearn, regex, PIL, yaml, tqdm; \
+import torch_ema, torchsde, torchinfo, pystoi; \
+import torchmetrics, pesq, matplotlib, mlflow, wandb; \
+import xformers, julius, num2words, av, flashy, spacy; \
+from audiocraft.models import MultiBandDiffusion; \
+assert numpy.__version__.startswith('1.'), 'numpy 2.x breaks this stack: ' + numpy.__version__; \
+print('torch', torch.__version__, '| torchaudio', torchaudio.__version__, '| numpy', numpy.__version__, '| xformers', xformers.__version__)"
