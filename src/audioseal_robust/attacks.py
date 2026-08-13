@@ -42,6 +42,7 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.utils.checkpoint
 
 
 class IdentityAttack(nn.Module):
@@ -345,14 +346,32 @@ class SGMSEAttack(nn.Module):
         # (B, num_steps): row b is that example's own linspace(t_star[b], eps).
         ramp = torch.linspace(1.0, 0.0, self.num_steps, device=device)
         timesteps = eps + (t_star[:, None] - eps) * ramp[None, :]
+
+        def _pc_step(
+            xt: torch.Tensor, xt_mean: torch.Tensor, Y: torch.Tensor, vec_t: torch.Tensor, stepsize: torch.Tensor
+        ) -> tp.Tuple[torch.Tensor, torch.Tensor]:
+            xt, xt_mean = corrector.update_fn(xt, Y, vec_t)
+            xt, xt_mean = predictor.update_fn(xt, Y, vec_t, stepsize)
+            return xt, xt_mean
+
         for i in range(self.num_steps):
             vec_t = timesteps[:, i]
             if i != self.num_steps - 1:
                 stepsize = vec_t - timesteps[:, i + 1]
             else:
                 stepsize = timesteps[:, -1]  # from eps to 0, as in the reference
-            xt, xt_mean = corrector.update_fn(xt, Y, vec_t)
-            xt, xt_mean = predictor.update_fn(xt, Y, vec_t, stepsize)
+            # Activation checkpointing: this loop is a differentiable
+            # multi-step sampler (see class docstring's "can be memory-heavy"
+            # note) -- without it, autograd holds every step's activations
+            # (score-model forward, twice per step via corrector+predictor)
+            # live simultaneously for backward, num_steps=30 by default. This
+            # trades that for one recomputed forward per step during
+            # backward instead. use_reentrant=False: the modern
+            # checkpoint API, correctly threads gradients to Y (reused every
+            # step, not just the loop-carried xt/xt_mean).
+            xt, xt_mean = torch.utils.checkpoint.checkpoint(
+                _pc_step, xt, xt_mean, Y, vec_t, stepsize, use_reentrant=False
+            )
 
         x_hat = self._model._istft(self._spec_back(xt_mean.squeeze(1)), orig_len)
         x_hat = x_hat * norm_factor
@@ -639,8 +658,8 @@ class AudioLDMAttack(nn.Module):
             for i, key in enumerate(self._model.conditioning_key)
         }
         clip_denoised = self._model.clip_denoised
-        for t in range(noise_timestep, 0, -1):
-            t_tensor = torch.full((z.shape[0],), t, device=device, dtype=torch.long)
+
+        def _ddpm_step(z: torch.Tensor, t: int) -> torch.Tensor:
             # Inlined body of LatentDiffusion.p_sample (ddpm.py), minus its
             # @torch.no_grad() decorator -- see class docstring. p_mean_variance
             # itself is undecorated (confirmed differentiable: the model's own
@@ -648,6 +667,7 @@ class AudioLDMAttack(nn.Module):
             # such decorator). noise_like(shape, device, repeat=False) (what
             # p_sample calls) is exactly torch.randn(shape, device=device) --
             # see audioldm_train/utilities/diffusion_util.py:noise_like.
+            t_tensor = torch.full((z.shape[0],), t, device=device, dtype=torch.long)
             model_mean, _, model_log_variance = self._model.p_mean_variance(
                 x=z, c=cond, t=t_tensor, clip_denoised=clip_denoised
             )
@@ -657,7 +677,17 @@ class AudioLDMAttack(nn.Module):
                 .reshape(z.shape[0], *((1,) * (len(z.shape) - 1)))
                 .contiguous()
             )
-            z = model_mean + nonzero_mask * (0.5 * model_log_variance).exp() * noise
+            return model_mean + nonzero_mask * (0.5 * model_log_variance).exp() * noise
+
+        for t in range(noise_timestep, 0, -1):
+            # Activation checkpointing -- same reasoning as SGMSEAttack.forward's
+            # _pc_step: this is a differentiable reverse-diffusion loop (up to
+            # noise_timestep <= num_timesteps*strength_max steps, each one a full
+            # UNet forward through self._model), so autograd would otherwise hold
+            # every step's activations live simultaneously for backward.
+            # preserve_rng_state=True (checkpoint's default) reruns this step's
+            # torch.randn_like(z) noise draw identically on recompute.
+            z = torch.utils.checkpoint.checkpoint(_ddpm_step, z, t, use_reentrant=False)
 
         # NOTE: first_stage_model.decode(...) directly, not
         # self._model.decode_first_stage(...) -- same reason as the encode
