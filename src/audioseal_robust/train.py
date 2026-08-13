@@ -66,7 +66,8 @@ def embed_watermark(
     message: torch.Tensor,
     snr_db_min: float,
     snr_db_max: float,
-) -> torch.Tensor:
+    return_parts: bool = False,
+):
     """x_wm = x + scale * delta, where delta = generator.get_watermark(x, m)
     and `scale` is chosen per-example (sampled fresh every call) so that
     ||scale * delta|| lands at a target SNR (dB) relative to ||x||, drawn
@@ -77,13 +78,25 @@ def embed_watermark(
 
     x: (B, 1, T). Gradients flow through normally (delta is not detached),
     same as before this scaling was introduced.
+
+    `return_parts=True` additionally returns `(delta, scale)` -- the RAW,
+    pre-scaling generator output and the per-example factor applied to it.
+    This scaling is idempotent in the reported SNR by construction (x_wm
+    always lands exactly on the target), so a generator whose delta has
+    collapsed toward zero is indistinguishable from a healthy one *after*
+    the fact -- it just gets multiplied by a correspondingly enormous
+    `scale`. The raw delta is the only place that collapse is still visible,
+    hence this hook; see evaluate.py:prepare_eval_batches, which reports it.
     """
     delta = generator.get_watermark(x, message=message)
     target_snr_db = torch.empty(x.size(0), 1, 1, device=x.device).uniform_(snr_db_min, snr_db_max)
     x_norm = x.norm(dim=-1, keepdim=True)
     delta_norm = delta.norm(dim=-1, keepdim=True).clamp_min(1e-8)
     scale = (x_norm / delta_norm) * (10 ** (-target_snr_db / 20))
-    return x + scale * delta
+    x_wm = x + scale * delta
+    if return_parts:
+        return x_wm, delta, scale
+    return x_wm
 
 
 def build_generator(cfg: TrainConfig, device: torch.device) -> AudioSealWM:

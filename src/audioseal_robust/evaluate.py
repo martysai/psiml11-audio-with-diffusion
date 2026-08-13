@@ -18,6 +18,23 @@ Then again after fine-tuning, same eval set, pointing at the checkpoint:
         label=finetuned_epoch10 \\
         generator_checkpoint=./checkpoints/audioseal_robust/generator_epoch10.pth
 
+If either run's detection numbers come out near chance, run the stock
+baseline before debugging anything else:
+    python -m audioseal_robust.evaluate eval_dir=/path/to/heldout/wavs \\
+        label=stock --stock-baseline
+
+That pins the run to the unmodified pretrained AudioSeal generator+detector
+with no attack, on the same data and the same code path, and exits non-zero
+unless detection, bit accuracy and watermark SNR all land where known-good
+weights must. It splits the diagnosis in two: stock passing means the
+harness is fine and the fine-tuned generator collapsed; stock failing means
+the bug is in the harness (sample rate, tensor shape, scaling, channel
+layout) and no training number here means anything yet.
+
+Every run reports the pre-attack watermark SNR (`snr_db` percentiles +
+`delta_rms`, see metrics.watermark_report) before any robustness number,
+because a near-silent delta explains near-chance detection all by itself.
+
 Attacks that are still stubs (see attacks.py -- bigvgan, dac, sgmse raise
 NotImplementedError until a checkpoint is configured; diff_erase is wired to
 DiffErase-latent, see attacks.py's DiffEraseAttack and
@@ -48,7 +65,19 @@ from .attacks import BigVGANAttack, DACAttack, DiffEraseAttack, IdentityAttack, 
 from .config import EvalConfig, load_eval_config
 from .data import build_dataloader
 from .device import resolve_device
-from .metrics import bit_accuracy, confusion_counts, f1_score, pesq_score, sisnr_score, tpr_at_fpr, visqol_score
+from .metrics import (
+    bit_accuracy,
+    confusion_counts,
+    detection_rate,
+    f1_score,
+    pesq_score,
+    sisnr_score,
+    tpr_at_fpr,
+    visqol_score,
+    watermark_delta_rms,
+    watermark_report,
+    watermark_snr_db,
+)
 from .model_init import build_untrained_generator
 from .plotting import plot_confusion_matrices, plot_robustness_curve
 from .train import embed_watermark, random_message
@@ -72,6 +101,30 @@ _ATTACK_CLASSES: tp.Dict[str, tp.Type[nn.Module]] = {
 # no-op, and bigvgan/dac/mbd have no natural single corruption-level knob), so
 # they're left at strength=None.
 _STRENGTH_AWARE_ATTACKS = ("sgmse", "diff_erase")
+
+# Warning gates on the median per-clip watermark SNR (see
+# `check_watermark_snr`). Wider than the training target range
+# (TrainConfig.watermark_snr_db_{min,max} = 24..36 dB) on purpose: these are
+# "something is wrong", not "this is off-target".
+SNR_NEAR_SILENT_DB = 45.0
+SNR_AUDIBLE_DB = 15.0
+# p95 - p5 above this means the per-clip perturbation size is all over the
+# place, so the median is hiding clips with no usable watermark.
+SNR_SPREAD_WARN_DB = 20.0
+
+# The shipped, never-fine-tuned AudioSeal cards -- what `--stock-baseline`
+# pins the run to regardless of what the config says (see `apply_stock_baseline`).
+STOCK_GENERATOR_CARD = "audioseal_wm_16bits"
+STOCK_DETECTOR_CARD = "audioseal_detector_16bits"
+
+# Pass criteria for `--stock-baseline` (see `stock_baseline_verdict`). The SNR
+# band is deliberately loose -- it is checking that stock AudioSeal emits a
+# perturbation of a plausible order of magnitude, not reproducing a specific
+# measurement (we measured mean=30.65dB, std=2.73dB on our own VCTK data, see
+# TrainConfig.watermark_snr_db_min).
+STOCK_MIN_DETECTION_RATE = 0.99
+STOCK_MIN_BIT_ACCURACY = 0.99
+STOCK_SNR_DB_BAND = (20.0, 40.0)
 
 
 def _reset_peak_memory(device: torch.device) -> None:
@@ -165,12 +218,35 @@ def prepare_eval_batches(
     dataloader,
     cfg: EvalConfig,
     device: torch.device,
-) -> tp.List[PreparedEvalBatch]:
+) -> tp.Tuple[tp.List[PreparedEvalBatch], tp.Dict[str, tp.Any]]:
     """Materialize one set of (clean, watermarked, message) batches, held on
     CPU and reused by every attack and every t* point, so all reported
     numbers come from identical audio and identical messages. The curve
-    points read a prefix of this list (see `cfg.n_curve_batches`)."""
+    points read a prefix of this list (see `cfg.n_curve_batches`).
+
+    Returns `(batches, watermark_diagnostics)`. The diagnostics are the
+    per-clip watermark SNR / delta RMS summary (see metrics.watermark_report),
+    measured here -- immediately after watermarking and therefore before any
+    attack touches the audio, which is the only point where "how loud is the
+    perturbation the generator actually emitted" is well defined. Every clip
+    the run will later report on is measured, since this is the same set of
+    batches every attack reuses.
+
+    Both sides of the SNR normalization are measured, because they answer
+    different questions:
+      - `snr_db` (post-scaling) is pinned to `cfg.watermark_snr_db` by
+        construction, so it is a check that the normalization works, NOT a
+        check that the generator is healthy.
+      - `raw_snr_db` / `raw_delta_rms` (pre-scaling) is the generator's own
+        output, and is the only thing here that can still distinguish "delta
+        is effectively zero" from "delta is fine" -- a collapsed delta gets
+        multiplied back up to the target and reports an identical `snr_db`.
+    """
     prepared = []
+    snr_db_values = []
+    delta_rms_values = []
+    raw_snr_db_values = []
+    raw_delta_rms_values = []
     for batch_index, batch in enumerate(dataloader):
         if batch_index >= cfg.n_eval_batches:
             break
@@ -181,11 +257,113 @@ def prepare_eval_batches(
         # embed_watermark) -- NOT raw x + get_watermark(), which would
         # measure detection at whatever amplitude get_watermark() happens to
         # produce unscaled, an operating point training never sees.
-        x_wm = embed_watermark(generator, x, message, cfg.watermark_snr_db, cfg.watermark_snr_db)
+        # return_parts also hands back the pre-scaling delta, see above.
+        x_wm, delta_raw, _ = embed_watermark(
+            generator, x, message, cfg.watermark_snr_db, cfg.watermark_snr_db, return_parts=True
+        )
+        snr_db_values.append(watermark_snr_db(x, x_wm).cpu())
+        delta_rms_values.append(watermark_delta_rms(x, x_wm).cpu())
+        raw_snr_db_values.append(watermark_snr_db(x, x + delta_raw).cpu())
+        raw_delta_rms_values.append(watermark_delta_rms(x, x + delta_raw).cpu())
         prepared.append((x.cpu(), x_wm.cpu(), message.cpu()))
     if not prepared:
         raise RuntimeError("Evaluation dataloader produced no batches")
-    return prepared
+    diagnostics = watermark_report(
+        torch.cat(snr_db_values),
+        torch.cat(delta_rms_values),
+        raw_snr_db=torch.cat(raw_snr_db_values),
+        raw_delta_rms=torch.cat(raw_delta_rms_values),
+    )
+    return prepared, diagnostics
+
+
+def check_watermark_snr(
+    diagnostics: tp.Dict[str, tp.Any],
+    snr_db_range: tp.Optional[tp.Tuple[float, float]] = None,
+    tolerance_db: float = 1.0,
+) -> tp.List[str]:
+    """Gate the watermark-SNR diagnostic on its MEDIAN, returning (and
+    logging) a list of human-readable warnings.
+
+    The median, not the mean: `watermark_snr_db` saturates around ~150 dB on
+    a zero delta, and a handful of such clips would pull a mean far out of
+    any sane band while leaving most of the distribution untouched.
+
+    Which median depends on what the diagnostics contain. When the embedding
+    is SNR-normalized, `snr_db` is pinned to the configured target by
+    construction and says nothing about the generator, so the quality gates
+    below read `raw_snr_db` (pre-scaling) instead and the configured target
+    is checked separately, as an assertion, against `snr_db`. With an
+    unscaled embedding there is no `raw_snr_db` and `snr_db` is already the
+    raw number, so it is used for both.
+
+    Warnings (not exceptions -- these are "do not trust the robustness
+    numbers below", and the run still produces the evidence for why):
+      - median > `SNR_NEAR_SILENT_DB`: the perturbation is too quiet to be
+        detectable, so near-chance detection is explained by the generator,
+        not by the attack or the detector.
+      - median < `SNR_AUDIBLE_DB`: the perturbation is loud enough to be
+        audible, which invalidates the perceptual claim even if detection
+        looks good. (Under normalization this means the generator is being
+        scaled *down* hard, not that the output is actually audible.)
+      - delta_rms floor at exactly 0: at least one clip got no watermark at
+        all. Called out separately because a zero delta reads as a *large*
+        (good-looking) dB value, being the ratio's denominator.
+      - p95 - p5 wider than `SNR_SPREAD_WARN_DB`: per-clip normalization is
+        not working, so a healthy median is averaging over clips that have no
+        usable watermark and clips that are over-perturbed.
+
+    `snr_db_range` is the (min, max) SNR target that was configured for the
+    embedding, when the embedding is SNR-normalized -- pass `(target, target)`
+    for a single target. Then the *post-scaling* median landing outside it
+    (plus `tolerance_db` of slack on each side) means the normalization did
+    not do what it was configured to do, which is a wiring bug rather than a
+    diagnosis, so that one is an assertion. `None` skips the check.
+    """
+    normalized = "raw_snr_db" in diagnostics
+    # Post-scaling stats back the assertion; pre-scaling stats (when the
+    # embedding is normalized) back the quality gates -- see above.
+    stats = diagnostics["raw_snr_db"] if normalized else diagnostics["snr_db"]
+    median = stats["p50"]
+    label = "raw (pre-normalization) " if normalized else ""
+    delta_rms_min = diagnostics.get("raw_delta_rms_min", diagnostics["delta_rms_min"])
+    warnings: tp.List[str] = []
+
+    if median > SNR_NEAR_SILENT_DB:
+        warnings.append(
+            f"watermark near-silent ({label}median SNR {median:.1f} dB > {SNR_NEAR_SILENT_DB:.0f} dB) "
+            "-- check SNR normalization / generator output"
+        )
+    if median < SNR_AUDIBLE_DB:
+        warnings.append(
+            f"watermark likely audible ({label}median SNR {median:.1f} dB < {SNR_AUDIBLE_DB:.0f} dB) "
+            "-- check SNR normalization"
+        )
+    if delta_rms_min == 0.0:
+        warnings.append(
+            "at least one clip has an exactly-zero watermark delta (delta_rms_min=0.0) "
+            "-- the generator emitted nothing for it"
+        )
+    spread = stats["p95"] - stats["p5"]
+    if spread > SNR_SPREAD_WARN_DB:
+        warnings.append(
+            f"wide per-clip {label}SNR spread (p5={stats['p5']:.1f} dB, p95={stats['p95']:.1f} dB, "
+            f"{spread:.1f} dB) -- per-clip normalization is not working, the median hides "
+            "clips with no usable watermark"
+        )
+
+    for message in warnings:
+        logger.warning("watermark SNR: %s", message)
+
+    if snr_db_range is not None:
+        low, high = snr_db_range
+        achieved = diagnostics["snr_db"]["p50"]
+        assert low - tolerance_db <= achieved <= high + tolerance_db, (
+            f"median watermark SNR {achieved:.2f} dB is outside the configured "
+            f"[{low:g}, {high:g}] dB target (+/- {tolerance_db:g} dB) -- SNR normalization "
+            "is enabled but is not hitting its target"
+        )
+    return warnings
 
 
 @torch.no_grad()
@@ -255,6 +433,9 @@ def evaluate_attack(
     return {
         "bit_accuracy": sum(bit_accs) / len(bit_accs),
         "tpr_at_fpr": tpr_at_fpr(positive_cat, negative_cat, cfg.fpr_target),
+        # Uncalibrated companion to tpr_at_fpr, at a fixed 0.5 threshold --
+        # diagnostic only, see metrics.detection_rate for why both.
+        "detection_rate": detection_rate(positive_cat),
         "confusion": confusion,
         "f1": f1_score(confusion),
         "attack_sisnr": sum(attack_sisnr_values) / len(attack_sisnr_values),
@@ -297,10 +478,93 @@ def evaluate_perceptual(
     return metrics
 
 
+def apply_stock_baseline(cfg: EvalConfig) -> EvalConfig:
+    """Pin `cfg` to the stock-baseline reference point: the unmodified,
+    pretrained AudioSeal generator and detector, no attack, no fine-tuned
+    weights -- on the same data and the same code path as every other run.
+
+    This is the measurement that splits the near-chance-detection diagnosis
+    in two, which is why it overrides rather than merely defaults (a
+    baseline you have to remember to configure correctly is not a baseline):
+      - stock passes  -> the harness is correct end to end, and the
+        fine-tuned generator is what collapsed.
+      - stock fails   -> the bug is in the harness itself (sample rate,
+        tensor shape, scaling, channel layout), not in training, and no
+        fine-tuning number here means anything yet.
+
+    Only the attack list is emptied down to `identity`, not the perceptual
+    metrics: those come from the same prepared batches and cost nothing
+    extra, and PESQ on stock AudioSeal is itself a useful cross-check.
+    """
+    overrides = {
+        "generator_checkpoint": STOCK_GENERATOR_CARD,
+        "detector_checkpoint": STOCK_DETECTOR_CARD,
+        "eval_attacks": ["identity"],
+        "held_out_attacks": [],
+    }
+    for key, value in overrides.items():
+        current = getattr(cfg, key)
+        was = list(current) if isinstance(value, list) else current
+        if was != value:
+            logger.info("stock baseline: overriding %s=%r (was %r)", key, value, was)
+        setattr(cfg, key, value)
+    return cfg
+
+
+def stock_baseline_verdict(results: tp.Dict[str, tp.Any]) -> tp.Tuple[bool, tp.List[str]]:
+    """PASS/FAIL for a `--stock-baseline` run, as (passed, report lines).
+
+    Three independent checks, because each failure mode points somewhere
+    different: SNR says the generator emits a real perturbation, detection
+    rate says the detector sees it, bit accuracy says the message survives
+    the round trip. A stock run failing any of them means the harness is
+    wrong -- these weights are known-good.
+
+    The SNR check reads `raw_snr_db` (pre-normalization) whenever it is
+    present, and only falls back to `snr_db` when the embedding was not
+    normalized. Checking the post-scaling number under normalization would be
+    vacuous: it equals the configured target by construction, so it would
+    report PASS for a generator emitting nothing at all.
+    """
+    identity = results.get("attacks", {}).get("identity", {})
+    watermark = results.get("watermark", {})
+    normalized = "raw_snr_db" in watermark
+    snr = watermark.get("raw_snr_db") if normalized else watermark.get("snr_db", {})
+    snr_label = "raw_snr_db median" if normalized else "snr_db median"
+    snr_low, snr_high = STOCK_SNR_DB_BAND
+
+    checks = [
+        ("detection_rate", identity.get("detection_rate"), lambda v: v >= STOCK_MIN_DETECTION_RATE,
+         f">= {STOCK_MIN_DETECTION_RATE}"),
+        ("bit_accuracy", identity.get("bit_accuracy"), lambda v: v >= STOCK_MIN_BIT_ACCURACY,
+         f">= {STOCK_MIN_BIT_ACCURACY}"),
+        (snr_label, (snr or {}).get("p50"), lambda v: snr_low <= v <= snr_high,
+         f"in [{snr_low:g}, {snr_high:g}] dB"),
+    ]
+
+    passed = True
+    lines = []
+    for name, value, predicate, expectation in checks:
+        if value is None:
+            passed = False
+            lines.append(f"  {name}: MISSING (expected {expectation}) -- the run did not produce it")
+            continue
+        ok = predicate(value)
+        passed = passed and ok
+        lines.append(f"  {name}: {value:.4f} (expected {expectation}) {'PASS' if ok else 'FAIL'}")
+    return passed, lines
+
+
 def run(cfg: EvalConfig) -> tp.Dict[str, tp.Any]:
     device = resolve_device(cfg.device)
     torch.manual_seed(cfg.seed)
     random.seed(cfg.seed)
+
+    if cfg.stock_baseline:
+        logger.info(
+            "=== stock baseline mode: unmodified AudioSeal generator + detector, identity attack only ==="
+        )
+        cfg = apply_stock_baseline(cfg)
 
     generator = load_generator_under_test(cfg.generator_checkpoint, cfg.nbits, device)
     generator.eval()
@@ -319,7 +583,7 @@ def run(cfg: EvalConfig) -> tp.Dict[str, tp.Any]:
         num_workers=cfg.num_workers,
         shuffle=False,
     )
-    eval_batches = prepare_eval_batches(generator, dataloader, cfg, device)
+    eval_batches, watermark_diagnostics = prepare_eval_batches(generator, dataloader, cfg, device)
 
     tracker = build_tracker(
         backend=cfg.tracking.backend,
@@ -374,6 +638,46 @@ def run(cfg: EvalConfig) -> tp.Dict[str, tp.Any]:
     run_started = time.perf_counter()
 
     try:
+        # Read this BEFORE any robustness number below: it says whether the
+        # generator emitted a non-trivial perturbation at all. Near-chance
+        # detection with a near-silent delta is a generator problem; with a
+        # healthy delta it is a detection/harness problem. Measured pre-attack
+        # in prepare_eval_batches.
+        logger.info("=== watermark SNR (pre-attack diagnostic) ===")
+        results["watermark"] = watermark_diagnostics
+        snr_stats = watermark_diagnostics["snr_db"]
+        logger.info(
+            "watermark: snr_db median=%.2f mean=%.2f std=%.2f min=%.2f max=%.2f p5=%.2f p95=%.2f "
+            "| delta_rms=%.3e (min %.3e) over %d clips",
+            snr_stats["p50"],
+            snr_stats["mean"],
+            snr_stats["std"],
+            snr_stats["min"],
+            snr_stats["max"],
+            snr_stats["p5"],
+            snr_stats["p95"],
+            watermark_diagnostics["delta_rms"],
+            watermark_diagnostics["delta_rms_min"],
+            watermark_diagnostics["n_clips"],
+        )
+        # The embedding IS SNR-normalized now (prepare_eval_batches scales to
+        # cfg.watermark_snr_db), so hold the achieved median to that target
+        # +/- 1 dB -- missing it means the normalization is broken, which is a
+        # wiring bug, not a finding. The quality gates inside read the raw
+        # pre-scaling numbers instead, since the post-scaling ones are pinned
+        # to the target by construction.
+        results["watermark"]["warnings"] = check_watermark_snr(
+            watermark_diagnostics, snr_db_range=(cfg.watermark_snr_db, cfg.watermark_snr_db)
+        )
+        tracker.log(
+            {
+                **{f"watermark/snr_db_{k}": v for k, v in snr_stats.items()},
+                "watermark/delta_rms": watermark_diagnostics["delta_rms"],
+                "watermark/delta_rms_min": watermark_diagnostics["delta_rms_min"],
+            },
+            step=0,
+        )
+
         logger.info("=== perceptual metrics (no attack) ===")
         _reset_peak_memory(device)
         perceptual = evaluate_perceptual(eval_batches, cfg, device)
@@ -541,6 +845,45 @@ def _print_timing_and_projection(cfg: EvalConfig, results: tp.Dict[str, tp.Any])
     )
 
 
+def _print_watermark_diagnostic(results: tp.Dict[str, tp.Any]) -> None:
+    """The pre-attack watermark block, printed before the attack numbers
+    because it is what decides whether they are worth reading at all.
+
+    When the embedding is SNR-normalized, `snr_db` is pinned to the target by
+    construction, so the `raw_*` line (the generator's output before scaling)
+    is the one that actually says whether the generator is healthy -- it is
+    labelled as such rather than left for the reader to work out.
+    """
+    watermark = results.get("watermark")
+    if not watermark:
+        return
+    stats = watermark["snr_db"]
+    print(f"\nWatermark (pre-attack, {watermark['n_clips']} clips):")
+    print(
+        f"  snr_db:        median {stats['p50']:7.2f} dB  [p5 {stats['p5']:.2f}, p95 {stats['p95']:.2f}]"
+        f"  mean {stats['mean']:.2f} +/- {stats['std']:.2f}"
+    )
+    print(f"  delta_rms:     {watermark['delta_rms']:.3e} (min over clips {watermark['delta_rms_min']:.3e})")
+
+    raw = watermark.get("raw_snr_db")
+    if raw:
+        print(
+            f"  raw_snr_db:    median {raw['p50']:7.2f} dB  [p5 {raw['p5']:.2f}, p95 {raw['p95']:.2f}]"
+            f"  mean {raw['mean']:.2f} +/- {raw['std']:.2f}"
+        )
+        print(
+            f"  raw_delta_rms: {watermark['raw_delta_rms']:.3e} "
+            f"(min over clips {watermark['raw_delta_rms_min']:.3e})"
+        )
+        print(
+            "    ^ raw_* is the generator's output BEFORE SNR normalization -- snr_db above is "
+            "pinned to the\n      configured target by construction, so only raw_* can show a "
+            "collapsed generator."
+        )
+    for message in watermark.get("warnings", []):
+        print(f"  WARNING: {message}")
+
+
 def _print_results_table(results: tp.Dict[str, tp.Any]) -> None:
     """Human-readable stand-in for dumping `results` (a deeply nested dict,
     including a whole robustness_curve list per attack) straight to stdout --
@@ -553,7 +896,14 @@ def _print_results_table(results: tp.Dict[str, tp.Any]) -> None:
     perceptual = results.get("perceptual")
     if perceptual:
         print("\nPerceptual (watermarked vs. clean, no attack):")
-        print(f"  SI-SNR: {perceptual['sisnr']:.2f} dB    PESQ: {perceptual['pesq']:.2f}")
+        # Either metric can be absent (compute_sisnr/compute_pesq off, or PESQ
+        # skipped every batch -- see evaluate_perceptual), so don't index.
+        parts = [f"{name}: {perceptual[key]:.2f}{unit}"
+                 for name, key, unit in (("SI-SNR", "sisnr", " dB"), ("PESQ", "pesq", ""))
+                 if key in perceptual]
+        print("  " + "    ".join(parts) if parts else "  (none computed)")
+
+    _print_watermark_diagnostic(results)
 
     print("\nAttacks:")
     col = "  {:<12}{:<10}{:>9}{:>10}{:>8}{:>9}{:>9}"
@@ -633,6 +983,22 @@ def main() -> None:
                 f"({worst_gb / gpu['total_gb']:.0%} of the card) -- "
                 f"~{gpu['total_gb'] / worst_gb:.1f}x headroom before it's full"
             )
+
+    if cfg.stock_baseline:
+        passed, lines = stock_baseline_verdict(results)
+        print("\n=== Stock baseline check (unmodified AudioSeal, no attack) ===")
+        for line in lines:
+            print(line)
+        print(f"result: {'PASS' if passed else 'FAIL'}")
+        print(
+            "  -> the harness is correct end to end; a failing fine-tuned run is the generator"
+            if passed
+            else "  -> the harness itself is wrong (sample rate, tensor shape, scaling, or channel "
+            "layout) -- fix this before reading any fine-tuning number"
+        )
+        # Non-zero exit so this is usable as a gate in a script/CI step, the
+        # same convention sanity_check.py uses.
+        raise SystemExit(0 if passed else 1)
 
 
 if __name__ == "__main__":
