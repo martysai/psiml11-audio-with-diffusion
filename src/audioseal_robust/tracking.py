@@ -6,17 +6,19 @@
 
 """Experiment tracking, pluggable between MLflow and Weights & Biases.
 
-Default backend is MLflow using its local backend store (a `./mlflow.db`
-SQLite file with MLflow 3.x, or a `./mlruns` directory with older MLflow --
-either way, in the current working directory unless `mlflow_tracking_uri` is
-set): no account, no network call, no API key -- it works out of the box on
-a laptop or a training box with no internet egress, which makes it the safer
-default for this pipeline. Run `mlflow ui` in that directory to browse it.
-Weights & Biases is fully supported as an alternative
-(`tracking.backend=wandb`) for anyone who wants hosted dashboards / audio
-sample browsing; it needs `pip install wandb` and either a logged-in account
-or `tracking.wandb_mode=offline` in the caller's own environment -- neither
-is set up by this module.
+Default backend is Weights & Biases (`tracking.backend=wandb`) for hosted
+dashboards and easy cross-device metric comparison; it needs `pip install
+wandb` and either a logged-in account or `tracking.wandb_mode=offline` in the
+caller's own environment -- neither is set up by this module.
+
+MLflow is fully supported as an alternative (`tracking.backend=mlflow`),
+using its local backend store (a `./mlflow.db` SQLite file with MLflow 3.x,
+or a `./mlruns` directory with older MLflow -- either way, in the current
+working directory unless `mlflow_tracking_uri` is set): no account, no
+network call, no API key -- it works out of the box on a training box with
+no internet egress, which is why Azure job submissions (no wandb access
+there) pin this backend explicitly. Run `mlflow ui` in that directory to
+browse it.
 
 If the selected backend's package isn't installed, we fall back to a
 console-only tracker rather than crashing the training run.

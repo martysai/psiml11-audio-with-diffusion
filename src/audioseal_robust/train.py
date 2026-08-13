@@ -34,6 +34,7 @@ import typing as tp
 import torch
 import torch.nn as nn
 from omegaconf import OmegaConf
+from tqdm import tqdm
 
 from audioseal import AudioSeal
 from audioseal.models import AudioSealDetector, AudioSealWM
@@ -317,10 +318,13 @@ def train(cfg: TrainConfig) -> None:
     step = 0
     try:
         for epoch in range(cfg.epochs):
+            progress = tqdm(total=cfg.updates_per_epoch, desc=f"epoch {epoch}", unit="step", leave=False)
             for batch in dataloader:
                 metrics = train_step(generator, detector, attack, perceptual_loss_fn, optimizer, batch, cfg, device)
                 scalar_metrics = {k: v for k, v in metrics.items() if isinstance(v, (int, float))}
                 tracker.log(scalar_metrics, step=step)
+                progress.update(1)
+                progress.set_postfix(loss=f"{metrics['loss']:.4f}", attack=metrics["attack"])
                 if valid_iter is not None and step % cfg.eval_every == 0:
                     eval_metrics = eval_step(
                         generator, detector, attack, perceptual_loss_fn, next(valid_iter), cfg, device
@@ -345,6 +349,7 @@ def train(cfg: TrainConfig) -> None:
                 if step % cfg.updates_per_epoch == 0:
                     break
 
+            progress.close()
             ckpt_path = f"{cfg.checkpoint_dir}/generator_epoch{epoch}.pth"
             torch.save({"model": generator.state_dict(), "xp.cfg": cfg}, ckpt_path)
             logger.info("saved checkpoint to %s", ckpt_path)

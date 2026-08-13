@@ -7,9 +7,9 @@ cd "$(dirname "$0")"
 # try + skip the rest for lack of a checkpoint/package). See
 # run_full_eval_1h.sh's note on why the label carries "audioldm".
 #
-# tracking.backend left at its default (mlflow, local) and n_curve_batches
+# tracking.backend left at its default (wandb) and n_curve_batches
 # bumped to 20 -- same reasoning as run_full_eval_1h.sh, kept identical here
-# so a smoke run and the real run are directly comparable in mlflow, not
+# so a smoke run and the real run are directly comparable in wandb, not
 # just structurally similar.
 MPLBACKEND=Agg PYTHONPATH=src python3 -m audioseal_robust.evaluate \
   eval_dir=/data/datasets/LibriSpeech/test-clean \

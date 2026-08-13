@@ -30,10 +30,10 @@ set +e
 # not after them). Stamping that into the label so output filenames
 # (full_1h_audioldm_confusion.png etc.) say what actually ran.
 #
-# tracking.backend left at its default (mlflow, local) instead of "none" --
-# this is the real baseline number, meant to sit in the same mlflow
-# experiment as later post-fine-tuning runs for a same-dashboard comparison
-# (see evaluate.py's module docstring).
+# tracking.backend left at its default (wandb) instead of "none" -- this is
+# the real baseline number, meant to sit in the same wandb experiment as
+# later post-fine-tuning runs for a same-dashboard comparison (see
+# evaluate.py's module docstring).
 #
 # n_curve_batches=20 (up from the config default of 6): curve cost doesn't
 # scale with n_eval_batches (see EvalConfig.n_curve_batches), so this only
