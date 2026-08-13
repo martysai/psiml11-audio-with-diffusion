@@ -1,4 +1,4 @@
-$schema: https://azuremlschemas.azureedge.net/latest/commandJob.schema.json
+﻿$schema: https://azuremlschemas.azureedge.net/latest/commandJob.schema.json
 
 # az ml job create -f azureml/jobs/train_sgmse.yaml \
 #     --set compute=azureml:<your-a100-cluster>
@@ -25,7 +25,7 @@ compute: azureml:gpu-cluster
 inputs:
   librispeech:
     type: uri_folder
-    path: azureml:librispeech-asr@1
+    path: azureml:librispeech-asr:1
     # download, not ro_mount. data.py:36 builds the file list with
     #   sorted(p for ext in (".wav", ".flac") for p in root.rglob(f"*{ext}"))
     # i.e. a full recursive walk *per extension*, and train.py constructs a
@@ -37,7 +37,7 @@ inputs:
     mode: download
   checkpoints:
     type: custom_model
-    path: azureml:psiml-diffusion-checkpoints@1
+    path: azureml:psiml-diffusion-checkpoints:1
     # ro_mount is right here, unlike the data above: 11 large files read
     # sequentially at startup, streamed at full throughput, and the sgmse
     # direction never touches most of audioldm-s-full -- mounting skips

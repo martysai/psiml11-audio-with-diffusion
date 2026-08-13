@@ -1,4 +1,4 @@
-# python azureml/aml_submit.py --config azureml/configs/sgmse.yaml
+﻿# python azureml/aml_submit.py --config azureml/configs/sgmse.yaml
 #
 # Trains against SGMSE, holds DiffErase + MBD out (recipes.yaml's `sgmse` /
 # `after_sgmse_training` pair). The static equivalent is
@@ -25,8 +25,8 @@ description: >-
   with DiffErase and MBD held out.
 
 inputs:
-  librispeech: azureml:librispeech-asr@1
-  checkpoints: azureml:psiml-diffusion-checkpoints@1
+  librispeech: azureml:librispeech-asr:1
+  checkpoints: azureml:psiml-diffusion-checkpoints:1
 
 timeout_minutes: 720
 
