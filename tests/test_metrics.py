@@ -66,7 +66,29 @@ def test_confusion_counts_separated_distributions():
     assert confusion["tp"] + confusion["fn"] == 200
     assert confusion["fp"] + confusion["tn"] == 200
     assert confusion["tp"] > 195
-    assert confusion["fp"] <= 5  # ~1% target FPR (threshold is itself one of the negatives, so off by ~1)
+    assert confusion["fp"] <= 2
+
+
+def test_confusion_counts_does_not_exceed_fpr_budget():
+    positive_scores = torch.ones(160)
+    negative_scores = torch.arange(160, dtype=torch.float32)
+
+    confusion = confusion_counts(positive_scores, negative_scores, target_fpr=0.01)
+    assert confusion["fp"] == 1  # int(0.01 * 160) = 1 negative allowed through
+
+
+def test_confusion_counts_zero_fpr_admits_no_negatives():
+    confusion = confusion_counts(torch.ones(100), torch.zeros(100), target_fpr=0.0)
+
+    assert confusion["fp"] == 0
+    assert confusion["tp"] == 100
+
+
+def test_confusion_counts_ties_at_threshold_stay_within_budget():
+    negative_scores = torch.cat([torch.ones(2), torch.zeros(98)])
+
+    confusion = confusion_counts(torch.ones(100), negative_scores, target_fpr=0.01)
+    assert confusion["fp"] <= 1
 
 
 def test_confusion_counts_matches_tpr_at_fpr():
