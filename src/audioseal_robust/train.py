@@ -42,7 +42,7 @@ from audioseal.models import AudioSealDetector, AudioSealWM
 from .attacks import (
     BigVGANAttack,
     DACAttack,
-    DiffEraseAttack,
+    AudioLDMAttack,
     IdentityAttack,
     SGMSEAttack,
     SampledReconstructionAttack,
@@ -116,11 +116,11 @@ def build_attack(cfg: TrainConfig, device: torch.device) -> SampledReconstructio
             sample_rate=cfg.sample_rate,
             num_steps=cfg.attack.sgmse.num_steps,
         ),
-        "diff_erase": DiffEraseAttack(
-            checkpoint=cfg.attack.diff_erase.checkpoint,
-            config=cfg.attack.diff_erase.config,
+        "audioldm": AudioLDMAttack(
+            checkpoint=cfg.attack.audioldm.checkpoint,
+            config=cfg.attack.audioldm.config,
             sample_rate=cfg.sample_rate,
-            strength_max=cfg.attack.diff_erase.strength_max,
+            strength_max=cfg.attack.audioldm.strength_max,
         ),
     }
     weights = {
@@ -128,7 +128,7 @@ def build_attack(cfg: TrainConfig, device: torch.device) -> SampledReconstructio
         "bigvgan": cfg.attack.weights.bigvgan,
         "dac": cfg.attack.weights.dac,
         "sgmse": cfg.attack.weights.sgmse,
-        "diff_erase": cfg.attack.weights.diff_erase,
+        "audioldm": cfg.attack.weights.audioldm,
     }
     attack = SampledReconstructionAttack(attacks, weights)
     return attack.to(device)

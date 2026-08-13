@@ -5,8 +5,8 @@
 # To train against a specific diffusion attack, pick a named recipe (see
 # config/recipes.yaml -- sets attack.weights.* for you) and supply that
 # attack's checkpoint(s):
-#   python -m audioseal_robust.train recipe=diff_erase data.train_dir=/path/to/wavs \
-#       attack.diff_erase.checkpoint=/path/to/checkpoint.ckpt attack.diff_erase.config=/path/to/config.yaml
+#   python -m audioseal_robust.train recipe=audioldm data.train_dir=/path/to/wavs \
+#       attack.audioldm.checkpoint=/path/to/checkpoint.ckpt attack.audioldm.config=/path/to/config.yaml
 #   python -m audioseal_robust.train recipe=sgmse data.train_dir=/path/to/wavs \
 #       attack.sgmse.checkpoint=/path/to/checkpoint.ckpt
 
@@ -42,7 +42,7 @@ attack:
     bigvgan: 0.0
     dac: 0.0
     sgmse: 0.0
-    diff_erase: 0.0
+    audioldm: 0.0
   bigvgan:
     checkpoint: null
   dac:
@@ -50,7 +50,7 @@ attack:
   sgmse:
     checkpoint: null
     num_steps: 30
-  diff_erase:
+  audioldm:
     checkpoint: null
     config: null
     strength_max: 0.08

@@ -59,8 +59,8 @@ class SGMSEAttackConfig:
 
 
 @dataclass
-class DiffEraseAttackConfig:
-    """Wires DiffEraseAttack (attacks.py) to pretrained AudioLDM weights.
+class AudioLDMAttackConfig:
+    """Wires AudioLDMAttack (attacks.py) to pretrained AudioLDM weights.
     The model *code* (audioldm_train, MIT licensed) is vendored under
     src/audioldm_train/ -- see that directory's VENDORED.md -- so only the
     *weights* need to be supplied externally (multi-GB, never belongs in
@@ -70,27 +70,24 @@ class DiffEraseAttackConfig:
 
     # A full LatentDiffusion checkpoint (VAE + diffusion UNet), NOT the
     # VAE-only checkpoint -- must live at <weights_root>/data/checkpoints/<file>
-    # (see attacks.py:DiffEraseAttack._load_backbone for why: get_vocoder()
+    # (see attacks.py:AudioLDMAttack._load_backbone for why: get_vocoder()
     # and the VAE's reload_from_ckpt both hardcode that relative layout).
-    # E.g. a checkout of github.com/DiffErase/Differase's
-    # DiffErase-latent/data/checkpoints/*.ckpt -- that repo ships no
-    # pretrained checkpoint of its own though (its README is about
-    # *training* one); a generic pretrained AudioLDM checkpoint also works
-    # here -- see DiffEraseAttack's docstring for why.
+    # E.g. `audioldm-s-full` from the AudioLDM authors' Zenodo record,
+    # placed at <weights_root>/data/checkpoints/audioldm-s-full alongside
+    # the VAE/CLAP/HiFiGAN support bundle that config references by name.
     checkpoint: tp.Optional[str] = None
-    # Matching audioldm_train config, e.g. a checkout of Differase's
-    # DiffErase-latent/audioldm_train/config/**/*.yaml
-    # (2023_08_23_reproduce_audioldm/audioldm_original.yaml matches a
+    # Matching audioldm_train config -- the vendored
+    # config/2023_08_23_reproduce_audioldm/audioldm_original.yaml matches a
     # standard/small AudioLDM checkpoint's architecture). NOTE: every shipped
     # LatentDiffusion config in that repo is CLAP-conditioned, which pulls in
     # its own pretrained sub-checkpoint at model-construction time (e.g.
     # audioldm_original.yaml needs a `clap_htsat_tiny.pt` next to `checkpoint`,
-    # under the same data/checkpoints/ dir) even though DiffEraseAttack runs
+    # under the same data/checkpoints/ dir) even though AudioLDMAttack runs
     # the model fully unconditionally -- confirmed empirically, see attacks.py.
     config: tp.Optional[str] = None
-    # Caps the strength (t*) DiffEraseAttack samples when `strength=None` is
+    # Caps the strength (t*) AudioLDMAttack samples when `strength=None` is
     # passed in (random.random() * strength_max otherwise) -- see
-    # DiffEraseAttack.forward and its class docstring. Backprop through the
+    # AudioLDMAttack.forward and its class docstring. Backprop through the
     # full DDPM reverse loop (up to num_timesteps, commonly ~1000, steps at
     # strength=1.0) is not memory-tractable during training; 0.08 matches
     # EvalConfig.t_star_grid's own calibrated "hard regime" ceiling (see that
@@ -123,16 +120,16 @@ class AttackWeights:
     # branch guaranteed to work without extra setup -- see attacks.py for
     # what's needed to enable the others.
     #
-    # This project's current config trains against `diff_erase` (AudioLDM)
+    # This project's current config trains against `audioldm`
     # and holds `sgmse` out for evaluation only (see EvalConfig in this file
     # / evaluate.py's held_out_attacks) -- do not also give `sgmse` nonzero
     # weight here unless you deliberately want to give up that held-out
-    # generalization probe (see DiffEraseAttack's docstring in attacks.py).
+    # generalization probe (see AudioLDMAttack's docstring in attacks.py).
     identity: float = 1.0
     bigvgan: float = 0.0
     dac: float = 0.0
     sgmse: float = 0.0
-    diff_erase: float = 0.0
+    audioldm: float = 0.0
 
 
 @dataclass
@@ -141,7 +138,7 @@ class AttackConfig:
     bigvgan: BigVGANAttackConfig = field(default_factory=BigVGANAttackConfig)
     dac: DACAttackConfig = field(default_factory=DACAttackConfig)
     sgmse: SGMSEAttackConfig = field(default_factory=SGMSEAttackConfig)
-    diff_erase: DiffEraseAttackConfig = field(default_factory=DiffEraseAttackConfig)
+    audioldm: AudioLDMAttackConfig = field(default_factory=AudioLDMAttackConfig)
 
 
 @dataclass
@@ -208,7 +205,7 @@ class TrainConfig:
     seed: int = 1234
 
     # Name of a bundle under config/recipes.yaml's `train:` section (e.g.
-    # "diff_erase" or "sgmse"), merged in on top of this schema/default.yaml
+    # "audioldm" or "sgmse"), merged in on top of this schema/default.yaml
     # but below explicit CLI overrides -- see load_config and recipes.yaml's
     # own header comment for what these set and why. None (default): no
     # recipe applied, falls back to whatever attack.weights.* default.yaml
@@ -246,12 +243,12 @@ class TrainConfig:
 class EvalAttackConfig:
     """Per-attack extra settings for evaluate.py's attacks (checkpoints etc),
     separate from TrainConfig's AttackConfig since eval also runs held-out
-    attacks (diff_erase, mbd) that training must never see."""
+    attacks (audioldm, mbd) that training must never see."""
 
     bigvgan: BigVGANAttackConfig = field(default_factory=BigVGANAttackConfig)
     dac: DACAttackConfig = field(default_factory=DACAttackConfig)
     sgmse: SGMSEAttackConfig = field(default_factory=SGMSEAttackConfig)
-    diff_erase: DiffEraseAttackConfig = field(default_factory=DiffEraseAttackConfig)
+    audioldm: AudioLDMAttackConfig = field(default_factory=AudioLDMAttackConfig)
     mbd: MBDAttackConfig = field(default_factory=MBDAttackConfig)
 
 
@@ -280,7 +277,7 @@ class EvalConfig:
     seed: int = 1234
 
     # Name of a bundle under config/recipes.yaml's `eval:` section (e.g.
-    # "after_diff_erase_training" or "after_sgmse_training") -- same merge
+    # "after_audioldm_training" or "after_sgmse_training") -- same merge
     # position/semantics as TrainConfig.recipe (see load_eval_config). None
     # (default): no recipe applied, falls back to default_eval.yaml's plain
     # eval_attacks/held_out_attacks.
@@ -334,9 +331,9 @@ class EvalConfig:
     # Robustness curve: detection vs. attack strength t* (diffusion
     # purification starting point -- 0 = no corruption, 1 = full
     # noise-then-regenerate). Only meaningful for attacks that implement a
-    # `strength` axis (currently sgmse, diff_erase) -- see attacks.py.
+    # `strength` axis (currently sgmse, audioldm) -- see attacks.py.
     # Fractions of num_timesteps (attack-agnostic -- each strength-aware
-    # attack maps this through its own T, see SGMSEAttack/DiffEraseAttack
+    # attack maps this through its own T, see SGMSEAttack/AudioLDMAttack
     # docstrings). Calibrated against the mentor's curriculum table (linear
     # schedule, T=1000): actual timesteps t*={0.3, 2, 6, 15, 40} correspond
     # to noise floors lambda_dB={50, 36, 30, 24, 18} -- 50dB is "barely an
@@ -350,15 +347,15 @@ class EvalConfig:
         default_factory=lambda: [0.0, 0.0003, 0.002, 0.006, 0.015, 0.04, 0.08]
     )
     # The single t* the HEADLINE robustness number is measured at, for the
-    # strength-aware attacks (sgmse, diff_erase -- the rest ignore strength
+    # strength-aware attacks (sgmse, audioldm -- the rest ignore strength
     # entirely). 0.04 = t*=40 out of T=1000 = the top of the mentor's
     # curriculum table, i.e. their "hard regime" (see t_star_grid above).
     #
     # Passing no strength at all (what evaluate.py used to do) is NOT a
     # neutral default -- it leaves strength=None, which makes each attack
     # sample its own t* ~ U[0, 1] per forward call (see
-    # SGMSEAttack/DiffEraseAttack.forward). Two problems with that:
-    #   1. Cost. DiffEraseAttack's reverse loop runs int(1000 * strength)
+    # SGMSEAttack/AudioLDMAttack.forward). Two problems with that:
+    #   1. Cost. AudioLDMAttack's reverse loop runs int(1000 * strength)
     #      sequential UNet steps, so U[0,1] averages ~500 steps/batch --
     #      ~12x this setting's 40, and still ~6x past t*=80 (t_star_grid's
     #      top point, itself already beyond the hard regime). We were paying
@@ -371,13 +368,13 @@ class EvalConfig:
     headline_strength: float = 0.04
 
     # Attacks the generator was (or will be) trained against.
-    eval_attacks: tp.List[str] = field(default_factory=lambda: ["identity", "bigvgan", "dac", "diff_erase"])
+    eval_attacks: tp.List[str] = field(default_factory=lambda: ["identity", "bigvgan", "dac", "audioldm"])
     # Held out on purpose: NEVER given nonzero weight in AttackConfig.weights
     # during training. This is the generalization probe -- "did robustness
     # transfer to an attack the generator never saw, or did it just
     # memorize the training attacks." `sgmse` is held out here (rather than
     # trained against, as in the original design) -- this project variant
-    # trains on `diff_erase` (AudioLDM) instead, so `sgmse` is the
+    # trains on `audioldm` instead, so `sgmse` is the
     # generalization probe: does robustness against latent-diffusion
     # resynthesis transfer to SGMSE's structurally different OU-VE SDE
     # attack. `mbd` remains held out either way (never wired into
