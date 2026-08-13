@@ -519,17 +519,62 @@ def _print_timing_and_projection(cfg: EvalConfig, results: tp.Dict[str, tp.Any])
     )
 
 
+def _print_results_table(results: tp.Dict[str, tp.Any]) -> None:
+    """Human-readable stand-in for dumping `results` (a deeply nested dict,
+    including a whole robustness_curve list per attack) straight to stdout --
+    that's fine for the log line evaluate_attack already emits (grep-able,
+    machine-parseable), but unreadable as the final on-screen summary."""
+    print(f"\n{'=' * 60}")
+    print(f" Evaluation summary: {results['label']}")
+    print(f"{'=' * 60}")
+
+    perceptual = results.get("perceptual")
+    if perceptual:
+        print("\nPerceptual (watermarked vs. clean, no attack):")
+        print(f"  SI-SNR: {perceptual['sisnr']:.2f} dB    PESQ: {perceptual['pesq']:.2f}")
+
+    print("\nAttacks:")
+    col = "  {:<12}{:<10}{:>9}{:>10}{:>8}{:>9}"
+    print(col.format("name", "tag", "bit_acc", "tpr@fpr", "f1", "time"))
+    print("  " + "-" * 58)
+    for name, r in results["attacks"].items():
+        tag = r.get("tag", "")
+        if "skipped" in r:
+            print(col.format(name, tag, "skipped", "", "", ""))
+            print(f"    -> {r['skipped']}")
+            continue
+        time_str = _fmt_duration(r["seconds"]) if "seconds" in r else "-"
+        print(
+            col.format(
+                name, tag, f"{r['bit_accuracy']:.3f}", f"{r['tpr_at_fpr']:.3f}", f"{r['f1']:.3f}", time_str
+            )
+        )
+        c = r.get("confusion")
+        if c:
+            # Actual 2x2 layout (rows=ground truth, cols=predicted), same
+            # convention as plotting.py's confusion-matrix PNG -- not just a
+            # flat "tp=.. fn=.. fp=.. tn=.." line.
+            mcol = "      {:<14}{:>10}{:>15}"
+            print("    confusion matrix:")
+            print(mcol.format("", "detected", "not detected"))
+            print(mcol.format("watermarked", c["tp"], c["fn"]))
+            print(mcol.format("clean", c["fp"], c["tn"]))
+
+        curve = r.get("robustness_curve")
+        if curve:
+            print(f"    robustness curve ({_fmt_duration(r.get('curve_seconds', 0))}, {len(curve)} points):")
+            curve_col = "      {:>8}{:>10}{:>10}"
+            print(curve_col.format("t*", "bit_acc", "tpr@fpr"))
+            for p in curve:
+                print(curve_col.format(f"{p['t_star']:.4f}", f"{p['bit_accuracy']:.3f}", f"{p['tpr_at_fpr']:.3f}"))
+
+
 def main() -> None:
     logging.basicConfig(level=logging.INFO)
     cfg = load_eval_config()
     results = run(cfg)
 
-    print("\n=== Evaluation summary ===")
-    print(f"label: {results['label']}")
-    print(f"perceptual: {results.get('perceptual')}")
-    for name, r in results["attacks"].items():
-        print(f"attack={name} ({r.get('tag')}): {r}")
-
+    _print_results_table(results)
     _print_timing_and_projection(cfg, results)
     if "confusion_matrix_plot" in results:
         print(f"confusion matrix plot: {results['confusion_matrix_plot']}")
