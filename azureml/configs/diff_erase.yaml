@@ -1,0 +1,40 @@
+# python azureml/aml_submit.py --config azureml/configs/diff_erase.yaml
+#
+# The opposite direction from sgmse.yaml: trains against DiffErase (AudioLDM),
+# holds SGMSE + MBD out. Static equivalent: azureml/jobs/train_diff_erase.yaml.
+
+# workspace:
+#   subscription_id: 00000000-0000-0000-0000-000000000000
+#   resource_group_name: playground-rg
+#   workspace_name: playground-ws
+
+direction: diff_erase
+compute: a100-cluster
+environment: azureml:audioseal-robust-diffusion@latest
+
+experiment_name: audioseal-robust-diffusion-swap
+display_name: swap-diff-erase
+description: >-
+  Generator-only robustness fine-tuning against the DiffErase/AudioLDM attack,
+  then eval with SGMSE and MBD held out.
+
+inputs:
+  librispeech: azureml:librispeech-asr@1
+  checkpoints: azureml:psiml-diffusion-checkpoints@1
+
+timeout_minutes: 720
+
+overrides:
+  epochs: 3
+  updates_per_epoch: 200
+  log_every: 20
+  eval_every: 100
+  # Half the sgmse batch: this direction backprops through AudioLDM's VAE
+  # encoder plus UNet reverse steps, the heavier of the two graphs.
+  data.batch_size: 4
+  data.num_workers: 4
+  data.segment_duration: 2.0
+  # attack.diff_erase.strength_max stays at its default 0.08 on purpose --
+  # config.py:91-100 sets that ceiling because backprop through the full DDPM
+  # reverse loop is not memory-tractable. Raising it is how you OOM this job.
+  tracking.backend: none
