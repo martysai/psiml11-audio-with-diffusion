@@ -170,6 +170,12 @@ az ml job create -f azureml/jobs/smoke_audioldm_manifold.yaml `
 
 Three things about this that are not obvious:
 
+- **`job_tier` must be `standard`, never `premium`.** Premium costs
+  materially more and is not ours to spend on this workload, however long
+  standard waits for a node. The working Singularity job this spec's shape was
+  copied from happened to use premium; that was carried over by mistake once
+  and cancelled. If you copy an existing job's `resources`/`queue_settings`
+  block again, re-check this field.
 - **The 18.8 GB is not copied.** The job identity `as-shared-w3-id` already
   holds *Storage Blob Data Contributor* on `asplaygroundw3data`, so a
   credential-less datastore reads the existing blobs in place.

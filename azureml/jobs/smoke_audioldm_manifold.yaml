@@ -44,7 +44,10 @@ resources:
   shm_size: 64g
 
 queue_settings:
-  job_tier: premium
+  # STANDARD ONLY. Never premium -- premium is a materially more expensive
+  # tier and is not ours to spend on this workload, regardless of how long
+  # standard has to wait for a node. This applies to every job in this repo.
+  job_tier: standard
 
 inputs:
   librispeech:

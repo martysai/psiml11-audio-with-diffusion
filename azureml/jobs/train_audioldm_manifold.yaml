@@ -29,7 +29,10 @@ resources:
   shm_size: 64g
 
 queue_settings:
-  job_tier: premium
+  # STANDARD ONLY. Never premium -- see smoke_audioldm_manifold.yaml. This is
+  # the long-running job, so the temptation to buy a faster slot is highest
+  # here; do not.
+  job_tier: standard
 
 inputs:
   librispeech:
