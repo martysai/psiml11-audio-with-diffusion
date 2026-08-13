@@ -32,6 +32,7 @@ import os
 import random
 import typing as tp
 
+import numpy as np
 import torch
 import torch.nn as nn
 from omegaconf import OmegaConf
@@ -333,7 +334,17 @@ def build_experiment_tracker(cfg: TrainConfig) -> ExperimentTracker:
 
 
 def train(cfg: TrainConfig) -> None:
+    # All RNG sources actually touched by this pipeline: torch.manual_seed
+    # alone only seeds the default CPU generator, not CUDA's per-device ones
+    # (torch.cuda.manual_seed_all covers every visible GPU, harmless no-op if
+    # none); numpy has its own independent RNG state (soundfile/librosa/scipy
+    # in the sgmse/data path can draw from it); random.seed covers Python
+    # stdlib (random_message doesn't use it, but attacks.py's AudioLDMAttack
+    # None-strength sampling and SampledReconstructionAttack's attack-name
+    # choice do).
     torch.manual_seed(cfg.seed)
+    torch.cuda.manual_seed_all(cfg.seed)
+    np.random.seed(cfg.seed)
     random.seed(cfg.seed)
 
     device = resolve_device(cfg.device)
