@@ -28,8 +28,8 @@ watermarking solver (`audiocraft/utils/audio_effects.py`,
 copy of the input and reattach the *difference* with a straight-through
 estimator. That is a workaround for compression codecs that have no
 meaningful gradient (external, non-differentiable subprocess calls). Since
-BigVGAN/DAC/SGMSE/DiffErase are ordinary neural nets, we don't need that
-workaround -- we can and do backprop through them for real (DiffErase needs a
+BigVGAN/DAC/SGMSE/AudioLDM are ordinary neural nets, we don't need that
+workaround -- we can and do backprop through them for real (AudioLDM needs a
 little more care to get there -- see that class's own docstring for why).
 """
 
@@ -147,7 +147,7 @@ class SGMSEAttack(nn.Module):
     """A diffusion-based reconstruction (SGMSE, score-based generative model
     for speech enhancement) run on `x_wm`. In this project's current config,
     this is the held-out attack instead (see `held_out_attacks` in
-    evaluate.py / EvalConfig in config.py) -- DiffEraseAttack (AudioLDM) is
+    evaluate.py / EvalConfig in config.py) -- AudioLDMAttack is
     the one trained against, and SGMSE measures whether robustness
     generalizes to it. Its forward pass stays differentiable regardless (see
     below) in case it's re-enabled for training later -- being differentiable
@@ -161,17 +161,17 @@ class SGMSEAttack(nn.Module):
     inference-time step count. Its forward pass is NOT wrapped in no_grad --
     gradients can reach back through it into the generator (frozen params
     via requires_grad_(False), but the graph stays connected, same "frozen
-    but differentiable" pattern as BigVGAN/DAC/DiffErase).
+    but differentiable" pattern as BigVGAN/DAC/AudioLDM).
 
     Wired to sp-uhh/sgmse (MIT licensed; vendored under src/sgmse/, see that
     directory's VENDORED.md), an OU-VE SDE score model for speech
     enhancement. Its mechanism is structurally different from
-    DiffEraseAttack's DDPM: there's no discrete `q_sample`/`p_sample` step
+    AudioLDMAttack's DDPM: there's no discrete `q_sample`/`p_sample` step
     index -- the SDE runs in continuous time t in [t_eps, T=1], and the
     predictor/corrector sampler always starts from the SDE's own prior at
     t=T (centered on the input `y`, i.e. `x_wm` treated as "the noisy signal
     to enhance"). To get a `strength`-parametrized *partial* corruption
-    (matching DiffEraseAttack's t* convention) rather than always running
+    (matching AudioLDMAttack's t* convention) rather than always running
     the model's default full enhancement, `forward` manually replicates
     `sgmse.sampling.get_pc_sampler`'s predictor-corrector loop (see that
     function for the reference this mirrors) but starts from
@@ -180,7 +180,7 @@ class SGMSEAttack(nn.Module):
     t_star)` -- since x0=y=Y here (we only have one signal, not a genuine
     clean/noisy pair), the mean term collapses to exactly Y and this reduces
     to "add `std(t_star)`-scaled Gaussian noise to Y, then reverse-diffuse
-    from there," the direct SDE analogue of DiffEraseAttack's
+    from there," the direct SDE analogue of AudioLDMAttack's
     `q_sample`-then-`p_sample` loop.
 
     `strength` (the t* robustness-curve axis, see evaluate.py): t*=0 means
@@ -190,7 +190,7 @@ class SGMSEAttack(nn.Module):
     spread of the curve rather than a single point; passing a float pins the
     whole batch to it, which is what evaluate.py's per-t* measurements need.
     NOTE: `t_star_grid`'s default values in config.py were calibrated against
-    DiffErase's DDPM (T=1000 discrete steps) using the mentor's timestep
+    AudioLDM's DDPM (T=1000 discrete steps) using the mentor's timestep
     table -- SGMSE's noise schedule (OU-VE SDE, continuous t in [t_eps, 1])
     is a different process, so the same strength fractions likely correspond
     to a different *qualitative* corruption level here. Not yet recalibrated
@@ -237,7 +237,7 @@ class SGMSEAttack(nn.Module):
         # .eval() is not just standard hygiene here -- ScoreModel overrides
         # train()/eval() to swap in EMA-smoothed weights on eval() (see
         # sgmse/model.py:ScoreModel.train), the SGMSE-native equivalent of
-        # DiffErase's ema_scope. Skipping this would silently run the raw
+        # AudioLDMAttack's ema_scope. Skipping this would silently run the raw
         # (non-EMA) training weights instead.
         model.eval()
         for p in model.parameters():
@@ -329,7 +329,7 @@ class SGMSEAttack(nn.Module):
         # Forward-corrupt Y to t_star via the SDE's own marginal_prob. With
         # x0=y=Y (see class docstring), the mean term is exactly Y, so this
         # is "Y plus std(t_star)-scaled Gaussian noise" -- the SDE analogue
-        # of DiffEraseAttack's q_sample.
+        # of AudioLDMAttack's q_sample.
         mean, std = sde.marginal_prob(Y, Y, t_star)
         xt = mean + std[:, None, None, None] * torch.randn_like(Y)
         xt_mean = xt
@@ -359,9 +359,9 @@ class SGMSEAttack(nn.Module):
         return x_hat.unsqueeze(1).to(x.dtype)
 
 
-class DiffEraseAttack(nn.Module):
+class AudioLDMAttack(nn.Module):
     """The trained attack in this project variant: given nonzero weight in
-    `AttackConfig.weights.diff_erase` during training (see train.py), so the
+    `AttackConfig.weights.audioldm` during training (see train.py), so the
     generator is fine-tuned directly against it. SGMSEAttack plays the
     held-out role instead here (see `held_out_attacks` in evaluate.py /
     EvalConfig in config.py) -- the generalization question this setup
@@ -371,32 +371,35 @@ class DiffEraseAttack(nn.Module):
     reverse. Do not also give `sgmse` nonzero training weight unless you
     deliberately want to give up that held-out probe.
 
-    Wired to DiffErase-latent (github.com/DiffErase/Differase's "Audio
-    Pirates" project, the AudioLDM-style latent-diffusion variant):
-    forward-diffuses a mel-spectrogram of `x` up to timestep
+    HISTORY: this was called DiffEraseAttack until it was renamed, and was
+    written against DiffErase-latent (github.com/DiffErase/Differase's
+    "Audio Pirates"), whose *method* -- partial-noise then
+    diffusion-regenerate -- is what this implements. It was never their
+    model, though: that repo ships no pretrained checkpoint (its README is
+    about training one), so there are no open weights to run and the code
+    always pointed at a stock pretrained AudioLDM checkpoint instead. The
+    name was making a promise the weights couldn't keep, hence `audioldm`.
+
+    Forward-diffuses a mel-spectrogram of `x` up to timestep
     `strength * num_timesteps` (same t* convention as SGMSEAttack -- 0 = no
     corruption, 1 = full noise-then-regenerate), reverse-diffuses it back
     with the pretrained LatentDiffusion model, and vocodes the result back
-    to a waveform with the accompanying HiFiGAN. This mirrors the reference
-    `Differase/remove_differase-latent.py` script's `process_audio_batch`
-    algorithm, just working on in-memory batched tensors (so it slots into
-    train.py's/evaluate.py's per-batch loops) instead of reading/writing wav
-    files -- see the "differentiability" paragraph below for the one place
-    this implementation deliberately does NOT call through to the reference
+    to a waveform with the accompanying HiFiGAN. Works on in-memory batched
+    tensors so it slots into train.py's/evaluate.py's per-batch loops --
+    see the "differentiability" paragraph below for the one place this
+    implementation deliberately does NOT call through to the vendored
     library's own convenience methods.
 
     Model code (`audioldm_train`, MIT licensed) is vendored under
     `src/audioldm_train/` -- see that directory's VENDORED.md for provenance
-    and the one intentional local change (unrelated to gradients -- see
-    below). Only the actual *weights* (multi-GB, never belongs in git) stay
-    external: point `checkpoint` and `config` at files on disk (e.g. a
-    checkout of the Differase repo's
-    `DiffErase-latent/data/checkpoints/*.ckpt` and
-    `DiffErase-latent/audioldm_train/config/**/*.yaml`) you've trained or
-    otherwise obtained -- DiffErase-latent's own README is literally about
-    *training* one, it ships none. This attack stays disabled (constructing
-    it without a checkpoint keeps raising NotImplementedError) until you do
-    -- see AttackConfig.diff_erase / EvalAttackConfig.diff_erase in config.py.
+    and its local changes. Only the actual *weights* (multi-GB, never belong
+    in git) stay external: point `checkpoint` and `config` at a pretrained
+    AudioLDM release on disk (e.g. `audioldm-s-full` from the AudioLDM
+    authors' Zenodo record, plus the matching
+    `audioldm_train/config/**/audioldm_original.yaml` vendored here). This
+    attack stays disabled (constructing it without a checkpoint keeps
+    raising NotImplementedError) until you do -- see AttackConfig.audioldm /
+    EvalAttackConfig.audioldm in config.py.
 
     Differentiable, same "frozen but differentiable" pattern as
     BigVGAN/DAC/SGMSE (see module docstring): its own parameters are frozen
@@ -466,23 +469,23 @@ class DiffEraseAttack(nn.Module):
     def _load_backbone(self, checkpoint: str) -> None:
         if self.config_path is None:
             raise NotImplementedError(
-                "DiffEraseAttack needs `config` set alongside `checkpoint` "
-                "-- see EvalAttackConfig.diff_erase in src/audioseal_robust/config.py."
+                "AudioLDMAttack needs `config` set alongside `checkpoint` "
+                "-- see EvalAttackConfig.audioldm in src/audioseal_robust/config.py."
             )
 
         ckpt_path = Path(checkpoint).resolve()
         if not ckpt_path.is_file():
-            raise FileNotFoundError(f"DiffErase-latent checkpoint not found: {ckpt_path}")
+            raise FileNotFoundError(f"AudioLDM checkpoint not found: {ckpt_path}")
         # get_vocoder() hardcodes a "data/checkpoints" *relative* path (same
         # convention first_stage_config.reload_from_ckpt uses in the yaml) --
         # `checkpoint` must live at <weights_root>/data/checkpoints/<file>
         # so we can cd into <weights_root> for that lookup to resolve.
         if ckpt_path.parent.name != "checkpoints" or ckpt_path.parent.parent.name != "data":
             raise ValueError(
-                f"DiffErase-latent checkpoint {ckpt_path} must live at "
+                f"AudioLDM checkpoint {ckpt_path} must live at "
                 "<weights_root>/data/checkpoints/<file> -- that's where "
                 "get_vocoder() and the VAE's reload_from_ckpt look for the "
-                "vocoder/VAE weights next to it (see DiffErase-latent's own "
+                "vocoder/VAE weights next to it (see AudioLDM's own "
                 "data/checkpoints/ layout)."
             )
         weights_root = ckpt_path.parent.parent.parent
@@ -494,7 +497,7 @@ class DiffEraseAttack(nn.Module):
 
         config_path = Path(self.config_path)
         if not config_path.is_file():
-            raise FileNotFoundError(f"DiffErase-latent config not found: {config_path}")
+            raise FileNotFoundError(f"AudioLDM config not found: {config_path}")
         with open(config_path) as f:
             model_config = yaml.load(f, Loader=yaml.FullLoader)
 
@@ -532,7 +535,7 @@ class DiffEraseAttack(nn.Module):
         original_cwd = os.getcwd()
         original_torch_load = torch.load
         os.chdir(weights_root)
-        # DiffErase-latent's own model construction calls torch.load() in a
+        # AudioLDM's own model construction calls torch.load() in a
         # few places (e.g. get_vocoder, and AutoencoderKL's own internal
         # preview-vocoder in __init__) without map_location -- fine on the
         # GPU boxes those checkpoints were saved on, but on CPU-only/MPS
@@ -567,11 +570,11 @@ class DiffEraseAttack(nn.Module):
         [0, 1])."""
         if self._model is None:
             raise NotImplementedError(
-                "DiffEraseAttack was constructed without a checkpoint (see "
+                "AudioLDMAttack was constructed without a checkpoint (see "
                 "class docstring in src/audioseal_robust/attacks.py). Either "
-                "set attack.diff_erase.{checkpoint,config} (training) / "
-                "eval.diff_erase.{checkpoint,config} (eval), or set "
-                "attack.weights.diff_erase=0 / remove diff_erase from "
+                "set attack.audioldm.{checkpoint,config} (training) / "
+                "eval.audioldm.{checkpoint,config} (eval), or set "
+                "attack.weights.audioldm=0 / remove audioldm from "
                 "eval_attacks to skip it."
             )
         if strength is None:
@@ -681,7 +684,7 @@ class MBDAttack(nn.Module):
     MultiBand Diffusion (github.com/facebookresearch/audiocraft,
     `docs/MBD.md`), an EnCodec-conditioned diffusion decoder. Per the
     mentor's plan (2026-08-12 Notion doc), this is the intended replacement/
-    complement for DiffEraseAttack's AudioLDM as "a diffusion model not
+    complement for AudioLDMAttack's latent diffusion as "a diffusion model not
     trained specifically on watermark removal, but that can incidentally
     remove them due to the neural encoding embedded into the system":
 
@@ -697,7 +700,7 @@ class MBDAttack(nn.Module):
     resampling internally (see forward below), matching the pipeline in the
     mentor's plan (upsample -> EnCodec -> MBD -> downsample -> detector).
 
-    `strength`: unlike DiffEraseAttack/SGMSEAttack, MBD has no continuous
+    `strength`: unlike AudioLDMAttack/SGMSEAttack, MBD has no continuous
     corruption-level knob -- the closest analogue is bitrate (fewer bits
     through the EnCodec bottleneck = more information thrown away = a
     stronger attack). `bandwidth` (1.5/3.0/6.0 kbps, MBD's only supported
@@ -734,7 +737,7 @@ class MBDAttack(nn.Module):
         # DictConfig (their model config), which PyTorch >=2.6's default
         # weights_only=True unpickler refuses as an untrusted global. Patch
         # the default rather than editing their source (same approach as
-        # DiffEraseAttack's torch.load patch).
+        # AudioLDMAttack's torch.load patch).
         torch.load = functools.partial(original_torch_load, weights_only=False)
         try:
             mbd = MultiBandDiffusion.get_mbd_24khz(bw=self.bandwidth)

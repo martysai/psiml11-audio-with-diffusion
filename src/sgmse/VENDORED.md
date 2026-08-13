@@ -24,7 +24,7 @@ enhancement model, run on watermarked audio to see if the watermark washes
 out as "noise" the way real acoustic degradation would. See that class's
 docstring for how its OU-VE SDE (continuous time, predictor/corrector
 sampler) maps onto this project's `strength`/t* convention -- it's a
-different mechanism from DiffEraseAttack's DDPM (src/audioldm_train/), not
+different mechanism from AudioLDMAttack's DDPM (src/audioldm_train/), not
 just a different checkpoint.
 
 Checkpoint used in this project: `train_vb_29nqe0uh_epoch=115.ckpt`

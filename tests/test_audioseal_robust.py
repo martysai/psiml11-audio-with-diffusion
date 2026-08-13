@@ -36,7 +36,7 @@ from audioseal.builder import (
     create_generator,
 )
 from audioseal_robust.attacks import (
-    DiffEraseAttack,
+    AudioLDMAttack,
     IdentityAttack,
     MBDAttack,
     SampledReconstructionAttack,
@@ -399,20 +399,20 @@ def test_mbd_attack_without_checkpoint_stays_a_stub():
         attack(torch.randn(1, 1, 1600))
 
 
-def test_diff_erase_attack_without_checkpoint_stays_a_stub():
-    attack = DiffEraseAttack()
+def test_audioldm_attack_without_checkpoint_stays_a_stub():
+    attack = AudioLDMAttack()
     with pytest.raises(NotImplementedError, match="constructed without a checkpoint"):
         attack(torch.randn(1, 1, 1600))
 
 
-def test_diff_erase_attack_checkpoint_without_config_raises_clear_error(tmp_path):
+def test_audioldm_attack_checkpoint_without_config_raises_clear_error(tmp_path):
     fake_ckpt = tmp_path / "fake.ckpt"
     fake_ckpt.write_bytes(b"not a real checkpoint")
     with pytest.raises(NotImplementedError, match="needs `config` set"):
-        DiffEraseAttack(checkpoint=str(fake_ckpt))
+        AudioLDMAttack(checkpoint=str(fake_ckpt))
 
 
-def test_diff_erase_attack_checkpoint_wrong_layout_fails_before_any_import(tmp_path):
+def test_audioldm_attack_checkpoint_wrong_layout_fails_before_any_import(tmp_path):
     """checkpoint must live at <weights_root>/data/checkpoints/<file> -- that's
     the relative layout get_vocoder()/reload_from_ckpt hardcode. A checkpoint
     anywhere else should get a clear error, not a confusing failure deep
@@ -422,12 +422,12 @@ def test_diff_erase_attack_checkpoint_wrong_layout_fails_before_any_import(tmp_p
     fake_config = tmp_path / "fake.yaml"
     fake_config.write_text("preprocessing: {}\n")
     with pytest.raises(ValueError, match="data/checkpoints"):
-        DiffEraseAttack(checkpoint=str(fake_ckpt), config=str(fake_config))
+        AudioLDMAttack(checkpoint=str(fake_ckpt), config=str(fake_config))
 
 
 def _tacotron_stft():
-    """Skips unless the diff_erase extras are installed -- audioldm_train pulls
-    in pandas et al. (see requirements-diff-erase.txt), which the base
+    """Skips unless the audioldm extras are installed -- audioldm_train pulls
+    in pandas et al. (see requirements-audioldm.txt), which the base
     training/eval stack deliberately does not."""
     stft = pytest.importorskip("audioldm_train.utilities.audio.stft")
     return stft.TacotronSTFT(
@@ -442,8 +442,8 @@ def _tacotron_stft():
 
 
 def test_audioldm_mel_reaches_the_waveform():
-    """DiffEraseAttack is eval-only here, but making it trainable (the point of
-    the diff_erase training direction) requires this front-end to be
+    """AudioLDMAttack is eval-only here, but making it trainable (the point of
+    the audioldm training direction) requires this front-end to be
     differentiable at all. `mel_spectrogram` used to call `.data`, which
     detached -- so the mel came back with grad_fn None and the detection loss
     silently stopped reaching the generator."""
@@ -481,39 +481,39 @@ def test_build_eval_attacks_threads_per_attack_config_through():
     assert attacks["sgmse"].num_steps == 7
 
 
-def test_train_recipe_diff_erase_sets_weights():
-    """recipe=diff_erase (config/recipes.yaml) should train against
-    DiffErase and zero out the identity-only default.yaml fallback."""
-    cfg = load_config(["recipe=diff_erase", "data.train_dir=."])
+def test_train_recipe_audioldm_sets_weights():
+    """recipe=audioldm (config/recipes.yaml) should train against
+    AudioLDM and zero out the identity-only default.yaml fallback."""
+    cfg = load_config(["recipe=audioldm", "data.train_dir=."])
     assert cfg.attack.weights.identity == 0.0
-    assert cfg.attack.weights.diff_erase == 1.0
+    assert cfg.attack.weights.audioldm == 1.0
     assert cfg.attack.weights.sgmse == 0.0
 
 
 def test_train_recipe_sgmse_sets_weights():
     """The opposite direction: recipe=sgmse trains against SGMSE instead,
-    leaving diff_erase at its default (disabled) weight."""
+    leaving audioldm at its default (disabled) weight."""
     cfg = load_config(["recipe=sgmse", "data.train_dir=."])
     assert cfg.attack.weights.identity == 0.0
     assert cfg.attack.weights.sgmse == 1.0
-    assert cfg.attack.weights.diff_erase == 0.0
+    assert cfg.attack.weights.audioldm == 0.0
 
 
 def test_train_recipe_cli_override_wins_over_recipe():
     """Regression test for merge order: CLI overrides must be applied AFTER
     the recipe, so an explicit CLI value for a field the recipe also sets
     still wins (letting you tweak one field without forking the recipe)."""
-    cfg = load_config(["recipe=diff_erase", "data.train_dir=.", "attack.weights.diff_erase=0.5"])
-    assert cfg.attack.weights.diff_erase == 0.5
+    cfg = load_config(["recipe=audioldm", "data.train_dir=.", "attack.weights.audioldm=0.5"])
+    assert cfg.attack.weights.audioldm == 0.5
 
 
 def test_eval_recipe_after_sgmse_training_swaps_held_out():
-    """The eval-side recipe should report sgmse (not diff_erase) as the
-    trained attack and hold diff_erase out instead -- the reverse of
+    """The eval-side recipe should report sgmse (not audioldm) as the
+    trained attack and hold audioldm out instead -- the reverse of
     default_eval.yaml's plain fallback."""
     cfg = load_eval_config(["recipe=after_sgmse_training", "eval_dir=."])
     assert list(cfg.eval_attacks) == ["identity", "bigvgan", "dac", "sgmse"]
-    assert list(cfg.held_out_attacks) == ["diff_erase", "mbd"]
+    assert list(cfg.held_out_attacks) == ["audioldm", "mbd"]
 
 
 def test_unknown_recipe_raises_with_available_names():
@@ -526,8 +526,8 @@ def test_build_eval_attacks_construction_failure_is_skipped_not_fatal():
     fix above), a misconfigured attack can now fail inside __init__/
     _load_backbone instead of only at forward() time -- that must land in
     the `skipped` dict, not raise and take down the whole eval run."""
-    cfg = load_eval_config(["eval_dir=.", "attack.diff_erase.checkpoint=/nonexistent/fake.ckpt"])
-    attacks, skipped = build_eval_attacks(["identity", "diff_erase"], torch.device("cpu"), cfg)
-    assert "diff_erase" not in attacks
-    assert "config" in skipped["diff_erase"]
+    cfg = load_eval_config(["eval_dir=.", "attack.audioldm.checkpoint=/nonexistent/fake.ckpt"])
+    attacks, skipped = build_eval_attacks(["identity", "audioldm"], torch.device("cpu"), cfg)
+    assert "audioldm" not in attacks
+    assert "config" in skipped["audioldm"]
     assert attacks["identity"] is not None

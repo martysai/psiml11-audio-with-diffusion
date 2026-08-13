@@ -19,10 +19,11 @@ Then again after fine-tuning, same eval set, pointing at the checkpoint:
         generator_checkpoint=./checkpoints/audioseal_robust/generator_epoch10.pth
 
 Attacks that are still stubs (see attacks.py -- bigvgan, dac, sgmse raise
-NotImplementedError until a checkpoint is configured; diff_erase is wired to
-DiffErase-latent, see attacks.py's DiffEraseAttack and
-EvalAttackConfig.diff_erase in config.py, but still raises the same way if
-its checkpoint/config/differase_root aren't set) are individually caught and
+NotImplementedError until a checkpoint is configured; audioldm is wired to
+a pretrained AudioLDM latent-diffusion release, see attacks.py's
+AudioLDMAttack and
+EvalAttackConfig.audioldm in config.py, but still raises the same way if
+its checkpoint/config aren't set) are individually caught and
 reported as "skipped", not fatal -- so this is runnable today, giving you
 the identity-attack + perceptual baseline immediately, and picks up each
 attack's real numbers as its checkpoint gets configured without any change
@@ -44,7 +45,7 @@ from audioseal import AudioSeal
 from audioseal.loader import load_state_dict as audioseal_load_state_dict
 from audioseal.models import AudioSealDetector, AudioSealWM
 
-from .attacks import BigVGANAttack, DACAttack, DiffEraseAttack, IdentityAttack, MBDAttack, SGMSEAttack
+from .attacks import AudioLDMAttack, BigVGANAttack, DACAttack, IdentityAttack, MBDAttack, SGMSEAttack
 from .config import EvalConfig, load_eval_config
 from .data import build_dataloader
 from .device import resolve_device
@@ -61,7 +62,7 @@ _ATTACK_CLASSES: tp.Dict[str, tp.Type[nn.Module]] = {
     "bigvgan": BigVGANAttack,
     "dac": DACAttack,
     "sgmse": SGMSEAttack,
-    "diff_erase": DiffEraseAttack,
+    "audioldm": AudioLDMAttack,
     "mbd": MBDAttack,
 }
 
@@ -71,7 +72,7 @@ _ATTACK_CLASSES: tp.Dict[str, tp.Type[nn.Module]] = {
 # forward() takes `strength` and ignores it (see attacks.py -- identity is a
 # no-op, and bigvgan/dac/mbd have no natural single corruption-level knob), so
 # they're left at strength=None.
-_STRENGTH_AWARE_ATTACKS = ("sgmse", "diff_erase")
+_STRENGTH_AWARE_ATTACKS = ("sgmse", "audioldm")
 
 
 def _reset_peak_memory(device: torch.device) -> None:
@@ -133,7 +134,7 @@ def build_eval_attacks(
 
     Unlike `evaluate_attack`'s forward-time failures, a still-stubbed or
     misconfigured attack (missing checkpoint, missing companion
-    config/differase_root, or a backbone package that isn't installed in
+    config, or a backbone package that isn't installed in
     this env) can now fail at *construction* time too, since a real
     checkpoint path is actually threaded through. That's caught here rather
     than left to crash the whole run: returns `(attacks, skipped)`, the

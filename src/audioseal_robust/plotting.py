@@ -11,7 +11,7 @@ just printed/logged as numbers:
     (TP/FN/FP/TN, see metrics.confusion_counts) per attack, with its F1 in
     the title.
   - `plot_robustness_curve`: detection (TPR@FPR) vs. attack strength t*, one
-    line per strength-aware attack (sgmse, diff_erase).
+    line per strength-aware attack (sgmse, audioldm).
 
 Both import matplotlib lazily so evaluate.py stays importable without it if
 you only need the numeric results. Return None (and log nothing) if there's
@@ -67,7 +67,7 @@ def plot_robustness_curve(results: tp.Dict[str, tp.Any], out_path: Path) -> tp.O
         name: r["robustness_curve"] for name, r in results.get("attacks", {}).items() if r.get("robustness_curve")
     }
     if not curves:
-        logger.info("no attack produced a robustness curve yet (sgmse/diff_erase still stubs?), nothing to plot")
+        logger.info("no attack produced a robustness curve yet (sgmse/audioldm still stubs?), nothing to plot")
         return None
 
     import matplotlib.pyplot as plt

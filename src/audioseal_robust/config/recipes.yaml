@@ -10,25 +10,25 @@
 # for why holding one out matters). Which attack plays which role is a
 # per-experiment choice, not something to hardcode into default.yaml /
 # default_eval.yaml -- these recipes are that choice, named, so switching
-# direction is `recipe=sgmse` vs. `recipe=diff_erase` instead of re-typing
+# direction is `recipe=sgmse` vs. `recipe=audioldm` instead of re-typing
 # every attack.weights.*/eval_attacks/held_out_attacks field by hand.
 # Checkpoint/config *paths* stay out of here on purpose (machine-specific,
 # multi-GB, never belong in git) -- pass those separately on the CLI, e.g.:
-#   python -m audioseal_robust.train recipe=diff_erase data.train_dir=... \
-#       attack.diff_erase.checkpoint=... attack.diff_erase.config=...
+#   python -m audioseal_robust.train recipe=audioldm data.train_dir=... \
+#       attack.audioldm.checkpoint=... attack.audioldm.config=...
 
 train:
-  # Train against DiffErase (AudioLDM latent-diffusion resynthesis); SGMSE
+  # Train against AudioLDM (latent-diffusion resynthesis); SGMSE
   # stays at its config/default.yaml weight (0.0), so evaluate.py's
-  # after_diff_erase_training recipe below can hold it out as the probe.
-  diff_erase:
+  # after_audioldm_training recipe below can hold it out as the probe.
+  audioldm:
     attack:
       weights:
         identity: 0.0
-        diff_erase: 1.0
+        audioldm: 1.0
   # Train against SGMSE (OU-VE SDE speech enhancement) instead -- the
-  # opposite direction, DiffErase held out. This is the original design's
-  # direction (see attacks.py's SGMSEAttack/DiffEraseAttack docstrings).
+  # opposite direction, AudioLDM held out. This is the original design's
+  # direction (see attacks.py's SGMSEAttack/AudioLDMAttack docstrings).
   sgmse:
     attack:
       weights:
@@ -36,14 +36,14 @@ train:
         sgmse: 1.0
 
 eval:
-  # Pair with `recipe=diff_erase` at train time: reports DiffErase alongside
+  # Pair with `recipe=audioldm` at train time: reports AudioLDM alongside
   # the always-available identity/bigvgan/dac attacks, holds SGMSE (and MBD)
   # out as the generalization probe.
-  after_diff_erase_training:
-    eval_attacks: [identity, bigvgan, dac, diff_erase]
+  after_audioldm_training:
+    eval_attacks: [identity, bigvgan, dac, audioldm]
     held_out_attacks: [sgmse, mbd]
   # Pair with `recipe=sgmse` at train time: the reverse -- SGMSE reported,
-  # DiffErase (and MBD) held out.
+  # AudioLDM (and MBD) held out.
   after_sgmse_training:
     eval_attacks: [identity, bigvgan, dac, sgmse]
-    held_out_attacks: [diff_erase, mbd]
+    held_out_attacks: [audioldm, mbd]
