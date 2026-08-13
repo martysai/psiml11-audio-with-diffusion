@@ -225,6 +225,7 @@ def evaluate_attack(
     positive_scores = []
     negative_scores = []
     bit_accs = []
+    attack_sisnr_values = []
 
     progress = tqdm(eval_batches[:n_batches], desc=progress_desc, unit="batch", leave=False)
     for x_cpu, x_wm_cpu, message_cpu in progress:
@@ -241,6 +242,10 @@ def evaluate_attack(
         positive_scores.append(presence_pos[:, 1, :].mean(dim=-1).cpu())
         negative_scores.append(presence_neg[:, 1, :].mean(dim=-1).cpu())
         bit_accs.append(bit_accuracy(m_hat, message))
+        # SNR the attack itself imposes (watermarked-before vs. watermarked-after),
+        # so t_star_grid's values can be checked against real degradation instead
+        # of the hand-picked curriculum table they were calibrated from.
+        attack_sisnr_values.append(sisnr_score(x_wm, x_att_pos))
 
     progress.close()
 
@@ -252,6 +257,7 @@ def evaluate_attack(
         "tpr_at_fpr": tpr_at_fpr(positive_cat, negative_cat, cfg.fpr_target),
         "confusion": confusion,
         "f1": f1_score(confusion),
+        "attack_sisnr": sum(attack_sisnr_values) / len(attack_sisnr_values),
     }
 
 
@@ -550,19 +556,20 @@ def _print_results_table(results: tp.Dict[str, tp.Any]) -> None:
         print(f"  SI-SNR: {perceptual['sisnr']:.2f} dB    PESQ: {perceptual['pesq']:.2f}")
 
     print("\nAttacks:")
-    col = "  {:<12}{:<10}{:>9}{:>10}{:>8}{:>9}"
-    print(col.format("name", "tag", "bit_acc", "tpr@fpr", "f1", "time"))
-    print("  " + "-" * 58)
+    col = "  {:<12}{:<10}{:>9}{:>10}{:>8}{:>9}{:>9}"
+    print(col.format("name", "tag", "bit_acc", "tpr@fpr", "f1", "snr", "time"))
+    print("  " + "-" * 67)
     for name, r in results["attacks"].items():
         tag = r.get("tag", "")
         if "skipped" in r:
-            print(col.format(name, tag, "skipped", "", "", ""))
+            print(col.format(name, tag, "skipped", "", "", "", ""))
             print(f"    -> {r['skipped']}")
             continue
         time_str = _fmt_duration(r["seconds"]) if "seconds" in r else "-"
+        snr_str = f"{r['attack_sisnr']:.1f}" if "attack_sisnr" in r else "-"
         print(
             col.format(
-                name, tag, f"{r['bit_accuracy']:.3f}", f"{r['tpr_at_fpr']:.3f}", f"{r['f1']:.3f}", time_str
+                name, tag, f"{r['bit_accuracy']:.3f}", f"{r['tpr_at_fpr']:.3f}", f"{r['f1']:.3f}", snr_str, time_str
             )
         )
         c = r.get("confusion")
@@ -579,10 +586,15 @@ def _print_results_table(results: tp.Dict[str, tp.Any]) -> None:
         curve = r.get("robustness_curve")
         if curve:
             print(f"    robustness curve ({_fmt_duration(r.get('curve_seconds', 0))}, {len(curve)} points):")
-            curve_col = "      {:>8}{:>10}{:>10}"
-            print(curve_col.format("t*", "bit_acc", "tpr@fpr"))
+            curve_col = "      {:>8}{:>10}{:>10}{:>9}"
+            print(curve_col.format("t*", "bit_acc", "tpr@fpr", "snr"))
             for p in curve:
-                print(curve_col.format(f"{p['t_star']:.4f}", f"{p['bit_accuracy']:.3f}", f"{p['tpr_at_fpr']:.3f}"))
+                print(
+                    curve_col.format(
+                        f"{p['t_star']:.4f}", f"{p['bit_accuracy']:.3f}", f"{p['tpr_at_fpr']:.3f}",
+                        f"{p['attack_sisnr']:.1f}"
+                    )
+                )
 
 
 def main() -> None:
