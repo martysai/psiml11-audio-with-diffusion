@@ -1,4 +1,4 @@
-﻿# python azureml/aml_submit.py --config azureml/configs/audioldm.yaml
+# python azureml/aml_submit.py --config azureml/configs/audioldm.yaml
 #
 # The opposite direction from sgmse.yaml: trains against AudioLDM (AudioLDM),
 # holds SGMSE + MBD out. Static equivalent: azureml/jobs/train_audioldm.yaml.

@@ -1,4 +1,4 @@
-﻿"""Fail an AzureML job in seconds instead of hours.
+"""Fail an AzureML job in seconds instead of hours.
 
 Every check here is for a failure mode this project has that is either silent
 or only surfaces late:
