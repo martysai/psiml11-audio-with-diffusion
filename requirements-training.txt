@@ -39,6 +39,14 @@ librosa               # sgmse/util/other.py, data_module.py
 scipy                 # sgmse/sampling, sdes.py
 pytorch_lightning     # sgmse/model.py: ScoreModel is a LightningModule
 
+# NCSNpp backbone (sgmse/backbones/ncsnpp.py) JIT-compiles a CUDA extension
+# (upfirdn2d) via torch.utils.cpp_extension.load the moment
+# torch.cuda.is_available() is true -- unconditionally, not just the first
+# time it's needed -- and that raises "Ninja is required to load C++
+# extensions" without this installed. Only the CPU fallback path
+# (upfirdn2d_native) skips it, which is not the path device=cuda takes.
+ninja
+
 # AudioLDMAttack (the audioldm attack) needs src/audioldm_train/
 # (vendored, see that directory's VENDORED.md) -- its dependencies are listed
 # separately in requirements-diff-erase.txt, since they're a much heavier,
