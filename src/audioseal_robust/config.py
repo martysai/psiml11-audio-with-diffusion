@@ -179,10 +179,11 @@ class DataConfig:
 
 @dataclass
 class TrackingConfig:
-    # "mlflow" (default: local ./mlruns, no account/network needed),
-    # "wandb" (needs `pip install wandb` + login or wandb_mode=offline),
-    # or "none" (console logging only). See tracking.py.
-    backend: str = "mlflow"
+    # "wandb" (default: needs `pip install wandb` + login or wandb_mode=offline),
+    # "mlflow" (local ./mlruns, no account/network needed -- used for Azure
+    # job submissions, which have no wandb access), or "none" (console
+    # logging only). See tracking.py.
+    backend: str = "wandb"
     project: str = "audioseal-robust"
     run_name: tp.Optional[str] = None
     mlflow_tracking_uri: tp.Optional[str] = None  # None -> local ./mlruns

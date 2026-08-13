@@ -74,7 +74,7 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="load real facebook/audioseal checkpoints from Hugging Face instead of random init (needs network)",
     )
-    p.add_argument("--tracking-backend", type=str, default="mlflow", choices=["mlflow", "wandb", "none"])
+    p.add_argument("--tracking-backend", type=str, default="wandb", choices=["mlflow", "wandb", "none"])
     p.add_argument("--tracking-project", type=str, default="audioseal-robust-sanity")
     p.add_argument(
         "--pass-threshold",
