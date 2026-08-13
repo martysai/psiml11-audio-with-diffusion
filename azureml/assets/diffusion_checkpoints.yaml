@@ -1,0 +1,39 @@
+$schema: https://azuremlschemas.azureedge.net/latest/model.schema.json
+
+# az ml model create -f azureml/assets/diffusion_checkpoints.yaml
+#
+# ~10.9 GB. `path` is a local machine path -- override with --path to upload
+# from elsewhere.
+#
+# THE DIRECTORY LAYOUT IS LOAD-BEARING, do not flatten it:
+#
+#   sgmse/train_vb_29nqe0uh_epoch=115.ckpt
+#   audioldm/data/checkpoints/audioldm-s-full
+#   audioldm/data/checkpoints/vae_mel_16k_64bins.ckpt
+#   audioldm/data/checkpoints/clap_htsat_tiny.pt
+#   audioldm/data/checkpoints/hifigan_16k_64bins.ckpt (+ .json)
+#   ...
+#
+# attacks.py:418-426 hard-rejects a diff_erase checkpoint that isn't at
+# <weights_root>/data/checkpoints/<file>, then chdirs to <weights_root>
+# (attacks.py:472) so the relative paths baked into audioldm_original.yaml
+# ("data/checkpoints/vae_mel_16k_64bins.ckpt" at line 56,
+# "data/checkpoints/clap_htsat_tiny.pt" at line 138) resolve. Hence the
+# audioldm/data/checkpoints/ nesting.
+#
+# Mounted read-only by the jobs: nothing writes here. The one thing that
+# would have (LPIPS fetching a ~500MB vgg.pth into a relative path) is
+# pre-empted by attacks.py:467-468 swapping the VAE's lossconfig for a
+# no-op -- see requirements-diff-erase.txt:40-45.
+type: custom_model
+name: psiml-diffusion-checkpoints
+version: "1"
+description: >-
+  Frozen backbones for the two diffusion attacks: SGMSE (VoiceBank-DEMAND
+  epoch 115) and AudioLDM-s-full plus its VAE/CLAP/HiFiGAN companions in the
+  data/checkpoints/ layout attacks.py:DiffEraseAttack requires.
+path: C:<user-home>/psiml11-project-aml-assets/checkpoints
+tags:
+  sgmse: https://github.com/sp-uhh/sgmse
+  audioldm: https://zenodo.org/records/7884686
+  mounted: read-only

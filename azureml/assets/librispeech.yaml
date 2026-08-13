@@ -1,0 +1,24 @@
+$schema: https://azuremlschemas.azureedge.net/latest/data.schema.json
+
+# az ml data create -f azureml/assets/librispeech.yaml
+#
+# ~6.8 GB across 33,862 .flac files. `path` is a local machine path, so
+# override it on the CLI when uploading from somewhere else:
+#   az ml data create -f azureml/assets/librispeech.yaml --path <dir>
+#
+# The uploaded folder must contain train-clean-100/, dev-clean/ and
+# test-clean/ at its top level; azureml/aml_run.sh also tolerates one extra
+# LibriSpeech/ nesting level, since that's how the tarballs extract.
+type: uri_folder
+name: librispeech-asr
+version: "1"
+description: >-
+  LibriSpeech train-clean-100 (28,539 utts) + dev-clean (2,703) +
+  test-clean (2,620), 16 kHz .flac, unmodified from openslr.org/12.
+  Read directly by data.py:WavDirDataset via rglob, so the nested
+  speaker/chapter layout is fine as-is and needs no resampling.
+path: C:<user-home>/psiml11-project-aml-assets/data/LibriSpeech
+tags:
+  source: https://www.openslr.org/12
+  sample_rate: "16000"
+  splits: train-clean-100,dev-clean,test-clean
