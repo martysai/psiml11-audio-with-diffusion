@@ -98,9 +98,17 @@ def build_generator(cfg: TrainConfig, device: torch.device) -> AudioSealWM:
 def build_detector(cfg: TrainConfig, device: torch.device) -> AudioSealDetector:
     """Frozen. Never placed in the optimizer (see build_optimizer); params
     also have requires_grad=False so no .grad ever accumulates on them even
-    if someone mistakenly passes detector.parameters() somewhere."""
+    if someone mistakenly passes detector.parameters() somewhere.
+
+    train() rather than eval(): train_step backprops through the detector
+    (frozen but differentiable, see its comment) into the generator, and
+    cudnn's LSTM (inside SEANet) only supports backward in training mode --
+    eval() raises "cudnn RNN backward can only be called in training mode".
+    Numerically harmless here since audioseal has no dropout/batchnorm
+    anywhere, so train() vs eval() forward output is identical; freezing is
+    entirely done via requires_grad_(False) above, not via this mode."""
     detector = AudioSeal.load_detector(cfg.detector.checkpoint, nbits=cfg.nbits, device=device)
-    detector.eval()
+    detector.train()
     for p in detector.parameters():
         p.requires_grad_(False)
     return detector
