@@ -17,11 +17,19 @@
 #   4. Point HF/matplotlib/torch caches at writable scratch. The container's
 #      HOME is not reliably writable, and AudioSeal's generator/detector plus
 #      the mbd attack all pull weights from Hugging Face at runtime.
-#   5. Copy eval_outputs/ to the output mount even when the run fails, so a
+#   5. Own experiment tracking end to end (see "Tracking" below).
+#   6. Copy eval_outputs/ to the output mount even when the run fails, so a
 #      partial result is still recoverable.
 #
+# Tracking: the job YAML deliberately sets no tracking.* override. This script
+# derives the whole tracking config from WANDB_* env vars instead, so there is
+# exactly one place that decides it, and applies it to BOTH the train and the
+# eval call -- otherwise eval would silently land in default_eval.yaml's
+# separate `audioseal-robust-eval` project while training went to yours, and
+# the eval numbers are the actual experimental result.
+#
 # Usage (from the repo root, which is where AML drops the snapshot):
-#   bash azureml/aml_run.sh <diff_erase|sgmse> \
+#   bash azureml/aml_run.sh <audioldm|sgmse> \
 #       --librispeech DIR --checkpoints DIR --artifacts DIR \
 #       [-- train.py overrides...]
 set -euo pipefail
@@ -30,7 +38,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
 usage() {
-  echo "usage: bash azureml/aml_run.sh <diff_erase|sgmse> --librispeech DIR --checkpoints DIR --artifacts DIR [-- overrides...]" >&2
+  echo "usage: bash azureml/aml_run.sh <audioldm|sgmse> --librispeech DIR --checkpoints DIR --artifacts DIR [-- overrides...]" >&2
   exit 2
 }
 
@@ -110,12 +118,38 @@ export TRAIN_DIR="$DATA_ROOT/train-clean-100"
 export VALID_DIR="$DATA_ROOT/dev-clean"
 export EVAL_DIR="$DATA_ROOT/test-clean"
 export SGMSE_CHECKPOINT="$SGMSE_CKPT"
-export DIFF_ERASE_CHECKPOINT="$ALDM_CKPT"
-export DIFF_ERASE_CONFIG="$ALDM_CONFIG"
+export AUDIOLDM_CHECKPOINT="$ALDM_CKPT"
+export AUDIOLDM_CONFIG="$ALDM_CONFIG"
 # Checkpoints go straight to the output mount rather than being copied at the
 # end, so an epoch that completed before a crash/timeout is still retrievable.
 export CHECKPOINT_DIR="$ARTIFACTS/checkpoints"
 mkdir -p "$CHECKPOINT_DIR"
+
+# --- Tracking ---------------------------------------------------------------
+# wandb only if a key actually reached the container. Without this guard a
+# missing key makes wandb.init() block on an interactive login prompt against
+# a stdin that is never going to answer, i.e. the job hangs until its timeout
+# rather than failing -- strictly worse than logging to stdout.
+tracking_args=()
+if [ -n "${WANDB_API_KEY:-}" ]; then
+  WANDB_PROJECT="${WANDB_PROJECT:-audioseal-robust}"
+  tracking_args+=(tracking.backend=wandb tracking.project="$WANDB_PROJECT" tracking.wandb_mode=online)
+  # Cross-reference the two systems: AML's run id becomes the wandb run name,
+  # so a wandb chart can be traced back to the AML job that produced it.
+  if [ -n "${AZUREML_RUN_ID:-}" ]; then
+    tracking_args+=(tracking.run_name="$AZUREML_RUN_ID")
+  fi
+  echo "tracking: wandb project=$WANDB_PROJECT entity=${WANDB_ENTITY:-<default>}"
+else
+  tracking_args+=(tracking.backend=none)
+  echo "tracking: WANDB_API_KEY not set -- falling back to console logging"
+fi
+
+# The same tracking config has to reach evaluate.py, which "$@" does not
+# reach; EVAL_EXTRA_ARGS (run_diffusion_swap.sh) is that channel. Anything the
+# caller already put there is preserved and wins, since it lands last.
+EVAL_EXTRA_ARGS="${tracking_args[*]} ${EVAL_EXTRA_ARGS:-}"
+export EVAL_EXTRA_ARGS
 
 # evaluate.py writes plots to ./eval_outputs relative to the CWD, and
 # run_diffusion_swap.sh's own extra args go to train.py only -- so
@@ -138,12 +172,14 @@ echo "TRAIN_DIR            : $TRAIN_DIR"
 echo "VALID_DIR            : $VALID_DIR"
 echo "EVAL_DIR             : $EVAL_DIR"
 echo "SGMSE_CHECKPOINT     : $SGMSE_CHECKPOINT"
-echo "DIFF_ERASE_CHECKPOINT: $DIFF_ERASE_CHECKPOINT"
-echo "DIFF_ERASE_CONFIG    : $DIFF_ERASE_CONFIG"
+echo "AUDIOLDM_CHECKPOINT  : $AUDIOLDM_CHECKPOINT"
+echo "AUDIOLDM_CONFIG      : $AUDIOLDM_CONFIG"
 echo "CHECKPOINT_DIR       : $CHECKPOINT_DIR"
-echo "train.py overrides   : $*"
+echo "EVAL_EXTRA_ARGS      : $EVAL_EXTRA_ARGS"
+echo "train.py overrides   : $* ${tracking_args[*]}"
 echo "=============================================================="
 
 # `bash`, not ./ -- run_diffusion_swap.sh is mode 100644 in git (unlike
 # run_smoke_eval.sh at 100755), so it is not executable in the snapshot.
-bash run_diffusion_swap.sh "$DIRECTION" "$@"
+# tracking_args go last so they beat anything the job YAML passed.
+bash run_diffusion_swap.sh "$DIRECTION" "$@" "${tracking_args[@]}"

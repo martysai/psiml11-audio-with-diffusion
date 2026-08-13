@@ -1,4 +1,4 @@
-$schema: https://azuremlschemas.azureedge.net/latest/model.schema.json
+﻿$schema: https://azuremlschemas.azureedge.net/latest/model.schema.json
 
 # az ml model create -f azureml/assets/diffusion_checkpoints.yaml
 #
@@ -23,7 +23,7 @@ $schema: https://azuremlschemas.azureedge.net/latest/model.schema.json
 #   audioldm/data/checkpoints/hifigan_16k_64bins.ckpt (+ .json)
 #   ...
 #
-# attacks.py:418-426 hard-rejects a diff_erase checkpoint that isn't at
+# attacks.py:418-426 hard-rejects a audioldm checkpoint that isn't at
 # <weights_root>/data/checkpoints/<file>, then chdirs to <weights_root>
 # (attacks.py:472) so the relative paths baked into audioldm_original.yaml
 # ("data/checkpoints/vae_mel_16k_64bins.ckpt" at line 56,
@@ -40,7 +40,7 @@ version: "1"
 description: >-
   Frozen backbones for the two diffusion attacks: SGMSE (VoiceBank-DEMAND
   epoch 115) and AudioLDM-s-full plus its VAE/CLAP/HiFiGAN companions in the
-  data/checkpoints/ layout attacks.py:DiffEraseAttack requires.
+  data/checkpoints/ layout attacks.py:AudioLDMAttack requires.
 path: azureml://datastores/workspaceblobstore/paths/psiml-assets/checkpoints
 tags:
   sgmse: https://github.com/sp-uhh/sgmse

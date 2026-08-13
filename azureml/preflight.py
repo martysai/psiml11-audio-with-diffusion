@@ -1,4 +1,4 @@
-"""Fail an AzureML job in seconds instead of hours.
+﻿"""Fail an AzureML job in seconds instead of hours.
 
 Every check here is for a failure mode this project has that is either silent
 or only surfaces late:
@@ -11,7 +11,7 @@ or only surfaces late:
 * **Mount layout.** ``attacks.py:418-426`` requires the AudioLDM checkpoint at
   ``<weights_root>/data/checkpoints/<file>``, and the model's own YAML then
   resolves its VAE/CLAP/vocoder siblings by *relative* path after a chdir.
-  A wrong mount level fails only when DiffEraseAttack is first constructed,
+  A wrong mount level fails only when AudioLDMAttack is first constructed,
   which for the ``sgmse`` direction is after training has fully finished.
 * **Empty data dirs.** A dataloader over an empty directory raises deep inside
   a worker, well after the model is built.
@@ -88,7 +88,7 @@ def check_audioldm(ckpt: Path) -> None:
             f"audioldm_original.yaml resolves by relative path are missing from "
             f"{ckpt.parent}: {', '.join(missing)}"
         )
-    print(f"diff_erase OK: {ckpt}  (weights_root={ckpt.parent.parent.parent})")
+    print(f"audioldm OK: {ckpt}  (weights_root={ckpt.parent.parent.parent})")
 
 
 def _children(p: Path) -> list[str]:
@@ -100,7 +100,7 @@ def _children(p: Path) -> list[str]:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--direction", required=True, choices=("diff_erase", "sgmse"))
+    ap.add_argument("--direction", required=True, choices=("audioldm", "sgmse"))
     ap.add_argument("--data-root", required=True, type=Path)
     ap.add_argument("--sgmse-checkpoint", required=True, type=Path)
     ap.add_argument("--audioldm-checkpoint", required=True, type=Path)
@@ -128,14 +128,14 @@ def main() -> None:
     else:
         print(f"WARNING: SGMSE checkpoint missing ({args.sgmse_checkpoint}) -- held-out sgmse eval will be skipped")
 
-    if args.direction == "diff_erase":
+    if args.direction == "audioldm":
         check_audioldm(args.audioldm_checkpoint)
     elif args.audioldm_checkpoint.is_file():
         check_audioldm(args.audioldm_checkpoint)
     else:
         print(
             f"WARNING: AudioLDM checkpoint missing ({args.audioldm_checkpoint}) "
-            "-- held-out diff_erase eval will be skipped"
+            "-- held-out audioldm eval will be skipped"
         )
 
     print("preflight passed")

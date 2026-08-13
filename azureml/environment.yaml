@@ -1,4 +1,4 @@
-$schema: https://azuremlschemas.azureedge.net/latest/environment.schema.json
+﻿$schema: https://azuremlschemas.azureedge.net/latest/environment.schema.json
 
 # az ml environment create -f azureml/environment.yaml
 #
@@ -9,7 +9,7 @@ name: audioseal-robust-diffusion
 description: >-
   Training + eval environment for src/audioseal_robust: the base audioseal
   deps, the training/eval deps, and both held-out diffusion attack stacks
-  (diff_erase/AudioLDM and mbd/MultiBand Diffusion). torch 2.4.1+cu121.
+  (audioldm and mbd/MultiBand Diffusion). torch 2.4.1+cu121.
 
 build:
   path: ..

@@ -3,17 +3,17 @@
 # az ml job create -f azureml/jobs/train_sgmse.yaml \
 #     --set compute=azureml:<your-a100-cluster>
 #
-# Trains the AudioSeal generator against SGMSE and holds DiffErase (AudioLDM)
+# Trains the AudioSeal generator against SGMSE and holds AudioLDM
 # + MBD out as the generalization probe -- recipes.yaml's `sgmse` train recipe
-# paired with its `after_sgmse_training` eval recipe. Run train_diff_erase.yaml
+# paired with its `after_sgmse_training` eval recipe. Run train_audioldm.yaml
 # for the opposite direction; the pair is the actual experiment.
 type: command
 
 experiment_name: audioseal-robust-diffusion-swap
-display_name: swap-sgmse
+display_name: train-sgmse-100h
 description: >-
   Generator-only robustness fine-tuning against the SGMSE attack, then eval
-  with DiffErase and MBD held out.
+  with AudioLDM and MBD held out.
 
 # Repo root: this file is two levels down. A few MB, 224 tracked files.
 code: ../..
@@ -80,7 +80,6 @@ command: >-
   data.num_workers=4
   data.segment_duration=2.0
   attack.sgmse.num_steps=15
-  tracking.backend=none
 
 environment_variables:
   PYTHONUNBUFFERED: "1"

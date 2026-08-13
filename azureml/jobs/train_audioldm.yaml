@@ -1,0 +1,119 @@
+$schema: https://azuremlschemas.azureedge.net/latest/commandJob.schema.json
+
+# az ml job create -f azureml/jobs/train_audioldm.yaml
+#
+# Stage 2 of 2 -- run azureml/jobs/smoke_audioldm.yaml first and only submit
+# this once that one is green.
+#
+# Trains the AudioSeal generator against AudioLDM (latent-diffusion
+# resynthesis) and holds SGMSE + MBD out as the generalization probe:
+# recipes.yaml's `audioldm` train recipe paired with its
+# `after_audioldm_training` eval recipe. This is the primary direction --
+# train_sgmse.yaml is the mirror image, and the comparison between the two is
+# the experiment.
+#
+# Trains on the FULL train-clean-100 (~100h, 28,539 utterances). aml_run.sh
+# points data.train_dir straight at the split, so there is no 10h-subset
+# symlink farm in the loop the way run_train_10h.sh builds one.
+type: command
+
+experiment_name: audioseal-robust-diffusion-swap
+display_name: train-audioldm-100h
+description: >-
+  Generator-only robustness fine-tuning against the AudioLDM attack on the full
+  ~100h train-clean-100, then eval with SGMSE and MBD held out.
+
+code: ../..
+environment: azureml:audioseal-robust-diffusion@latest
+compute: azureml:a100x1
+
+inputs:
+  librispeech:
+    type: uri_folder
+    path: azureml:librispeech-asr:1
+    # download, not ro_mount. data.py:36 builds the file list with
+    #   sorted(p for ext in (".wav", ".flac") for p in root.rglob(f"*{ext}"))
+    # i.e. a full recursive walk *per extension*, and train.py constructs a
+    # WavDirDataset per split -- 6 walks of a ~1,500-directory tree. On a
+    # blobfuse mount every directory listing is a network round-trip, so that
+    # walk alone can eat minutes before step 1, and then each __getitem__ pays
+    # blob latency again. Copying 6.8 GB from blob to the node's local NVMe is
+    # fast (same region) and one-time.
+    mode: download
+  checkpoints:
+    type: custom_model
+    path: azureml:psiml-diffusion-checkpoints:1
+    # ro_mount is right here, unlike the data above: 11 large files read
+    # sequentially at startup and streamed at full throughput.
+    #
+    # Read-only is enough: nothing writes into the weights tree. attacks.py
+    # chdirs into it (line 472) but only reads, and the one component that
+    # *would* have written there -- LPIPS fetching a ~500MB vgg.pth into a
+    # relative path -- never gets constructed, because attacks.py:467-468
+    # swaps the VAE's lossconfig for a no-op first.
+    mode: ro_mount
+
+outputs:
+  artifacts:
+    type: uri_folder
+    # rw_mount, not upload-on-finish: CHECKPOINT_DIR points straight in here
+    # (azureml/aml_run.sh), so a completed epoch survives a later crash or a
+    # timeout kill.
+    mode: rw_mount
+
+# ---------------------------------------------------------------------------
+# BUDGET -- set these from the smoke run's measured seconds/step before
+# submitting. The numbers below are a placeholder sized for a ~12h wall clock
+# at an ASSUMED ~2 s/step, and that assumption has not been measured yet.
+#
+# Why the config defaults are not usable here: config.py ships epochs=100 x
+# updates_per_epoch=1000, and updates_per_epoch is a per-epoch CAP rather than
+# a target -- the inner loop also breaks when the dataloader is exhausted,
+# whichever comes first. On the full 100h split that is 28,539 files at
+# batch_size=8 with drop_last -> ~3,567 batches/epoch, so the cap binds and the
+# run would be a genuine 100 x 1000 = 100,000 steps. Every one of those steps
+# backprops through AudioLDM's VAE encoder plus its UNet reverse loop. Even at
+# an optimistic 1 s/step that is 27h; at a realistic 2-4 s/step it is 55-110h,
+# against a 12h limit.
+#
+# Note this differs from run_train_10h.sh's situation, where the 10h subset
+# exhausts the dataloader at ~167 steps/epoch and so self-limits to ~16.7k
+# steps. At 100h nothing self-limits -- the cap is the only thing bounding it,
+# so it has to be set deliberately.
+#
+# batch_size=8 rather than the config default 16: this direction backprops
+# through the heavier of the two attack graphs.
+# attack.audioldm.strength_max stays at its default 0.08 -- config.py:91-100
+# explains why that ceiling exists (backprop through the full DDPM reverse
+# loop is not memory-tractable), so raising it is how you OOM this job.
+# ---------------------------------------------------------------------------
+command: >-
+  bash azureml/aml_run.sh audioldm
+  --librispeech ${{inputs.librispeech}}
+  --checkpoints ${{inputs.checkpoints}}
+  --artifacts ${{outputs.artifacts}}
+  --
+  epochs=20
+  updates_per_epoch=1000
+  log_every=50
+  eval_every=250
+  data.batch_size=8
+  data.num_workers=8
+  data.segment_duration=2.0
+  attack.sgmse.num_steps=15
+
+environment_variables:
+  PYTHONUNBUFFERED: "1"
+  AZUREML_ARTIFACTS_DEFAULT_TIMEOUT: "1200"
+  # WANDB_API_KEY / WANDB_PROJECT / WANDB_ENTITY are injected at submit time
+  # (--set environment_variables.WANDB_API_KEY=...), never committed here.
+  # aml_run.sh falls back to console logging if the key is absent.
+
+resources:
+  instance_count: 1
+
+limits:
+  # 12h. Checkpoints are already on the output mount, so a timeout kill still
+  # leaves the completed epochs behind -- but eval never runs in that case, so
+  # prefer a budget that finishes over one that gets killed.
+  timeout: 43200
