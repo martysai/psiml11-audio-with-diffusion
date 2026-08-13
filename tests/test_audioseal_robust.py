@@ -189,6 +189,140 @@ def test_sgmse_attack_missing_checkpoint_file_raises_clear_error(tmp_path):
         SGMSEAttack(checkpoint=str(tmp_path / "no_such_checkpoint.ckpt"))
 
 
+class _StubScoreModel(torch.nn.Module):
+    """Stand-in for sgmse.model.ScoreModel exposing only what
+    SGMSEAttack.forward touches, so the whole predictor/corrector loop can be
+    exercised without a multi-GB checkpoint. The SDE is the real one; only the
+    score network is replaced (by a linear function of x, so the loop stays
+    numerically tame and any NaN that shows up came from the transforms or the
+    sampler, not from an untrained backbone)."""
+
+    def __init__(self, n_fft: int = 510, hop_length: int = 128):
+        super().__init__()
+        from sgmse.sdes import OUVESDE
+
+        self.sde = OUVESDE(theta=1.5, sigma_min=0.05, sigma_max=0.5, N=30)
+        self.t_eps = 0.03
+        self.n_fft = n_fft
+        self.hop_length = hop_length
+        self.register_buffer("window", torch.hann_window(n_fft))
+        self.seen_t = []
+
+    def forward(self, x, y, t):
+        self.seen_t.append(t.detach().clone())
+        return -x
+
+    def _stft(self, sig):
+        return torch.stft(
+            sig, self.n_fft, self.hop_length, window=self.window, center=True, return_complex=True
+        )
+
+    def _istft(self, spec, length=None):
+        return torch.istft(
+            spec, self.n_fft, self.hop_length, window=self.window, center=True, length=length
+        )
+
+
+def test_sgmse_spec_transforms_stay_finite_on_silence():
+    """The vendored spec_fwd/spec_back route |z|**0.5 through abs()/angle(),
+    whose gradient is NaN at z=0 -- fine upstream (its sampler is all
+    no_grad), fatal here. Silent STFT bins are exactly z=0."""
+    attack = SGMSEAttack()
+
+    spec = torch.zeros(1, 4, dtype=torch.complex64)
+    spec[0, 0] = 0.3 + 0.4j  # one live bin; the rest are exact silence
+    spec.requires_grad_(True)
+
+    roundtrip = attack._spec_back(attack._spec_fwd(spec))
+    (roundtrip.real.sum() + roundtrip.imag.sum()).backward()
+
+    assert spec.grad is not None
+    assert torch.isfinite(spec.grad).all()
+
+
+def test_sgmse_spec_transforms_match_upstream_away_from_zero():
+    """The rewrite is only allowed to change behaviour at the singularity.
+    Upstream's formulas are inlined here rather than imported, so this stays
+    runnable without pulling pytorch_lightning in for SpecsDataModule --
+    see sgmse/data_module.py:SpecsDataModule.spec_fwd/spec_back."""
+    attack = SGMSEAttack()
+    factor, exponent = attack._spec_factor, attack._spec_abs_exponent
+    spec = torch.randn(2, 8, dtype=torch.complex64)
+
+    upstream_fwd = spec.abs() ** exponent * torch.exp(1j * spec.angle()) * factor
+    upstream_back = (spec / factor).abs() ** (1 / exponent) * torch.exp(1j * (spec / factor).angle())
+
+    assert torch.allclose(attack._spec_fwd(spec), upstream_fwd, atol=1e-6)
+    assert torch.allclose(attack._spec_back(spec), upstream_back, atol=1e-6)
+
+
+def test_sde_discretize_accepts_per_example_stepsize():
+    """Per-example t* means per-example step sizes; upstream's discretize only
+    broadcasts a scalar (see src/sgmse/VENDORED.md). The scalar path must be
+    bit-identical to before."""
+    from sgmse.sdes import OUVESDE
+
+    sde = OUVESDE(theta=1.5, sigma_min=0.05, sigma_max=0.5, N=5)
+    x = torch.randn(2, 1, 8, 4)
+    y = torch.randn(2, 1, 8, 4)
+    t = torch.tensor([0.2, 0.7])
+
+    f_vec, g_vec = sde.discretize(x, y, t, torch.tensor([0.1, 0.1]))
+    f_scalar, g_scalar = sde.discretize(x, y, t, torch.tensor(0.1))
+
+    assert f_vec.shape == x.shape
+    assert g_vec.shape == (2,)
+    assert torch.allclose(f_vec, f_scalar)
+    assert torch.allclose(g_vec, g_scalar)
+
+
+def test_sgmse_attack_runs_end_to_end_and_keeps_gradients_finite():
+    """The gap this closes: every other SGMSE test here stops at the
+    no-checkpoint stub, so the sampler loop itself was never executed."""
+    attack = SGMSEAttack(num_steps=3)
+    attack._model = _StubScoreModel()
+
+    x = torch.randn(3, 1, 4000)
+    x[:, :, :1000] = 0.0  # a silent stretch -- the case that produces NaN grads
+    x.requires_grad_(True)
+
+    torch.manual_seed(0)
+    x_att = attack(x)
+
+    assert x_att.shape == x.shape
+    assert torch.isfinite(x_att).all()
+
+    x_att.pow(2).mean().backward()
+    assert x.grad is not None
+    assert torch.isfinite(x.grad).all()
+
+
+def test_sgmse_attack_samples_one_strength_per_example():
+    """strength=None must spread t* across the batch: one shared draw would
+    give a batch-size-8 step a single point of the robustness curve."""
+    attack = SGMSEAttack(num_steps=2)
+    attack._model = _StubScoreModel()
+
+    torch.manual_seed(0)
+    attack(torch.randn(4, 1, 4000))
+
+    first_t = attack._model.seen_t[0]
+    assert first_t.shape == (4,)
+    assert first_t.unique().numel() == 4
+
+
+def test_sgmse_attack_explicit_strength_pins_the_whole_batch():
+    """evaluate.py measures one t* at a time -- a float must not be perturbed
+    per example the way strength=None now is."""
+    attack = SGMSEAttack(num_steps=2)
+    attack._model = _StubScoreModel()
+
+    attack(torch.randn(4, 1, 4000), strength=0.04)
+
+    first_t = attack._model.seen_t[0]
+    assert first_t.unique().numel() == 1
+
+
 def test_mbd_attack_without_checkpoint_stays_a_stub():
     attack = MBDAttack()
     with pytest.raises(NotImplementedError, match="constructed without a checkpoint"):
