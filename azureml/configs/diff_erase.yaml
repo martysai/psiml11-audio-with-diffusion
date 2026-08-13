@@ -3,13 +3,13 @@
 # The opposite direction from sgmse.yaml: trains against DiffErase (AudioLDM),
 # holds SGMSE + MBD out. Static equivalent: azureml/jobs/train_diff_erase.yaml.
 
-# workspace:
-#   subscription_id: 00000000-0000-0000-0000-000000000000
-#   resource_group_name: gpu-resource-group
-#   workspace_name: playground-ws
+workspace:
+  subscription_id: <redacted-subscription>  # Azure ML
+  resource_group_name: gpu-resource-group
+  workspace_name: gpu-workspace
 
 direction: diff_erase
-compute: a100-cluster
+compute: gpu-cluster
 environment: azureml:audioseal-robust-diffusion@latest
 
 experiment_name: audioseal-robust-diffusion-swap

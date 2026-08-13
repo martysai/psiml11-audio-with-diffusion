@@ -18,7 +18,9 @@ description: >-
 # Repo root: this file is two levels down. A few MB, 224 tracked files.
 code: ../..
 environment: azureml:audioseal-robust-diffusion@latest
-compute: azureml:a100-cluster
+# STANDARD_NC24ADS_A100_V4 -- 1x A100 80GB, 24 vCPU. Single-GPU: nothing here
+# is distributed, so gpu-cluster/gpu-cluster would leave GPUs idle.
+compute: azureml:gpu-cluster
 
 inputs:
   librispeech:
