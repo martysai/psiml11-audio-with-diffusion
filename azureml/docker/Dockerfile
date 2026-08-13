@@ -76,6 +76,13 @@ RUN python3 -m pip install \
 # SpeechT5Processor + SpeechT5EncoderWithTextPrenet, GPT2/GPTJ, Bert and Bart.
 # Bumping torch to satisfy 5.x instead would unravel the cu118 + xformers +
 # audiocraft matching above, which is a far larger change for no benefit.
+#
+# mlflow is capped for a third reason. AzureML injects an `azureml://` tracking
+# URI into every job, and only the azureml-mlflow plugin teaches MLflow that
+# scheme; without it MLflow raises on a URI it cannot parse. That plugin
+# requires mlflow-skinny<=3.13.0, while an unpinned `mlflow>=2.0.0` resolves to
+# 3.15.1 -- so leaving it open both breaks the plugin and lets pip silently
+# downgrade mlflow underneath us. Pin it to the ceiling the plugin supports.
 RUN printf '%s\n' \
         'torch==2.4.0' \
         'torchvision==0.19.0' \
@@ -83,6 +90,7 @@ RUN printf '%s\n' \
         'xformers==0.0.27.post2' \
         'numpy<2' \
         'transformers==4.46.3' \
+        'mlflow<=3.13.0' \
         > /tmp/constraints.txt
 
 COPY requirements.txt \
@@ -107,6 +115,18 @@ RUN python3 -m pip install -c /tmp/constraints.txt \
         -r /tmp/reqs/requirements-training.txt \
         -r /tmp/reqs/requirements-audioldm.txt \
         -r /tmp/reqs/requirements-mbd.txt
+
+# Installed here rather than in requirements-training.txt because it is purely
+# an artifact of running inside AzureML: it registers the `azureml://` tracking
+# and artifact URI schemes with MLflow. Local users get plain MLflow (a SQLite
+# file / mlruns dir) and have no use for a mandatory Azure dependency.
+#
+# Its absence is what killed <redacted-run> and
+# <redacted-run> at step 0: AzureML sets the tracking URI
+# to azureml://<region>.api.azureml.ms/mlflow/..., MLflow looked the scheme up
+# in its store registry, found nothing, and raised. Before the layer below,
+# nothing in this build would have noticed.
+RUN python3 -m pip install -c /tmp/constraints.txt azureml-mlflow
 
 # Fail the *image build* rather than the GPU job if the stack is
 # inconsistent.
@@ -160,3 +180,18 @@ from audiocraft.models import MultiBandDiffusion; \
 assert numpy.__version__.startswith('1.'), 'numpy 2.x breaks this stack: ' + numpy.__version__; \
 assert transformers.__version__.startswith('4.'), 'transformers must stay on 4.x for torch 2.4: ' + transformers.__version__; \
 print('torch', torch.__version__, '| torchaudio', torchaudio.__version__, '| numpy', numpy.__version__, '| xformers', xformers.__version__, '| transformers', transformers.__version__)"
+
+# Same lesson as the transformers check above, applied to MLflow: `import
+# mlflow` succeeds whether or not MLflow can actually talk to AzureML, so it
+# proved nothing and two 4x A100 jobs died at step 0 to find that out.
+#
+# This performs the exact lookup that failed at runtime -- mlflow/tracking/
+# registry.py does `self._registry[scheme]` on the scheme parsed out of the
+# tracking URI -- so a missing or incompatible azureml-mlflow now costs one
+# failed build instead of a node allocation plus its queue wait.
+RUN python3 -c "\
+import mlflow, azureml.mlflow; \
+from mlflow.tracking._tracking_service.utils import _tracking_store_registry as reg; \
+schemes = sorted(reg._registry); \
+assert 'azureml' in schemes, 'azureml-mlflow is not registering the azureml:// tracking scheme -- MLflow only knows ' + repr(schemes) + '; AzureML injects an azureml:// tracking URI, so every job would die at tracker init'; \
+print('mlflow', mlflow.__version__, '| tracking URI schemes:', schemes)"
