@@ -97,13 +97,22 @@ differently from the 10h one here.
 
 ### Experiment tracking
 
-Tracking is wired to an external wandb project and is driven entirely by env
-vars — the job YAMLs deliberately set no `tracking.*` override, so `aml_run.sh`
-is the single place that decides it:
+Tracking is driven entirely by env vars — the job YAMLs deliberately set no
+`tracking.*` override, so `aml_run.sh` is the single place that decides it.
+Resolution order is **wandb → mlflow → none**:
+
+| condition | backend |
+|---|---|
+| `WANDB_API_KEY` is set | `wandb` |
+| no key, but inside an AzureML job (`AZUREML_RUN_ID` set) | `mlflow` |
+| neither | `none` (console logging) |
+
+Set `TRACKING_BACKEND` explicitly to override. Asking for `wandb` without a key
+is a fast, explicit failure rather than `wandb.init()` blocking forever on a
+login prompt against a stdin that will never answer.
 
 | var | effect |
 |---|---|
-| `WANDB_API_KEY` | absent ⇒ falls back to console logging |
 | `WANDB_PROJECT` | defaults to `audioseal-robust` |
 | `WANDB_ENTITY` | read natively by the wandb SDK; needed for team projects |
 
@@ -111,15 +120,79 @@ The key is passed at submit time and never committed. Note it *is* then visible
 in the job definition to anyone with workspace access, so rotate it if that
 matters.
 
+**On manifold, wandb is not an option.** Singularity virtual clusters are
+compliant compute, and wandb is an external endpoint — `tracking.py`'s
+`WandbTracker` uploads audio samples and figures, not just scalars, so using it
+there would move training data out of the compliance boundary. The manifold job
+YAML therefore sets no key at all and lands on `mlflow`, whose tracking URI the
+AzureML runtime injects; metrics go to the Studio run with no outbound network.
+Use wandb for playground runs only.
+
 Two non-obvious details this handles for you:
 
-- The AML run id becomes the wandb run name, so a chart traces back to the job.
+- The AML run id becomes the wandb/mlflow run name, so a chart traces back to
+  the job.
 - The same tracking config is forced onto **evaluate.py** too, via
   `EVAL_EXTRA_ARGS`. `default_eval.yaml` defaults to a *different* project
   (`audioseal-robust-eval`), and `run_diffusion_swap.sh` forwards `"$@"` to
   train.py only — so without that channel every experiment would split across
   two projects, with the eval half (the actual result) landing in the one you
   weren't watching.
+
+### Running on manifold (Singularity, 4× A100)
+
+playground's `a100x1` pool is shared and frequently saturated — the stage-1
+smoke sat `Queued` for over an hour behind other users, with all 27 nodes busy
+and no spot tier to fall back to. `as-manifold3-w3-vc` (westus3, same region as
+the assets) had 32 A100 cores idle. A single A100 was also already hitting OOM
+on this workload, so the manifold path runs 4× A100 under `torchrun`/DDP.
+
+```powershell
+$rg = "manifold3-rg"; $ws = "as-manifold3-w3-ws"
+
+# one-time: point manifold at the assets already staged in playground's blob
+az ml datastore create -f azureml/datastores/psiml_assets_playground.yaml `
+  --resource-group $rg --workspace-name $ws
+
+$ds = "azureml://datastores/psiml_assets_playground/paths/psiml-assets"
+az ml data create -f azureml/assets/librispeech.yaml `
+  --set path="$ds/LibriSpeech" --resource-group $rg --workspace-name $ws
+az ml data create -f azureml/assets/diffusion_checkpoints_manifold.yaml `
+  --resource-group $rg --workspace-name $ws
+az ml environment create -f azureml/environment.yaml `
+  --resource-group $rg --workspace-name $ws
+
+# then, per run:
+az ml job create -f azureml/jobs/smoke_audioldm_manifold.yaml `
+  --name "smoke-audioldm-manifold-$(Get-Date -Format 'MMdd-HHmmss')" `
+  --resource-group $rg --workspace-name $ws
+```
+
+Three things about this that are not obvious:
+
+- **The 18.8 GB is not copied.** The job identity `as-shared-w3-id` already
+  holds *Storage Blob Data Contributor* on `asplaygroundw3data`, so a
+  credential-less datastore reads the existing blobs in place.
+- **The checkpoints register as a `uri_folder`, not a `custom_model`.**
+  Registering a *model* asset makes the **workspace MSI** authenticate against
+  the backing storage, and manifold3's MSI has no role on the playground
+  account (`Datastore has no credentials, and workspace msi failed to
+  authenticate storage account`). Granting one needs
+  `roleAssignments/write` on `playground-rg`. Data assets register by reference
+  and skip that check; the mount at job time is identical, since that uses the
+  job identity. Hence the separate
+  `assets/diffusion_checkpoints_manifold.yaml`.
+- **`n_eval_batches` and `n_curve_batches` must be ≥ the GPU count.** They are
+  *global* totals that `evaluate.py` splits with `shard_size()`, so on 4 ranks
+  the playground values (2 and 1) would leave ranks 2–3 with an empty shard and
+  fail the run.
+
+`aml_run.sh` reads the GPU count off `nvidia-smi` and sets
+`torchrun --nproc_per_node=<n>` itself, so the SKU in `resources.instance_type`
+is the only thing to change to scale. `data.batch_size` stays **per GPU**, so
+the effective batch scales with the rank count and `optim.lr` is *not* rescaled
+automatically — see `docs/MULTI_GPU.md`.
+
 
 ## Outputs
 
