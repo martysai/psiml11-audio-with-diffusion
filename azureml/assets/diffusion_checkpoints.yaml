@@ -1,4 +1,4 @@
-﻿$schema: https://azuremlschemas.azureedge.net/latest/model.schema.json
+$schema: https://azuremlschemas.azureedge.net/latest/model.schema.json
 
 # az ml model create -f azureml/assets/diffusion_checkpoints.yaml
 #

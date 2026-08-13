@@ -1,4 +1,4 @@
-﻿$schema: https://azuremlschemas.azureedge.net/latest/commandJob.schema.json
+$schema: https://azuremlschemas.azureedge.net/latest/commandJob.schema.json
 
 # az ml job create -f azureml/jobs/train_sgmse.yaml \
 #     --set compute=azureml:<your-a100-cluster>

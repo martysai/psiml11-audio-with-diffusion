@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """Config-driven AzureML submitter for the diffusion-swap experiment.
 
 One YAML per experiment direction under azureml/configs/, one submit call:

@@ -1,4 +1,4 @@
-﻿# python azureml/aml_submit.py --config azureml/configs/sgmse.yaml
+# python azureml/aml_submit.py --config azureml/configs/sgmse.yaml
 #
 # Trains against SGMSE, holds AudioLDM + MBD out (recipes.yaml's `sgmse` /
 # `after_sgmse_training` pair). The static equivalent is
