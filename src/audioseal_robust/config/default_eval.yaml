@@ -17,6 +17,11 @@ eval_dir: ???
 segment_duration: 3.0
 batch_size: 8
 n_eval_batches: 20
+# Fixed watermark SNR (dB) the eval embedding is scaled to -- must match (or
+# be comparable to) TrainConfig.watermark_snr_db_{min,max}'s range, or eval
+# measures a different watermark strength than training optimized against.
+# See EvalConfig.watermark_snr_db in config.py.
+watermark_snr_db: 30.0
 # Batches per robustness-curve point, cheaper than the headline number's
 # n_eval_batches -- the curve is a shape read off a plot, the headline TPR@FPR
 # is the number that gets quoted. See EvalConfig.n_curve_batches in config.py.

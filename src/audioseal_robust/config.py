@@ -256,6 +256,20 @@ class EvalConfig:
     segment_duration: float = 3.0
     batch_size: int = 8
     n_eval_batches: int = 20
+    # Fixed watermark SNR (dB) for eval -- a single number, not a range like
+    # TrainConfig.watermark_snr_db_{min,max}, since eval wants one
+    # reproducible operating point to report, not per-step variety. Without
+    # this, evaluate.py embedded the watermark unscaled (raw
+    # generator.get_watermark() amplitude), while train.py (see
+    # train.py:embed_watermark) rescales it to a target SNR every step --
+    # meaning eval was measuring detection at a watermark amplitude training
+    # never actually optimized for. 30.0 = the midpoint of
+    # TrainConfig's default [24, 36] range, and close to what we measured for
+    # stock/unscaled AudioSeal on our own data (mean 30.65dB, see the
+    # TrainConfig.watermark_snr_db_{min,max} note) -- so this also keeps the
+    # stock-model baseline numbers close to what they were before this field
+    # existed, rather than silently shifting them too.
+    watermark_snr_db: float = 30.0
     # Batches per *robustness-curve* point (see evaluate.py's t_star_grid
     # loop), separate from n_eval_batches so the curve doesn't cost
     # len(t_star_grid)x the headline number. The curve is a shape ("where does
