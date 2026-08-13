@@ -186,6 +186,13 @@ class TrackingConfig:
     mlflow_tracking_uri: tp.Optional[str] = None  # None -> local ./mlruns
     wandb_mode: str = "online"  # "online" | "offline" | "disabled"
     log_audio_every: int = 0  # 0 disables; else log one x_wm sample every N steps
+    # Per-step CUDA allocator metrics under the "mem/" prefix -- the only way
+    # to see whether the diffusion attacks' activation checkpointing is
+    # actually buying anything, since the wandb/nvidia-smi system panels
+    # report reserved (pool) memory and stay flat either way. Costs a few
+    # counter reads per step, no device sync. Ignored off CUDA. See
+    # train.py:CudaMemoryProbe.
+    log_memory: bool = True
 
 
 @dataclass

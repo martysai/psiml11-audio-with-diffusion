@@ -83,3 +83,4 @@ tracking:
   mlflow_tracking_uri: null
   wandb_mode: online
   log_audio_every: 0
+  log_memory: true
