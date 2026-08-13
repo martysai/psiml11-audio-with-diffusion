@@ -2,7 +2,7 @@
 # watermark generator/detector inference, model cards, checkpoint loading.
 # Everything else in this repo layers on top of this file:
 #   requirements-training.txt    -- src/audioseal_robust (training + eval, identity/sgmse attacks)
-#   requirements-diff-erase.txt  -- the diff_erase held-out attack (AudioLDM)
+#   requirements-audioldm.txt    -- the audioldm attack (AudioLDM latent diffusion)
 #   requirements-mbd.txt         -- the mbd held-out attack (MultiBand Diffusion)
 #
 # Derived from the actual top-level third-party imports across src/audioseal

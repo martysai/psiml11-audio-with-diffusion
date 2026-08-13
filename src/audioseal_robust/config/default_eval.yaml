@@ -7,12 +7,12 @@
 # After fine-tuning with a train-time recipe (see config/recipes.yaml), pair
 # it with the matching eval recipe so the report/held-out labeling matches
 # which attack was actually trained against:
-#   python -m audioseal_robust.evaluate recipe=after_diff_erase_training eval_dir=... label=finetuned_diff_erase \
+#   python -m audioseal_robust.evaluate recipe=after_audioldm_training eval_dir=... label=finetuned_audioldm \
 #       generator_checkpoint=./checkpoints/audioseal_robust/generator_epochN.pth \
-#       attack.diff_erase.checkpoint=... attack.diff_erase.config=... attack.sgmse.checkpoint=...
+#       attack.audioldm.checkpoint=... attack.audioldm.config=... attack.sgmse.checkpoint=...
 #   python -m audioseal_robust.evaluate recipe=after_sgmse_training eval_dir=... label=finetuned_sgmse \
 #       generator_checkpoint=./checkpoints/audioseal_robust/generator_epochN.pth \
-#       attack.sgmse.checkpoint=... attack.diff_erase.checkpoint=... attack.diff_erase.config=...
+#       attack.sgmse.checkpoint=... attack.audioldm.checkpoint=... attack.audioldm.config=...
 
 sample_rate: 16000
 nbits: 16
@@ -48,18 +48,18 @@ output_dir: ./eval_outputs
 # regime" and just destroys the audio).
 fpr_target: 0.01
 t_star_grid: [0.0, 0.0003, 0.002, 0.006, 0.015, 0.04, 0.08]
-# The one t* the headline number is measured at for sgmse/diff_erase (the
+# The one t* the headline number is measured at for sgmse/audioldm (the
 # other attacks ignore strength). 0.04 = t*=40 = the mentor table's "hard
 # regime". NOT optional: leaving it unset makes each attack draw its own
-# random t* per forward call, which is both ~12x slower on diff_erase and
+# random t* per forward call, which is both ~12x slower on audioldm and
 # gives positives/negatives different strengths. See
 # EvalConfig.headline_strength in config.py.
 headline_strength: 0.04
 
 # Fallback used only when no `recipe=...` is given (see recipes.yaml's
-# after_diff_erase_training/after_sgmse_training, which override both of
+# after_audioldm_training/after_sgmse_training, which override both of
 # these together to match whichever attack was actually trained against).
-eval_attacks: [identity, bigvgan, dac, diff_erase]
+eval_attacks: [identity, bigvgan, dac, audioldm]
 held_out_attacks: [sgmse, mbd]
 
 compute_pesq: true
@@ -68,8 +68,8 @@ compute_visqol: false
 
 # Per-attack checkpoints -- None/null keeps that attack a stub (see
 # attacks.py). Override on the CLI, e.g.:
-#   attack.diff_erase.checkpoint=/path/to/Differase/DiffErase-latent/data/checkpoints/foo.ckpt \
-#   attack.diff_erase.config=/path/to/Differase/DiffErase-latent/audioldm_train/config/2023_08_23_reproduce_audioldm/audioldm_original.yaml
+#   attack.audioldm.checkpoint=/path/to/audioldm_root/data/checkpoints/audioldm-s-full \
+#   attack.audioldm.config=src/audioldm_train/config/2023_08_23_reproduce_audioldm/audioldm_original.yaml
 attack:
   bigvgan:
     checkpoint: null
@@ -86,7 +86,7 @@ attack:
     # sgmse number quoted from this default; bump it back up if it doesn't.
     checkpoint: null
     num_steps: 10
-  diff_erase:
+  audioldm:
     checkpoint: null
     config: null
     strength_max: 0.08

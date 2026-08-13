@@ -17,19 +17,18 @@ echo "logging to $LOG (tail -f $LOG to follow live, or just check it later)"
 # is also what lets this script still log the exit code on failure instead
 # of dying mid-pipeline before reaching that line.
 set +e
-# diff_erase only -- no identity/bigvgan/dac/sgmse, no mbd (default
-# held_out_attacks is [diff_erase, mbd], override to drop mbd).
+# audioldm only -- no identity/bigvgan/dac/sgmse, no mbd (default
+# held_out_attacks is [sgmse, mbd], override to isolate audioldm).
 # batch_size=8 (default) * n_eval_batches=150 * segment_duration=3.0s (default)
 # = 3600s = 1h of audio for the headline number.
 #
-# NOTE on the label: "diff_erase" is the attack *method* (partial-noise +
-# diffusion-regenerate, per the DiffErase paper) -- attack.diff_erase.checkpoint
-# below is a generic pretrained AudioLDM checkpoint standing in as its
+# NOTE on the label: the attack *method* here is partial-noise +
+# diffusion-regenerate (as described in the DiffErase paper) -- attack.audioldm.checkpoint
+# below is a pretrained AudioLDM checkpoint serving as its
 # diffusion prior, NOT a checkpoint DiffErase's authors trained/released
-# (they published none). Stamping that into the label so output filenames
-# (full_1h_audioldm_confusion.png etc.) don't silently read as "the real
-# DiffErase model" later -- swap this if a genuine DiffErase checkpoint ever
-# replaces the one below.
+# (they published none, which is why this attack is named after AudioLDM and
+# not after them). Stamping that into the label so output filenames
+# (full_1h_audioldm_confusion.png etc.) say what actually ran.
 #
 # tracking.backend left at its default (mlflow, local) instead of "none" --
 # this is the real baseline number, meant to sit in the same mlflow
@@ -47,9 +46,9 @@ PYTHONUNBUFFERED=1 MPLBACKEND=Agg PYTHONPATH=src python3 -m audioseal_robust.eva
   n_curve_batches=20 \
   device=cuda \
   eval_attacks=[] \
-  held_out_attacks=[diff_erase] \
-  attack.diff_erase.checkpoint=/data/checkpoints/diff_erase_root/data/checkpoints/audioldm-full-s-v2.ckpt \
-  attack.diff_erase.config=src/audioldm_train/config/2023_08_23_reproduce_audioldm/audioldm_original.yaml \
+  held_out_attacks=[audioldm] \
+  attack.audioldm.checkpoint=/data/checkpoints/audioldm_root/data/checkpoints/audioldm-full-s-v2.ckpt \
+  attack.audioldm.config=src/audioldm_train/config/2023_08_23_reproduce_audioldm/audioldm_original.yaml \
   2>&1 | tee "$LOG"
 STATUS=${PIPESTATUS[0]}
 set -e
