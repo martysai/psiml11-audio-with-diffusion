@@ -48,14 +48,18 @@ def bit_accuracy(m_hat: torch.Tensor, message: torch.Tensor, threshold: float = 
 
 
 def _threshold_at_fpr(negative_scores: torch.Tensor, target_fpr: float) -> float:
-    """Detection threshold on `negative_scores` that yields (approximately)
-    `target_fpr`: the score at or above which exactly `target_fpr` fraction
-    of negatives fall. Shared by `tpr_at_fpr` and `confusion_counts` so both
-    report numbers for the same operating point."""
+    """Detection threshold whose empirical FPR does not exceed `target_fpr`:
+    just above the (k+1)-th highest negative score, where k is the number of
+    false positives the budget allows. Stepping past that score (rather than
+    landing on it) keeps ties at the boundary from spending more than the
+    budget. Shared by `tpr_at_fpr` and `confusion_counts` so both report
+    numbers for the same operating point."""
     negative_sorted, _ = torch.sort(negative_scores, descending=True)
-    n_neg = negative_sorted.numel()
-    idx = max(0, min(n_neg - 1, int(round(target_fpr * n_neg))))
-    return negative_sorted[idx].item()
+    n_allowed = int(target_fpr * negative_sorted.numel())
+    if n_allowed >= negative_sorted.numel():
+        return negative_sorted[-1].item()
+    boundary = negative_sorted[n_allowed]
+    return torch.nextafter(boundary, torch.full_like(boundary, float("inf"))).item()
 
 
 def tpr_at_fpr(

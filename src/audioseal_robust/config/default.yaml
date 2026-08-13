@@ -1,6 +1,14 @@
 # Default config for generator-only robustness fine-tuning.
 # Override any field on the CLI, e.g.:
-#   python -m audioseal_robust.train data.train_dir=/path/to/wavs lambda_det=2.0 attack.weights.sgmse=1.0
+#   python -m audioseal_robust.train data.train_dir=/path/to/wavs lambda_det=2.0
+#
+# To train against a specific diffusion attack, pick a named recipe (see
+# config/recipes.yaml -- sets attack.weights.* for you) and supply that
+# attack's checkpoint(s):
+#   python -m audioseal_robust.train recipe=diff_erase data.train_dir=/path/to/wavs \
+#       attack.diff_erase.checkpoint=/path/to/checkpoint.ckpt attack.diff_erase.config=/path/to/config.yaml
+#   python -m audioseal_robust.train recipe=sgmse data.train_dir=/path/to/wavs \
+#       attack.sgmse.checkpoint=/path/to/checkpoint.ckpt
 
 sample_rate: 16000
 nbits: 16
@@ -10,6 +18,8 @@ updates_per_epoch: 1000
 log_every: 50
 checkpoint_dir: ./checkpoints/audioseal_robust
 seed: 1234
+eval_every: 0
+recipe: null
 
 lambda_det: 1.0
 lambda_perc: 1.0
@@ -32,6 +42,7 @@ attack:
     bigvgan: 0.0
     dac: 0.0
     sgmse: 0.0
+    diff_erase: 0.0
   bigvgan:
     checkpoint: null
   dac:
@@ -39,6 +50,10 @@ attack:
   sgmse:
     checkpoint: null
     num_steps: 30
+  diff_erase:
+    checkpoint: null
+    config: null
+    strength_max: 0.08
 
 mel_loss:
   n_fft: 1024
