@@ -61,12 +61,28 @@ RUN python3 -m pip install \
 # `==2.4.0` also matches the installed `2.4.0+cu118` -- PEP 440 ignores the
 # local version segment here -- so these satisfy rather than trigger a
 # reinstall from PyPI.
+#
+# transformers is pinned for a different reason than the torch stack, and it is
+# not cosmetic: unpinned it resolves to 5.x, which requires a much newer torch
+# than 2.4. When transformers decides torch is unavailable it does NOT fail
+# cleanly -- transformers/integrations/tensor_parallel.py guards its `import
+# torch` behind is_torch_available() but then subclasses torch.autograd.Function
+# at module scope regardless, so the import dies with a bare
+# `NameError: name 'torch' is not defined` that says nothing about versions.
+# That is what killed all 4 ranks of smoke-audioldm-manifold-0813-174222.
+#
+# 4.x is also the right major on API grounds: the vendored audioldm_train is
+# 2023-era code importing RobertaTokenizer/T5EncoderModel/MT5EncoderModel,
+# SpeechT5Processor + SpeechT5EncoderWithTextPrenet, GPT2/GPTJ, Bert and Bart.
+# Bumping torch to satisfy 5.x instead would unravel the cu118 + xformers +
+# audiocraft matching above, which is a far larger change for no benefit.
 RUN printf '%s\n' \
         'torch==2.4.0' \
         'torchvision==0.19.0' \
         'torchaudio==2.4.0' \
         'xformers==0.0.27.post2' \
         'numpy<2' \
+        'transformers==4.46.3' \
         > /tmp/constraints.txt
 
 COPY requirements.txt \
@@ -114,6 +130,15 @@ RUN conflicts="$(python3 -m pip check | grep -v '^audiocraft ' || true)"; \
 # chain for the audioldm attack, the sgmse chain, and
 # audiocraft.models.MultiBandDiffusion for mbd (attacks.py:667).
 #
+# `import transformers` on its own is NOT a sufficient check and used to be all
+# this did -- transformers is a _LazyModule, so the bare import succeeds even
+# when the package is fundamentally broken against the installed torch, and the
+# failure only surfaces once something pulls in modeling_utils. That is exactly
+# how a transformers 5.x/torch 2.4 mismatch got past this build and instead
+# killed a 4x A100 job at import time. So import the concrete model classes
+# audioldm_train/conditional_models.py imports, and assert is_torch_available()
+# directly for an error message that names the real problem.
+#
 # Deliberately `python3 -c` on one line rather than a heredoc: this Dockerfile
 # can reach the daemon with CRLF endings, and a `<<'PY'` terminator arriving as
 # "PY\r" never matches, so the heredoc swallows the rest of the build.
@@ -124,6 +149,14 @@ import webdataset, braceexpand, wget, sklearn, regex, PIL, yaml, tqdm; \
 import torch_ema, torchsde, torchinfo, pystoi; \
 import torchmetrics, pesq, matplotlib, mlflow, wandb; \
 import xformers, julius, num2words, av, flashy, spacy; \
+from transformers.utils import is_torch_available; \
+assert is_torch_available(), 'transformers ' + transformers.__version__ + ' does not consider torch ' + torch.__version__ + ' usable; it will NameError on torch at module scope'; \
+from transformers import RobertaTokenizer, AutoTokenizer, T5EncoderModel, MT5EncoderModel; \
+from transformers import SpeechT5Processor, GPT2Model, GPT2Tokenizer, GPT2Config, GPTJConfig, GPTJModel; \
+from transformers import BertTokenizer, BertModel, BartTokenizer, BartModel, RobertaModel; \
+from transformers.models.speecht5.modeling_speecht5 import SpeechT5EncoderWithTextPrenet; \
+from transformers.tokenization_utils_base import BatchEncoding; \
 from audiocraft.models import MultiBandDiffusion; \
 assert numpy.__version__.startswith('1.'), 'numpy 2.x breaks this stack: ' + numpy.__version__; \
-print('torch', torch.__version__, '| torchaudio', torchaudio.__version__, '| numpy', numpy.__version__, '| xformers', xformers.__version__)"
+assert transformers.__version__.startswith('4.'), 'transformers must stay on 4.x for torch 2.4: ' + transformers.__version__; \
+print('torch', torch.__version__, '| torchaudio', torchaudio.__version__, '| numpy', numpy.__version__, '| xformers', xformers.__version__, '| transformers', transformers.__version__)"

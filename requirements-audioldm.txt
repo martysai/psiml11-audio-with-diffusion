@@ -17,7 +17,12 @@ pytorch_lightning
 torchvision
 h5py
 torchlibrosa
-transformers
+transformers<5         # NOT unpinned: 5.x needs a much newer torch than our
+                       # 2.4, and it fails as a bare "NameError: name 'torch'
+                       # is not defined" from tensor_parallel.py rather than a
+                       # version complaint. 5.x also drops/renames APIs this
+                       # 2023-era vendored code uses (SpeechT5EncoderWithText-
+                       # Prenet, MT5EncoderModel, GPTJ*).
 ftfy
 braceexpand
 webdataset
