@@ -26,10 +26,23 @@ inputs:
   librispeech:
     type: uri_folder
     path: azureml:librispeech-asr@1
-    mode: ro_mount
+    # download, not ro_mount. data.py:36 builds the file list with
+    #   sorted(p for ext in (".wav", ".flac") for p in root.rglob(f"*{ext}"))
+    # i.e. a full recursive walk *per extension*, and train.py constructs a
+    # WavDirDataset per split -- 6 walks of a ~1,500-directory tree. On a
+    # blobfuse mount every directory listing is a network round-trip, so that
+    # walk alone can eat minutes before step 1, and then each __getitem__ pays
+    # blob latency again. Copying 6.8 GB from blob to the node's local NVMe is
+    # fast (same region) and one-time.
+    mode: download
   checkpoints:
     type: custom_model
     path: azureml:psiml-diffusion-checkpoints@1
+    # ro_mount is right here, unlike the data above: 11 large files read
+    # sequentially at startup, streamed at full throughput, and the sgmse
+    # direction never touches most of audioldm-s-full -- mounting skips
+    # transferring what it doesn't open.
+    #
     # Read-only is enough: nothing writes into the weights tree. attacks.py
     # chdirs into it (line 472) but only reads, and the one component that
     # *would* have written there -- LPIPS fetching a ~500MB vgg.pth into a

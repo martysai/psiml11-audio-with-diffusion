@@ -22,7 +22,10 @@ inputs:
   librispeech:
     type: uri_folder
     path: azureml:librispeech-asr@1
-    mode: ro_mount
+    # download, not ro_mount -- see train_sgmse.yaml for the reasoning
+    # (data.py:36 does a recursive walk per extension per split, and directory
+    # listings over blobfuse are network round-trips).
+    mode: download
   checkpoints:
     type: custom_model
     path: azureml:psiml-diffusion-checkpoints@1

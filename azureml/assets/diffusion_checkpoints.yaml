@@ -2,8 +2,17 @@ $schema: https://azuremlschemas.azureedge.net/latest/model.schema.json
 
 # az ml model create -f azureml/assets/diffusion_checkpoints.yaml
 #
-# ~10.9 GB. `path` is a local machine path -- override with --path to upload
-# from elsewhere.
+# ~10.9 GB. `path` points at the copy already staged in the workspace's default
+# blob datastore, so registering does NOT re-upload.
+#
+# To (re-)stage the bytes, use AzCopy -- and throttle it. The default 160
+# concurrent operations saturate a modest uplink and time out the multi-GB
+# files' block PUTs (the small-file LibriSpeech asset is unaffected):
+#   $env:AZCOPY_CONCURRENCY_VALUE = "8"; $env:AZCOPY_TUNE_TO_CPU = "false"
+#   azcopy copy <local>/checkpoints "https://<acct>.blob.core.windows.net/\
+#     azureml-blobstore-<guid>/psiml-assets?<sas>" --recursive \
+#     --block-size-mb 4 --overwrite=false
+# --overwrite=false makes a re-run resume: failed files never committed a blob.
 #
 # THE DIRECTORY LAYOUT IS LOAD-BEARING, do not flatten it:
 #
@@ -32,7 +41,7 @@ description: >-
   Frozen backbones for the two diffusion attacks: SGMSE (VoiceBank-DEMAND
   epoch 115) and AudioLDM-s-full plus its VAE/CLAP/HiFiGAN companions in the
   data/checkpoints/ layout attacks.py:DiffEraseAttack requires.
-path: C:<user-home>/psiml11-project-aml-assets/checkpoints
+path: azureml://datastores/workspaceblobstore/paths/psiml-assets/checkpoints
 tags:
   sgmse: https://github.com/sp-uhh/sgmse
   audioldm: https://zenodo.org/records/7884686

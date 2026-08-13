@@ -2,8 +2,20 @@ $schema: https://azuremlschemas.azureedge.net/latest/data.schema.json
 
 # az ml data create -f azureml/assets/librispeech.yaml
 #
-# ~6.8 GB across 33,862 .flac files. `path` is a local machine path, so
-# override it on the CLI when uploading from somewhere else:
+# ~6.8 GB across 33,862 .flac files. `path` points at the copy already staged
+# in the workspace's default blob datastore, so registering does NOT re-upload.
+#
+# To (re-)stage the bytes from a local machine, use AzCopy rather than letting
+# the CLI upload: the SDK uploader has no resume, so a single connection reset
+# restarts the whole transfer. Generate a container SAS with
+#   az storage container generate-sas --account-name <acct> \
+#     --name azureml-blobstore-<workspace-guid> --permissions racwdl \
+#     --expiry <utc> --auth-mode login --as-user -o tsv
+# then
+#   azcopy copy <local>/LibriSpeech "https://<acct>.blob.core.windows.net/\
+#     azureml-blobstore-<guid>/psiml-assets?<sas>" --recursive
+#
+# Or upload straight from a local folder (slower, no resume):
 #   az ml data create -f azureml/assets/librispeech.yaml --path <dir>
 #
 # The uploaded folder must contain train-clean-100/, dev-clean/ and
@@ -17,7 +29,7 @@ description: >-
   test-clean (2,620), 16 kHz .flac, unmodified from openslr.org/12.
   Read directly by data.py:WavDirDataset via rglob, so the nested
   speaker/chapter layout is fine as-is and needs no resampling.
-path: C:<user-home>/psiml11-project-aml-assets/data/LibriSpeech
+path: azureml://datastores/workspaceblobstore/paths/psiml-assets/LibriSpeech
 tags:
   source: https://www.openslr.org/12
   sample_rate: "16000"
