@@ -24,11 +24,23 @@ probabilities / sigmoid probabilities), so they use `BCELoss` rather than
 `BCEWithLogitsLoss` -- see `detection_loss` below.
 """
 
+import contextlib
 import typing as tp
 
 import torch
 import torch.nn as nn
 import torchaudio
+
+
+def _no_autocast(device: torch.device) -> tp.ContextManager[None]:
+    """Force-disable autocast for an op that can't tolerate it (see
+    detection_loss_components). cuda/cpu only, matching train.py's
+    _autocast -- torch.autocast's device_type is validated even when
+    enabled=False, and MPS's autocast support is inconsistent across torch
+    versions, so skip it there rather than risk an unsupported device_type."""
+    if device.type in ("cuda", "cpu"):
+        return torch.autocast(device_type=device.type, enabled=False)
+    return contextlib.nullcontext()
 
 
 def detection_loss_components(
@@ -48,11 +60,23 @@ def detection_loss_components(
     Returns:
         (presence_loss + bit_loss, presence_loss, bit_loss) -- all scalars.
     """
-    bce = nn.BCELoss()
-    target_presence = torch.full_like(p, presence_target)
-    presence_loss = bce(p.clamp(eps, 1 - eps), target_presence)
+    # Forces fp32 regardless of any ambient bf16/fp16 autocast (see train.py's
+    # _autocast): BCELoss/binary_cross_entropy raises rather than silently
+    # casting under autocast -- "Many models use a sigmoid layer right before
+    # the binary cross entropy layer... combine the two ... using
+    # binary_cross_entropy_with_logits" -- but p/m_hat here are
+    # AudioSealDetector's own already-activated outputs (frozen pretrained
+    # model; see this module's docstring), not logits we control, so
+    # switching to the *WithLogits variant isn't an option -- force the
+    # precision this op actually requires instead.
+    with _no_autocast(p.device):
+        p = p.float()
+        m_hat = m_hat.float()
+        bce = nn.BCELoss()
+        target_presence = torch.full_like(p, presence_target)
+        presence_loss = bce(p.clamp(eps, 1 - eps), target_presence)
 
-    bit_loss = bce(m_hat.clamp(eps, 1 - eps), message.float())
+        bit_loss = bce(m_hat.clamp(eps, 1 - eps), message.float())
 
     return presence_loss + bit_loss, presence_loss, bit_loss
 
