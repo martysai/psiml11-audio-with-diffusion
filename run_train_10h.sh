@@ -18,12 +18,15 @@ TRAIN_SOURCE_DIR="${TRAIN_SOURCE_DIR:-$DATASET_ROOT/train-clean-100}"
 TRAIN_SUBSET_DIR="${TRAIN_SUBSET_DIR:-data/LibriSpeech/train-clean-100_10h}"
 TRAIN_TARGET_MINUTES=600
 
-# recipe=sgmse (config/recipes.yaml): attack.weights becomes {identity: 0,
-# sgmse: 1} -- the generator trains against the real SGMSE speech-enhancement
-# attack instead of the default identity-only pass-through (see attacks.py:803
-# -- a zero-weight attack is never even a candidate for
-# SampledReconstructionAttack's random pick, so identity: 1.0 / sgmse: 0.0,
-# the default.yaml baseline, made this mathematically impossible before).
+# recipe=sgmse_mixed (config/recipes.yaml): attack.weights becomes
+# {identity: 0.5, sgmse: 0.5} -- half the steps train against the real SGMSE
+# speech-enhancement attack, half are unattacked identity steps (see that
+# recipe's comment for why not sgmse-only: no easy steps to anchor bit
+# accuracy on, and full exposure to SGMSE's own gradient instability). Either
+# way this is a real attack, not the default.yaml identity-only baseline
+# (attacks.py:803 -- a zero-weight attack is never even a candidate for
+# SampledReconstructionAttack's random pick, so identity: 1.0 / sgmse: 0.0
+# made a real attack mathematically impossible before this was set).
 # AudioLDM stays held out for eval (after_sgmse_training recipe), to measure
 # whether robustness generalizes to a diffusion attack never seen in training.
 # Same checkpoint path convention/default as run_diffusion_swap.sh.
@@ -111,13 +114,20 @@ build_subset "$VALID_SOURCE_DIR" "$VALID_SUBSET_DIR" "$VALID_TARGET_MINUTES"
 # eval_every=100: see the reasoning above VALID_TARGET_MINUTES -- ~167 eval
 # calls over the full ~16.7k-step run, each one a single forward-only batch,
 # negligible next to ~16.7k forward+backward train steps.
+# lambda_perc=0.0: perceptual loss off -- isolates detection_loss (presence +
+# bit) while debugging why bit_loss plateaus (see eval graphs from the
+# comic-snowball-9 run), so perceptual_loss's own gradient into x_wm can't
+# mask or compete with what detection_loss alone is doing. Not a permanent
+# default -- re-enable (drop this override) once detection-side training is
+# actually working, since perceptual quality still matters for the real run.
 set +e
 PYTHONUNBUFFERED=1 PYTHONPATH=src python3 -m audioseal_robust.train \
-  recipe=sgmse \
+  recipe=sgmse_mixed \
   attack.sgmse.checkpoint="$SGMSE_CHECKPOINT" \
   data.train_dir="$TRAIN_SUBSET_DIR" \
   data.valid_dir="$VALID_SUBSET_DIR" \
   eval_every=100 \
+  lambda_perc=0.0 \
   device=auto \
   2>&1 | tee "$LOG"
 STATUS=${PIPESTATUS[0]}
