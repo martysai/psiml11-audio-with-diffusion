@@ -75,7 +75,10 @@ class STFT(torch.nn.Module):
         real_part = forward_transform[:, :cutoff, :]
         imag_part = forward_transform[:, cutoff:, :]
 
-        magnitude = torch.sqrt(real_part**2 + imag_part**2)
+        # LOCAL CHANGE (see VENDORED.md): the 1e-12 floor keeps d|z|/dz finite
+        # at z=0. Invisible to the output -- dynamic_range_compression clamps
+        # at 1e-5, well above the 1e-6 magnitude this floor implies.
+        magnitude = torch.sqrt(real_part**2 + imag_part**2 + 1e-12)
         phase = torch.autograd.Variable(torch.atan2(imag_part.data, real_part.data))
 
         return magnitude, phase
@@ -170,7 +173,9 @@ class TacotronSTFT(torch.nn.Module):
         assert torch.max(y.data) <= 1, torch.max(y.data)
 
         magnitudes, phases = self.stft_fn.transform(y)
-        magnitudes = magnitudes.data.to(y.device)
+        # LOCAL CHANGE (see VENDORED.md): was `magnitudes.data`, which detaches
+        # and silently severs every gradient path from the mel back to `y`.
+        magnitudes = magnitudes.to(y.device)
         mel_output = torch.matmul(self.mel_basis.to(magnitudes.device), magnitudes)
         mel_output = self.spectral_normalize(mel_output, normalize_fun)
         energy = torch.norm(magnitudes, dim=1)

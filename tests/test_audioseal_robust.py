@@ -355,6 +355,51 @@ def test_diff_erase_attack_checkpoint_wrong_layout_fails_before_any_import(tmp_p
         DiffEraseAttack(checkpoint=str(fake_ckpt), config=str(fake_config))
 
 
+def _tacotron_stft():
+    """Skips unless the diff_erase extras are installed -- audioldm_train pulls
+    in pandas et al. (see requirements-diff-erase.txt), which the base
+    training/eval stack deliberately does not."""
+    stft = pytest.importorskip("audioldm_train.utilities.audio.stft")
+    return stft.TacotronSTFT(
+        filter_length=1024,
+        hop_length=160,
+        win_length=1024,
+        n_mel_channels=64,
+        sampling_rate=16_000,
+        mel_fmin=0,
+        mel_fmax=8000,
+    )
+
+
+def test_audioldm_mel_reaches_the_waveform():
+    """DiffEraseAttack is eval-only here, but making it trainable (the point of
+    the diff_erase training direction) requires this front-end to be
+    differentiable at all. `mel_spectrogram` used to call `.data`, which
+    detached -- so the mel came back with grad_fn None and the detection loss
+    silently stopped reaching the generator."""
+    wav = (torch.randn(1, 16_000) * 0.1).clamp(-1, 1).requires_grad_(True)
+
+    mel, *_ = _tacotron_stft().mel_spectrogram(wav)
+
+    assert mel.grad_fn is not None
+    mel.sum().backward()
+    assert wav.grad is not None
+    assert wav.grad.abs().sum() > 0
+
+
+def test_audioldm_mel_gradients_stay_finite_on_silence():
+    """Reconnecting the graph above exposes STFT.transform's
+    sqrt(real**2 + imag**2), whose derivative is infinite at exactly zero --
+    i.e. on digital silence, which every padded/clipped segment has."""
+    wav = torch.zeros(1, 16_000, requires_grad=True)
+
+    mel, *_ = _tacotron_stft().mel_spectrogram(wav)
+    mel.sum().backward()
+
+    assert wav.grad is not None
+    assert torch.isfinite(wav.grad).all()
+
+
 def test_build_eval_attacks_threads_per_attack_config_through():
     """Regression test: build_eval_attacks used to construct every attack
     with zero args, silently ignoring cfg.attack.* entirely (a config field
