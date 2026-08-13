@@ -6,15 +6,22 @@ cd "$(dirname "$0")"
 # couple minutes of validation audio, one epoch of a handful of steps.
 # Not a robustness number -- just "does the training loop actually run
 # without crashing", before committing to run_train_10h.sh's real run.
-TRAIN_SOURCE_DIR="<user-home>/Desktop/psiml/datasets/LibriSpeech/train-clean-100"
-TRAIN_SUBSET_DIR="<user-home>/Desktop/psiml/datasets/LibriSpeech/train-clean-100_smoke"
+#
+# DATASET_ROOT matches this server's known layout (see run_smoke_eval.sh /
+# run_diffusion_swap.sh for the same /data/... convention on the eval side).
+# Subset dirs default under the repo instead of DATASET_ROOT since the
+# dataset mount itself may not be writable -- override any of these via env
+# vars for a different layout (e.g. Colab/local, see run_diffusion_swap.sh).
+DATASET_ROOT="${DATASET_ROOT:-/data/datasets/LibriSpeech}"
+TRAIN_SOURCE_DIR="${TRAIN_SOURCE_DIR:-$DATASET_ROOT/train-clean-100}"
+TRAIN_SUBSET_DIR="${TRAIN_SUBSET_DIR:-data/LibriSpeech/train-clean-100_smoke}"
 TRAIN_TARGET_MINUTES=3
 
 # Validation is on (eval_every set below) -- separate held-out split
 # (dev-clean, never in train-clean-100) so eval_step measures something
 # meaningful rather than re-scoring the training set under a different name.
-VALID_SOURCE_DIR="<user-home>/Desktop/psiml/datasets/LibriSpeech/dev-clean"
-VALID_SUBSET_DIR="<user-home>/Desktop/psiml/datasets/LibriSpeech/dev-clean_smoke"
+VALID_SOURCE_DIR="${VALID_SOURCE_DIR:-$DATASET_ROOT/dev-clean}"
+VALID_SUBSET_DIR="${VALID_SUBSET_DIR:-data/LibriSpeech/dev-clean_smoke}"
 VALID_TARGET_MINUTES=2
 
 mkdir -p logs
