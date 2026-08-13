@@ -191,8 +191,29 @@ def train_step(
     #    randomly sampled target watermark SNR -- see embed_watermark.
     x_wm = embed_watermark(generator, x, message, cfg.watermark_snr_db_min, cfg.watermark_snr_db_max)
 
+    # Activation-gradient probes: register_hook fires during backward() with
+    # the gradient AT that point in the graph, before it continues further
+    # back. x_wm sits right at the generator/attack boundary -- its grad norm
+    # is the actual signal reaching the generator after passing back through
+    # the whole frozen detector+attack backbone, so if it's ~0 the backbone
+    # is killing the gradient regardless of what grad_norm_generator (the
+    # PARAMETER gradient, downstream of this) shows. x_att (attack/detector
+    # boundary) isolates which half of the backbone is responsible: compare
+    # against x_wm's norm -- a big drop across attack vs across detector
+    # tells you which one is the vanishing point.
+    activation_grad_norms: tp.Dict[str, float] = {}
+
+    def _capture_activation_grad_norm(name: str) -> tp.Callable[[torch.Tensor], None]:
+        def hook(grad: torch.Tensor) -> None:
+            activation_grad_norms[name] = grad.detach().float().norm(2).item()
+
+        return hook
+
+    x_wm.register_hook(_capture_activation_grad_norm("x_wm"))
+
     # 2. sampled reconstruction attack (frozen, graph stays connected)
     x_att, attack_name = attack(x_wm)
+    x_att.register_hook(_capture_activation_grad_norm("x_att"))
 
     # 3. frozen detector: presence (B,2,T) softmax probs, message (B,nbits) sigmoid probs
     presence, m_hat = detector.forward(x_att)
@@ -221,6 +242,8 @@ def train_step(
         "presence_prob": p.mean().item(),
         "grad_norm_generator": grad_norm_generator,
         "grad_norm_attack": grad_norm_attack,
+        "grad_norm_x_wm": activation_grad_norms.get("x_wm", 0.0),
+        "grad_norm_x_att": activation_grad_norms.get("x_att", 0.0),
         "attack": attack_name,
     }
 
