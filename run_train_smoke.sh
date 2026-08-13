@@ -24,6 +24,15 @@ VALID_SOURCE_DIR="${VALID_SOURCE_DIR:-$DATASET_ROOT/dev-clean}"
 VALID_SUBSET_DIR="${VALID_SUBSET_DIR:-data/LibriSpeech/dev-clean_smoke}"
 VALID_TARGET_MINUTES=2
 
+# recipe=sgmse, same checkpoint path convention/default as run_train_10h.sh --
+# smoke-tests the actual attack path run_train_10h.sh will use, not just the
+# default identity-only pass-through.
+SGMSE_CHECKPOINT="${SGMSE_CHECKPOINT:-/data/checkpoints/sgmse/sgmse_vb_pretrained.ckpt}"
+if [ ! -f "$SGMSE_CHECKPOINT" ]; then
+  echo "SGMSE_CHECKPOINT not found at $SGMSE_CHECKPOINT -- set SGMSE_CHECKPOINT to a real path" >&2
+  exit 1
+fi
+
 mkdir -p logs
 LOG="logs/train_smoke_$(date +%Y%m%d_%H%M%S).log"
 echo "logging to $LOG (tail -f $LOG to follow live, or just check it later)"
@@ -83,6 +92,8 @@ build_subset "$VALID_SOURCE_DIR" "$VALID_SUBSET_DIR" "$VALID_TARGET_MINUTES"
 # checkpoint_dir is separate from the real run's so this never clobbers it.
 set +e
 PYTHONUNBUFFERED=1 PYTHONPATH=src python3 -m audioseal_robust.train \
+  recipe=sgmse \
+  attack.sgmse.checkpoint="$SGMSE_CHECKPOINT" \
   data.train_dir="$TRAIN_SUBSET_DIR" \
   data.valid_dir="$VALID_SUBSET_DIR" \
   data.batch_size=2 \

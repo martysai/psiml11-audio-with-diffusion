@@ -27,7 +27,7 @@ TRAIN_TARGET_MINUTES=600
 # AudioLDM stays held out for eval (after_sgmse_training recipe), to measure
 # whether robustness generalizes to a diffusion attack never seen in training.
 # Same checkpoint path convention/default as run_diffusion_swap.sh.
-SGMSE_CHECKPOINT="${SGMSE_CHECKPOINT:-checkpoints/sgmse/train_vb_29nqe0uh_epoch=115.ckpt}"
+SGMSE_CHECKPOINT="${SGMSE_CHECKPOINT:-/data/checkpoints/sgmse/sgmse_vb_pretrained.ckpt}"
 if [ ! -f "$SGMSE_CHECKPOINT" ]; then
   echo "SGMSE_CHECKPOINT not found at $SGMSE_CHECKPOINT -- set SGMSE_CHECKPOINT to a real path" >&2
   exit 1
