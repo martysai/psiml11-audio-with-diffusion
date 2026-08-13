@@ -50,7 +50,7 @@ from .device import resolve_device
 from .metrics import bit_accuracy, confusion_counts, f1_score, pesq_score, sisnr_score, tpr_at_fpr, visqol_score
 from .model_init import build_untrained_generator
 from .plotting import plot_confusion_matrices, plot_robustness_curve
-from .train import random_message
+from .train import embed_watermark, random_message
 from .tracking import build_tracker
 
 logger = logging.getLogger(__name__)
@@ -206,8 +206,11 @@ def evaluate_attack(
         x = batch.to(device)
         message = random_message(cfg.nbits, x.size(0), device=device)
 
-        watermark = generator.get_watermark(x, message=message)
-        x_wm = x + watermark
+        # Same SNR-targeted scaling train.py optimizes against (see
+        # embed_watermark) -- NOT raw x + get_watermark(), which would
+        # measure detection at whatever amplitude get_watermark() happens to
+        # produce unscaled, an operating point training never sees.
+        x_wm = embed_watermark(generator, x, message, cfg.watermark_snr_db, cfg.watermark_snr_db)
 
         x_att_pos = attack(x_wm, strength=strength)
         x_att_neg = attack(x, strength=strength)
@@ -250,7 +253,9 @@ def evaluate_perceptual(
 
         x = batch.to(device)
         message = random_message(cfg.nbits, x.size(0), device=device)
-        x_wm = x + generator.get_watermark(x, message=message)
+        # Same SNR-targeted scaling as evaluate_attack -- see the comment
+        # there.
+        x_wm = embed_watermark(generator, x, message, cfg.watermark_snr_db, cfg.watermark_snr_db)
 
         if cfg.compute_sisnr:
             sisnr_values.append(sisnr_score(x, x_wm))
