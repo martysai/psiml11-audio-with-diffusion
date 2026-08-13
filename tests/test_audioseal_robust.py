@@ -50,7 +50,7 @@ from audioseal_robust.evaluate import (
     prepare_eval_batches,
 )
 from audioseal_robust.losses import PsychoacousticMelLoss, detection_loss
-from audioseal_robust.train import embed_watermark
+from audioseal_robust.train import CudaMemoryProbe, embed_watermark
 
 
 def _tiny_seanet_config() -> SEANetConfig:
@@ -531,3 +531,63 @@ def test_build_eval_attacks_construction_failure_is_skipped_not_fatal():
     assert "audioldm" not in attacks
     assert "config" in skipped["audioldm"]
     assert attacks["identity"] is not None
+
+
+def test_cuda_memory_probe_emits_nothing_off_cuda():
+    """train_step calls the probe unconditionally, so on a CPU box (tests,
+    laptops) it has to stay silent rather than crash or emit zeros that would
+    pollute the dashboard with a meaningless flat line."""
+    probe = CudaMemoryProbe(torch.device("cpu"))
+    probe.start()
+    probe.mark_forward_end()
+    probe.mark_backward_end()
+    assert probe.metrics() == {}
+
+
+def test_cuda_memory_probe_respects_the_disable_flag():
+    # torch.device("cuda") is just a descriptor -- constructing it touches no
+    # runtime, so this exercises the tracking.log_memory=false gate on any box.
+    probe = CudaMemoryProbe(torch.device("cuda"), enabled=False)
+    probe.start()
+    probe.mark_forward_end()
+    probe.mark_backward_end()
+    assert probe.metrics() == {}
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
+def test_cuda_memory_probe_sees_checkpointing_shrink_activations():
+    """The whole point of the mem/ metrics: they must actually distinguish a
+    checkpointed graph from an uncheckpointed one, which the reserved-memory
+    numbers on wandb's system panels cannot."""
+    device = torch.device("cuda")
+    layer = torch.nn.Linear(1024, 1024).to(device)
+
+    def _block(h: torch.Tensor) -> torch.Tensor:
+        for _ in range(8):
+            h = torch.relu(layer(h))
+        return h
+
+    def run(use_checkpoint: bool) -> dict:
+        x = torch.randn(256, 1024, device=device, requires_grad=True)
+        probe = CudaMemoryProbe(device)
+        probe.start()
+        h = x
+        for _ in range(8):
+            h = torch.utils.checkpoint.checkpoint(_block, h, use_reentrant=False) if use_checkpoint else _block(h)
+        loss = h.sum()
+        probe.mark_forward_end()
+        loss.backward()
+        probe.mark_backward_end()
+        return probe.metrics()
+
+    plain = run(use_checkpoint=False)
+    checkpointed = run(use_checkpoint=True)
+
+    assert set(plain) == {
+        "mem/forward_peak_gib",
+        "mem/activations_gib",
+        "mem/backward_peak_gib",
+        "mem/reserved_gib",
+    }
+    assert checkpointed["mem/activations_gib"] < plain["mem/activations_gib"] / 2
+    assert checkpointed["mem/forward_peak_gib"] < plain["mem/forward_peak_gib"]
