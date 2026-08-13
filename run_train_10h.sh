@@ -18,6 +18,21 @@ TRAIN_SOURCE_DIR="${TRAIN_SOURCE_DIR:-$DATASET_ROOT/train-clean-100}"
 TRAIN_SUBSET_DIR="${TRAIN_SUBSET_DIR:-data/LibriSpeech/train-clean-100_10h}"
 TRAIN_TARGET_MINUTES=600
 
+# recipe=sgmse (config/recipes.yaml): attack.weights becomes {identity: 0,
+# sgmse: 1} -- the generator trains against the real SGMSE speech-enhancement
+# attack instead of the default identity-only pass-through (see attacks.py:803
+# -- a zero-weight attack is never even a candidate for
+# SampledReconstructionAttack's random pick, so identity: 1.0 / sgmse: 0.0,
+# the default.yaml baseline, made this mathematically impossible before).
+# AudioLDM stays held out for eval (after_sgmse_training recipe), to measure
+# whether robustness generalizes to a diffusion attack never seen in training.
+# Same checkpoint path convention/default as run_diffusion_swap.sh.
+SGMSE_CHECKPOINT="${SGMSE_CHECKPOINT:-checkpoints/sgmse/train_vb_29nqe0uh_epoch=115.ckpt}"
+if [ ! -f "$SGMSE_CHECKPOINT" ]; then
+  echo "SGMSE_CHECKPOINT not found at $SGMSE_CHECKPOINT -- set SGMSE_CHECKPOINT to a real path" >&2
+  exit 1
+fi
+
 # Validation: dev-clean (never in train-clean-100, so eval_step measures
 # something meaningful instead of re-scoring the training set under a
 # different name). 60min target -- see the reasoning this was picked with:
@@ -25,11 +40,16 @@ TRAIN_TARGET_MINUTES=600
 #     EXACT batch sequence from one pass and replays it unchanged forever --
 #     it does not reshuffle -- so the subset size sets how many DISTINCT
 #     batches exist before eval starts re-scoring ones it already saw.
-#   - default epochs=100 * updates_per_epoch=1000 = 100k training steps;
-#     at eval_every=500 (below) that's 200 eval calls over the full run.
+#   - epochs=100 * updates_per_epoch=1000 is only a CAP per epoch, not a
+#     guarantee: the inner loop breaks once the dataloader itself is
+#     exhausted, whichever comes first. Measured on this exact 10h subset
+#     (~2921 files / batch_size=16, drop_last=True): ~167 steps/epoch, so
+#     ~16,700 steps total, not 100k -- confirmed from a real run's wandb log
+#     (step=16700 at epoch=99). At eval_every=100 (below) that's ~167 eval
+#     calls over the full run.
 #   - 60min of dev-clean (~574 files at this dataset's measured ~6.27s/file
 #     average) / batch_size=16 = ~35 distinct cached batches, so each is
-#     revisited ~200/35 ~ 6x over the run rather than a handful of batches
+#     revisited ~167/35 ~ 5x over the run rather than a handful of batches
 #     being hammered hundreds of times. ~21% of dev-clean's ~4.7h total,
 #     leaving the rest free for anything else that might want it later.
 VALID_SOURCE_DIR="${VALID_SOURCE_DIR:-$DATASET_ROOT/dev-clean}"
@@ -88,14 +108,16 @@ build_subset "$VALID_SOURCE_DIR" "$VALID_SUBSET_DIR" "$VALID_TARGET_MINUTES"
 # PYTHONUNBUFFERED/tee/PIPESTATUS: see run_full_eval_1h.sh's comment on the
 # same pattern -- keeps the log file live-updating and preserves python's
 # real exit code through the pipe.
-# eval_every=500: see the reasoning above VALID_TARGET_MINUTES -- 200 eval
-# calls over the full 100k-step run, each one a single forward-only batch,
-# negligible next to 100k forward+backward train steps.
+# eval_every=100: see the reasoning above VALID_TARGET_MINUTES -- ~167 eval
+# calls over the full ~16.7k-step run, each one a single forward-only batch,
+# negligible next to ~16.7k forward+backward train steps.
 set +e
 PYTHONUNBUFFERED=1 PYTHONPATH=src python3 -m audioseal_robust.train \
+  recipe=sgmse \
+  attack.sgmse.checkpoint="$SGMSE_CHECKPOINT" \
   data.train_dir="$TRAIN_SUBSET_DIR" \
   data.valid_dir="$VALID_SUBSET_DIR" \
-  eval_every=500 \
+  eval_every=100 \
   device=auto \
   2>&1 | tee "$LOG"
 STATUS=${PIPESTATUS[0]}

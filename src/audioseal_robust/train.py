@@ -350,6 +350,17 @@ def train(cfg: TrainConfig) -> None:
     try:
         for epoch in range(cfg.epochs):
             progress = tqdm(total=cfg.updates_per_epoch, desc=f"epoch {epoch}", unit="step", leave=False)
+            # epoch_step (not the global `step`) drives the break below: `step`
+            # never resets, so gating the break on step % updates_per_epoch
+            # truncates epochs whenever the dataloader's own natural length
+            # doesn't evenly divide updates_per_epoch (e.g. a small train_dir
+            # with fewer batches/epoch than the cap) -- the global count drifts
+            # out of phase with epoch boundaries and can cross a multiple of
+            # updates_per_epoch mid-epoch, cutting it short well before its own
+            # ~len(dataloader) steps. epoch_step ties the break to THIS epoch's
+            # own progress instead, so every epoch runs the same
+            # min(len(dataloader), updates_per_epoch) steps, consistently.
+            epoch_step = 0
             for batch in dataloader:
                 metrics = train_step(generator, detector, attack, perceptual_loss_fn, optimizer, batch, cfg, device)
                 scalar_metrics = {k: v for k, v in metrics.items() if isinstance(v, (int, float))}
@@ -377,7 +388,8 @@ def train(cfg: TrainConfig) -> None:
                 if step % cfg.log_every == 0:
                     logger.info("epoch=%d step=%d %s", epoch, step, metrics)
                 step += 1
-                if step % cfg.updates_per_epoch == 0:
+                epoch_step += 1
+                if epoch_step >= cfg.updates_per_epoch:
                     break
 
             progress.close()
