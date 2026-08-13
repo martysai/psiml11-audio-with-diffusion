@@ -21,10 +21,23 @@ azureml/
 
 ## One-time setup
 
+The workspace this was set up against:
+
+| | |
+|---|---|
+| subscription | `5c9e4789-4852-4ffe-8551-d682affcbd74` (ASG Azure ML) |
+| resource group | `playground-rg` |
+| workspace | `as-playground-w3-ws` (westus3) |
+| compute | `a100x1` — `STANDARD_NC24ADS_A100_V4`, 1× A100 80GB |
+
+`a100x1`, not `a100x2`/`a100x4`: nothing in this project is distributed, so the
+larger clusters would leave GPUs idle.
+
 ```bash
 az login
 az extension add -n ml
-az configure --defaults group=<resource-group> workspace=<workspace>
+az account set --subscription 5c9e4789-4852-4ffe-8551-d682affcbd74
+az configure --defaults group=playground-rg workspace=as-playground-w3-ws
 
 az ml data create -f azureml/assets/librispeech.yaml
 az ml model create -f azureml/assets/diffusion_checkpoints.yaml
@@ -43,8 +56,8 @@ az ml data create -f azureml/assets/librispeech.yaml --path /some/other/LibriSpe
 Either the static YAML:
 
 ```bash
-az ml job create -f azureml/jobs/train_sgmse.yaml --set compute=azureml:<cluster>
-az ml job create -f azureml/jobs/train_diff_erase.yaml --set compute=azureml:<cluster>
+az ml job create -f azureml/jobs/train_sgmse.yaml
+az ml job create -f azureml/jobs/train_diff_erase.yaml
 ```
 
 or the config-driven submitter, which is the better fit once you start sweeping

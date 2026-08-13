@@ -7,13 +7,15 @@
 # Leave `workspace` commented out to use whatever `az configure --defaults`
 # / config.json already points at. Fill it in to pin the submission to one
 # workspace regardless of local CLI state.
-# workspace:
-#   subscription_id: 00000000-0000-0000-0000-000000000000
-#   resource_group_name: playground-rg
-#   workspace_name: playground-ws
+workspace:
+  subscription_id: 5c9e4789-4852-4ffe-8551-d682affcbd74  # ASG Azure ML
+  resource_group_name: playground-rg
+  workspace_name: as-playground-w3-ws
 
 direction: sgmse
-compute: a100-cluster
+# STANDARD_NC24ADS_A100_V4 -- 1x A100 80GB. Nothing here is distributed, so
+# the a100x2/a100x4 clusters would just leave GPUs idle.
+compute: a100x1
 environment: azureml:audioseal-robust-diffusion@latest
 
 experiment_name: audioseal-robust-diffusion-swap

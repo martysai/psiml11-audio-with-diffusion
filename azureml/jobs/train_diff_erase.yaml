@@ -16,7 +16,7 @@ description: >-
 
 code: ../..
 environment: azureml:audioseal-robust-diffusion@latest
-compute: azureml:a100-cluster
+compute: azureml:a100x1
 
 inputs:
   librispeech:
