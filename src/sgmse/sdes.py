@@ -78,13 +78,19 @@ class SDE(abc.ABC):
         Args:
             x: a torch tensor
             t: a torch float representing the time step (from 0 to `self.T`)
+            stepsize: a scalar, or a per-example 1-D tensor of shape (batch,)
 
         Returns:
             f, G
         """
         dt = stepsize
         drift, diffusion = self.sde(x, y, t)
-        f = drift * dt
+        # LOCAL CHANGE (see VENDORED.md): batch-broadcast a per-example dt so
+        # every item can integrate its own time grid. `diffusion` is already
+        # (batch,), so only the drift term needs the extra dims; a scalar dt
+        # takes the original path untouched.
+        dt_drift = batch_broadcast(dt, drift) if torch.is_tensor(dt) and dt.dim() > 0 else dt
+        f = drift * dt_drift
         G = diffusion * torch.sqrt(dt)
         return f, G
 

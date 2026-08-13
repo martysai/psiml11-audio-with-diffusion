@@ -180,14 +180,21 @@ class SGMSEAttack(nn.Module):
 
     `strength` (the t* robustness-curve axis, see evaluate.py): t*=0 means
     "no corruption" (~identity); t*=1 means starting from the SDE's full
-    prior (maximum corruption before regeneration). NOTE: `t_star_grid`'s
-    default values in config.py were calibrated against DiffErase's DDPM
-    (T=1000 discrete steps) using the mentor's timestep table -- SGMSE's
-    noise schedule (OU-VE SDE, continuous t in [t_eps, 1]) is a different
-    process, so the same strength fractions likely correspond to a
-    different *qualitative* corruption level here. Not yet recalibrated
+    prior (maximum corruption before regeneration). Passing None samples a
+    *separate* t* for every item in the batch, so one training step covers a
+    spread of the curve rather than a single point; passing a float pins the
+    whole batch to it, which is what evaluate.py's per-t* measurements need.
+    NOTE: `t_star_grid`'s default values in config.py were calibrated against
+    DiffErase's DDPM (T=1000 discrete steps) using the mentor's timestep
+    table -- SGMSE's noise schedule (OU-VE SDE, continuous t in [t_eps, 1])
+    is a different process, so the same strength fractions likely correspond
+    to a different *qualitative* corruption level here. Not yet recalibrated
     empirically for SGMSE specifically.
     """
+
+    # Magnitude floor for the STFT amplitude transforms below. Only bites
+    # where the spectrogram is essentially silent, and only on the gradient.
+    _MAG_EPS = 1e-8
 
     def __init__(
         self,
@@ -200,6 +207,11 @@ class SGMSEAttack(nn.Module):
         self.checkpoint = checkpoint
         self.num_steps = num_steps
         self._model: tp.Optional[nn.Module] = None
+        # Overwritten from the checkpoint's own data module in _load_backbone;
+        # these are SpecsDataModule's defaults.
+        self._transform_type = "exponent"
+        self._spec_abs_exponent = 0.5
+        self._spec_factor = 0.15
         if checkpoint is not None:
             self._load_backbone(checkpoint)
 
@@ -226,10 +238,52 @@ class SGMSEAttack(nn.Module):
         for p in model.parameters():
             p.requires_grad_(False)
         self._model = model
+        data_module = model.data_module
+        self._transform_type = data_module.transform_type
+        self._spec_abs_exponent = float(data_module.spec_abs_exponent)
+        self._spec_factor = float(data_module.spec_factor)
+
+    def _magnitude(self, spec: torch.Tensor) -> torch.Tensor:
+        """|spec|, but smooth at the origin: `torch.abs` on a complex tensor
+        backprops z/|z|, which is NaN at z=0. This is 0 there instead."""
+        return torch.sqrt(spec.real.pow(2) + spec.imag.pow(2) + self._MAG_EPS**2)
+
+    def _spec_fwd(self, spec: torch.Tensor) -> torch.Tensor:
+        """`SpecsDataModule.spec_fwd`, rewritten so it can be backpropagated
+        through. Upstream computes `|z|**e * exp(1j*angle(z))`, which is
+        algebraically just `z * |z|**(e-1)` but, routed through abs()/angle(),
+        has an unbounded gradient as |z| -> 0 (e = 0.5 by default) and a NaN
+        one at exactly 0 -- i.e. on any silent STFT bin. Upstream never
+        notices because its sampler runs entirely under torch.no_grad (see
+        sgmse.sampling.get_pc_sampler); this attack is trained against, so it
+        cannot."""
+        if self._transform_type == "exponent":
+            if self._spec_abs_exponent != 1:
+                spec = spec * self._magnitude(spec).pow(self._spec_abs_exponent - 1)
+            return spec * self._spec_factor
+        if self._transform_type == "log":
+            magnitude = self._magnitude(spec)
+            return spec * (torch.log1p(magnitude) / magnitude) * self._spec_factor
+        return spec
+
+    def _spec_back(self, spec: torch.Tensor) -> torch.Tensor:
+        """Inverse of `_spec_fwd`, rewritten the same way -- `to_audio` routes
+        through the same abs()/angle() pair on the way out."""
+        if self._transform_type == "exponent":
+            spec = spec / self._spec_factor
+            if self._spec_abs_exponent != 1:
+                spec = spec * self._magnitude(spec).pow(1 / self._spec_abs_exponent - 1)
+            return spec
+        if self._transform_type == "log":
+            spec = spec / self._spec_factor
+            magnitude = self._magnitude(spec)
+            return spec * (torch.expm1(magnitude) / magnitude)
+        return spec
 
     def forward(self, x: torch.Tensor, strength: tp.Optional[float] = None) -> torch.Tensor:
-        """`strength` is t* in [0, 1] (see class docstring); None means
-        "sample it randomly", which is what training should do."""
+        """`strength` is t* in [0, 1] (see class docstring). None means "draw
+        one per example", which is what training should do; a float pins the
+        whole batch to that t*, which is what evaluate.py's curve needs."""
         if self._model is None:
             raise NotImplementedError(
                 "SGMSEAttack was constructed without a checkpoint (see TODO "
@@ -237,19 +291,24 @@ class SGMSEAttack(nn.Module):
                 "attack.sgmse.checkpoint or set attack.weights.sgmse=0 in the "
                 "config to keep it disabled."
             )
-        if strength is None:
-            strength = random.random()
-        strength = float(min(max(strength, 0.0), 1.0))
 
         from sgmse.sampling.correctors import CorrectorRegistry
         from sgmse.sampling.predictors import PredictorRegistry
         from sgmse.util.other import pad_spec
 
         device = x.device
+        batch_size = x.shape[0]
         sde = self._model.sde.copy()
         sde.N = self.num_steps
         eps = self._model.t_eps
-        t_star = eps + strength * (sde.T - eps)
+
+        if strength is None:
+            strengths = torch.rand(batch_size, device=device)
+        else:
+            strengths = torch.full(
+                (batch_size,), float(min(max(strength, 0.0), 1.0)), device=device
+            )
+        t_star = eps + strengths * (sde.T - eps)  # (B,)
 
         orig_len = x.shape[-1]
         wav = x.squeeze(1)  # (B, T)
@@ -259,15 +318,14 @@ class SGMSEAttack(nn.Module):
         norm_factor = wav.abs().amax(dim=-1, keepdim=True).clamp_min(1e-8)
         wav = wav / norm_factor
 
-        Y = self._model._forward_transform(self._model._stft(wav)).unsqueeze(1)  # (B, 1, F, T_frames)
+        Y = self._spec_fwd(self._model._stft(wav)).unsqueeze(1)  # (B, 1, F, T_frames)
         Y = pad_spec(Y)
 
         # Forward-corrupt Y to t_star via the SDE's own marginal_prob. With
         # x0=y=Y (see class docstring), the mean term is exactly Y, so this
         # is "Y plus std(t_star)-scaled Gaussian noise" -- the SDE analogue
         # of DiffEraseAttack's q_sample.
-        vec_t_star = torch.full((Y.shape[0],), t_star, device=device)
-        mean, std = sde.marginal_prob(Y, Y, vec_t_star)
+        mean, std = sde.marginal_prob(Y, Y, t_star)
         xt = mean + std[:, None, None, None] * torch.randn_like(Y)
         xt_mean = xt
 
@@ -279,15 +337,19 @@ class SGMSEAttack(nn.Module):
         # for the reference this replicates. Deliberately NOT wrapped in
         # torch.no_grad() (see class docstring: this attack must stay
         # differentiable for training).
-        timesteps = torch.linspace(t_star, eps, self.num_steps, device=device)
+        # (B, num_steps): row b is that example's own linspace(t_star[b], eps).
+        ramp = torch.linspace(1.0, 0.0, self.num_steps, device=device)
+        timesteps = eps + (t_star[:, None] - eps) * ramp[None, :]
         for i in range(self.num_steps):
-            t = timesteps[i]
-            stepsize = t - timesteps[i + 1] if i != self.num_steps - 1 else timesteps[-1]
-            vec_t = torch.full((Y.shape[0],), t.item(), device=device)
+            vec_t = timesteps[:, i]
+            if i != self.num_steps - 1:
+                stepsize = vec_t - timesteps[:, i + 1]
+            else:
+                stepsize = timesteps[:, -1]  # from eps to 0, as in the reference
             xt, xt_mean = corrector.update_fn(xt, Y, vec_t)
             xt, xt_mean = predictor.update_fn(xt, Y, vec_t, stepsize)
 
-        x_hat = self._model.to_audio(xt_mean.squeeze(1), orig_len)
+        x_hat = self._model._istft(self._spec_back(xt_mean.squeeze(1)), orig_len)
         x_hat = x_hat * norm_factor
         return x_hat.unsqueeze(1).to(x.dtype)
 
