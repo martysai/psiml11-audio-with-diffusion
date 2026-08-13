@@ -97,7 +97,7 @@ attack:
     bandwidth: 3.0
 
 tracking:
-  backend: mlflow
+  backend: wandb
   project: audioseal-robust-eval
   run_name: null
   mlflow_tracking_uri: null

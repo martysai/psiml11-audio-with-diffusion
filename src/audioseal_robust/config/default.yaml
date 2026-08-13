@@ -77,7 +77,7 @@ data:
   num_workers: 4
 
 tracking:
-  backend: mlflow
+  backend: wandb
   project: audioseal-robust
   run_name: null
   mlflow_tracking_uri: null
