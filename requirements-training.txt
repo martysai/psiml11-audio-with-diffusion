@@ -4,7 +4,7 @@
 #
 # This file covers the identity and sgmse attacks. The two held-out
 # diffusion attacks each need their own extra file on top of this one:
-#   requirements-diff-erase.txt  -- diff_erase (AudioLDM)
+#   requirements-audioldm.txt    -- audioldm (AudioLDM latent diffusion)
 #   requirements-mbd.txt         -- mbd (MultiBand Diffusion)
 
 torchaudio>=2.1.0
@@ -39,7 +39,7 @@ librosa               # sgmse/util/other.py, data_module.py
 scipy                 # sgmse/sampling, sdes.py
 pytorch_lightning     # sgmse/model.py: ScoreModel is a LightningModule
 
-# DiffEraseAttack (the diff_erase held-out attack) needs src/audioldm_train/
+# AudioLDMAttack (the audioldm attack) needs src/audioldm_train/
 # (vendored, see that directory's VENDORED.md) -- its dependencies are listed
 # separately in requirements-diff-erase.txt, since they're a much heavier,
 # diffusion-model-specific stack that the rest of this project doesn't need.
