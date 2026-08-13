@@ -197,10 +197,19 @@ esac
 # NPROC and optim.lr is NOT rescaled automatically (see docs/MULTI_GPU.md).
 if [ -z "${NPROC:-}" ]; then
   if command -v nvidia-smi >/dev/null 2>&1; then
-    NPROC="$(nvidia-smi -L 2>/dev/null | grep -c '^GPU ' || echo 1)"
-  else
-    NPROC=1
+    # `|| true`, not `|| echo 1`: grep -c already prints "0" when it matches
+    # nothing and *also* exits 1, so the fallback would append to it and leave
+    # NPROC as the two-line string "0\n1" -- which then makes the -gt test below
+    # die with "integer expression expected" at exactly the moment someone is
+    # trying to work out why they only got one GPU.
+    NPROC="$(nvidia-smi -L 2>/dev/null | grep -c '^GPU ' || true)"
   fi
+fi
+case "${NPROC:-}" in
+  '' | *[!0-9]*) NPROC=1 ;;
+esac
+if [ "$NPROC" -lt 1 ]; then
+  NPROC=1
 fi
 if [ "$NPROC" -gt 1 ]; then
   # --standalone: single node, rendezvous over localhost. Multi-node would
