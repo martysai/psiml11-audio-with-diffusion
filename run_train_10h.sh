@@ -8,8 +8,14 @@ cd "$(dirname "$0")"
 # .flac/.wav under it -- it has no built-in "first N hours" cutoff, so we
 # build a subset directory of symlinks into the real dataset first and point
 # training at that instead of the full ~100h corpus.
-TRAIN_SOURCE_DIR="/Users/djina/Desktop/psiml/datasets/LibriSpeech/train-clean-100"
-TRAIN_SUBSET_DIR="/Users/djina/Desktop/psiml/datasets/LibriSpeech/train-clean-100_10h"
+# DATASET_ROOT matches this server's known layout (see run_smoke_eval.sh /
+# run_diffusion_swap.sh for the same /data/... convention on the eval side).
+# Subset dirs default under the repo instead of DATASET_ROOT since the
+# dataset mount itself may not be writable -- override any of these via env
+# vars for a different layout (e.g. Colab/local, see run_diffusion_swap.sh).
+DATASET_ROOT="${DATASET_ROOT:-/data/datasets/LibriSpeech}"
+TRAIN_SOURCE_DIR="${TRAIN_SOURCE_DIR:-$DATASET_ROOT/train-clean-100}"
+TRAIN_SUBSET_DIR="${TRAIN_SUBSET_DIR:-data/LibriSpeech/train-clean-100_10h}"
 TRAIN_TARGET_MINUTES=600
 
 # Validation: dev-clean (never in train-clean-100, so eval_step measures
@@ -26,8 +32,8 @@ TRAIN_TARGET_MINUTES=600
 #     revisited ~200/35 ~ 6x over the run rather than a handful of batches
 #     being hammered hundreds of times. ~21% of dev-clean's ~4.7h total,
 #     leaving the rest free for anything else that might want it later.
-VALID_SOURCE_DIR="/Users/djina/Desktop/psiml/datasets/LibriSpeech/dev-clean"
-VALID_SUBSET_DIR="/Users/djina/Desktop/psiml/datasets/LibriSpeech/dev-clean_60min"
+VALID_SOURCE_DIR="${VALID_SOURCE_DIR:-$DATASET_ROOT/dev-clean}"
+VALID_SUBSET_DIR="${VALID_SUBSET_DIR:-data/LibriSpeech/dev-clean_60min}"
 VALID_TARGET_MINUTES=60
 
 mkdir -p logs
