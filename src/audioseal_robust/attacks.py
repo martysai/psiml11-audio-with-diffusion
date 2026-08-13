@@ -831,9 +831,20 @@ class SampledReconstructionAttack(nn.Module):
     any) never receive gradients and are never touched by the optimizer, but
     the forward computation stays part of the autograd graph so gradients
     flow back through it to its input.
+
+    Pass `rng` to control where the branch draw comes from. Under DDP the
+    draw must agree across ranks (branch costs differ by orders of magnitude
+    and DDP syncs at every backward, so a disagreement makes every step cost
+    the most expensive branch any rank picked) -- see
+    distributed.attack_sampling_rng.
     """
 
-    def __init__(self, attacks: tp.Dict[str, nn.Module], weights: tp.Dict[str, float]):
+    def __init__(
+        self,
+        attacks: tp.Dict[str, nn.Module],
+        weights: tp.Dict[str, float],
+        rng: tp.Optional[random.Random] = None,
+    ):
         super().__init__()
         assert set(attacks.keys()) == set(weights.keys()), (
             f"attacks {sorted(attacks.keys())} and weights "
@@ -849,6 +860,12 @@ class SampledReconstructionAttack(nn.Module):
 
         self._names = [n for n, w in weights.items() if w > 0]
         self._sampling_weights = [weights[n] for n in self._names]
+        # None -> the global `random` module, i.e. exactly the previous
+        # behavior. Under DDP, train.py passes an identically-seeded
+        # `random.Random` so every rank draws the SAME branch each step --
+        # see distributed.attack_sampling_rng for why that has to be shared
+        # when nothing else is.
+        self._rng: random.Random = rng if rng is not None else tp.cast(random.Random, random)
 
     def train(self, mode: bool = True) -> "SampledReconstructionAttack":
         # Keep the outer module's `.training` flag consistent with the rest of
@@ -870,7 +887,7 @@ class SampledReconstructionAttack(nn.Module):
         strength-aware attack should sample its own random t* per call in
         that case, which is what should give robustness across attack
         strengths rather than at a single fixed one."""
-        name = random.choices(self._names, weights=self._sampling_weights, k=1)[0]
+        name = self._rng.choices(self._names, weights=self._sampling_weights, k=1)[0]
         attack = self.attacks[name]
         # No torch.no_grad() and no .detach() here: see module docstring.
         x_att = attack(x_wm, strength=strength)

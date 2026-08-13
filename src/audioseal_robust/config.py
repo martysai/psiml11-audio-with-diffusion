@@ -170,8 +170,13 @@ class DataConfig:
     # training-set fit again under a different name.
     valid_dir: tp.Optional[str] = None
     segment_duration: float = 1.0  # seconds
+    # PER GPU under torchrun (standard DDP convention): with
+    # --nproc_per_node=4 this is 16 examples on each of 4 GPUs, i.e. an
+    # effective batch of 64. The learning rate is NOT rescaled automatically
+    # -- see docs/MULTI_GPU.md for why that is left as a deliberate choice
+    # rather than a silent one.
     batch_size: int = 16
-    num_workers: int = 4
+    num_workers: int = 4  # per rank: a 4-GPU run spawns 4 x this many loader processes
 
 
 @dataclass
@@ -291,7 +296,14 @@ class EvalConfig:
 
     eval_dir: str = "???"  # held-out wavs, never trained on
     segment_duration: float = 3.0
+    # PER GPU under torchrun (standard DDP convention), so a 4-GPU run
+    # processes 4 x batch_size examples at a time.
     batch_size: int = 8
+    # GLOBAL batch count, split across ranks (see distributed.shard_size) --
+    # deliberately NOT per GPU, unlike batch_size: this one controls how much
+    # audio a reported number is measured on, so scaling it with the GPU
+    # count would silently make 4-GPU results incomparable to the 1-GPU
+    # baselines already recorded.
     n_eval_batches: int = 20
     # Fixed watermark SNR (dB) for eval -- a single number, not a range like
     # TrainConfig.watermark_snr_db_{min,max}, since eval wants one
@@ -320,6 +332,9 @@ class EvalConfig:
     # torchaudio.load + resample per item) while the GPU is busy on the
     # current one; at 0 that work is serialized with the forward passes on the
     # main thread, which shows up as a CPU stall between every batch.
+    # PER RANK: a 4-GPU run spawns 4 x num_workers loader processes, so this
+    # is the knob to turn down first if the box runs out of CPU or shared
+    # memory.
     num_workers: int = 4
 
     # Where the confusion-matrix and robustness-curve PNGs (see plotting.py)
