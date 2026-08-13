@@ -1,4 +1,4 @@
-# python azureml/aml_submit.py --config azureml/configs/diff_erase.yaml
+﻿# python azureml/aml_submit.py --config azureml/configs/diff_erase.yaml
 #
 # The opposite direction from sgmse.yaml: trains against DiffErase (AudioLDM),
 # holds SGMSE + MBD out. Static equivalent: azureml/jobs/train_diff_erase.yaml.
@@ -19,8 +19,8 @@ description: >-
   then eval with SGMSE and MBD held out.
 
 inputs:
-  librispeech: azureml:librispeech-asr@1
-  checkpoints: azureml:psiml-diffusion-checkpoints@1
+  librispeech: azureml:librispeech-asr:1
+  checkpoints: azureml:psiml-diffusion-checkpoints:1
 
 timeout_minutes: 720
 

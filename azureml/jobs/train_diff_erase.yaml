@@ -1,4 +1,4 @@
-$schema: https://azuremlschemas.azureedge.net/latest/commandJob.schema.json
+﻿$schema: https://azuremlschemas.azureedge.net/latest/commandJob.schema.json
 
 # az ml job create -f azureml/jobs/train_diff_erase.yaml \
 #     --set compute=azureml:<your-a100-cluster>
@@ -21,14 +21,14 @@ compute: azureml:a100x1
 inputs:
   librispeech:
     type: uri_folder
-    path: azureml:librispeech-asr@1
+    path: azureml:librispeech-asr:1
     # download, not ro_mount -- see train_sgmse.yaml for the reasoning
     # (data.py:36 does a recursive walk per extension per split, and directory
     # listings over blobfuse are network round-trips).
     mode: download
   checkpoints:
     type: custom_model
-    path: azureml:psiml-diffusion-checkpoints@1
+    path: azureml:psiml-diffusion-checkpoints:1
     mode: ro_mount
 
 outputs:
