@@ -20,6 +20,7 @@ which is the same override mechanism Dora/Hydra are themselves built on.
 `total_loss` computation in `train.py` -- never hardcoded.
 """
 
+import sys
 import typing as tp
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -389,6 +390,18 @@ class EvalConfig:
     compute_sisnr: bool = True
     compute_visqol: bool = False  # needs a separate ViSQOL binary build, see metrics.py
 
+    # Reference-point mode, settable as `--stock-baseline` or
+    # `stock_baseline=true`: force the run onto the unmodified pretrained
+    # AudioSeal generator+detector with no attack and no fine-tuned weights,
+    # overriding generator_checkpoint / detector_checkpoint / eval_attacks /
+    # held_out_attacks (see evaluate.py:apply_stock_baseline). Everything else
+    # -- data, batching, embedding, detection, metrics -- stays on the exact
+    # same code path, which is the point: it isolates "is the harness right"
+    # from "is the fine-tuned generator right". Exits non-zero if the stock
+    # numbers don't come out where known-good weights must
+    # (evaluate.py:stock_baseline_verdict).
+    stock_baseline: bool = False
+
     attack: EvalAttackConfig = field(default_factory=EvalAttackConfig)
     tracking: TrackingConfig = field(default_factory=TrackingConfig)
 
@@ -412,6 +425,9 @@ def _load_recipe(section: str, name: str) -> tp.Any:
         raise ValueError(f"Unknown {section} recipe {name!r}, expected one of {available}")
     return section_cfg[name]
 
+# The only non-dotlist CLI argument evaluate.py accepts, see load_eval_config.
+_STOCK_BASELINE_FLAG = "--stock-baseline"
+
 
 def load_config(cli_args: tp.Optional[tp.List[str]] = None) -> TrainConfig:
     """Build the effective config: structured schema <- config/default.yaml
@@ -432,10 +448,23 @@ def load_config(cli_args: tp.Optional[tp.List[str]] = None) -> TrainConfig:
 def load_eval_config(cli_args: tp.Optional[tp.List[str]] = None) -> EvalConfig:
     """Same override mechanism as load_config (including the recipe step --
     see that function and EvalConfig.recipe / config/recipes.yaml), just
-    against config/default_eval.yaml."""
+    against config/default_eval.yaml.
+
+    Plus one true flag, `--stock-baseline` (see EvalConfig.stock_baseline),
+    which is stripped here and rewritten into the dotlist form OmegaConf
+    understands. It gets a flag rather than only `stock_baseline=true`
+    because it is a *mode*, not a value -- it overrides several other config
+    fields -- and because it is the first thing anyone is told to run when
+    the numbers look wrong, so it should be typo-proof at the shell.
+    """
+    args = list(sys.argv[1:] if cli_args is None else cli_args)
+    dotlist = [a for a in args if a != _STOCK_BASELINE_FLAG]
+    if len(dotlist) != len(args):
+        dotlist.append("stock_baseline=true")
+
     schema = OmegaConf.structured(EvalConfig)
     file_cfg = OmegaConf.load(_DEFAULT_EVAL_YAML) if _DEFAULT_EVAL_YAML.exists() else OmegaConf.create({})
-    cli_cfg = OmegaConf.from_cli(cli_args)
+    cli_cfg = OmegaConf.from_cli(dotlist)
     recipe_name = cli_cfg.get("recipe", None) or file_cfg.get("recipe", None)
     recipe_cfg = _load_recipe("eval", recipe_name) if recipe_name else OmegaConf.create({})
     cfg = OmegaConf.merge(schema, file_cfg, recipe_cfg, cli_cfg)
