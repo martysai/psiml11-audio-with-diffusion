@@ -22,11 +22,22 @@
 #   EVAL_DIR=data/LibriSpeech/test-clean \
 #   AUDIOLDM_CHECKPOINT=checkpoints/audioldm/data/checkpoints/audioldm-s-full \
 #   ./run_diffusion_swap.sh sgmse
+#
+# Multi-GPU: set LAUNCHER to run both stages under torchrun instead of a
+# single process (see docs/MULTI_GPU.md). data.batch_size stays PER GPU, so
+# this raises the effective batch by the number of processes:
+#   LAUNCHER="torchrun --standalone --nproc_per_node=4" ./run_diffusion_swap.sh audioldm
 set -euo pipefail
 cd "$(dirname "$0")"
 
 DIRECTION="${1:?Usage: $0 <audioldm|sgmse> [extra train.py overrides...]}"
 shift
+
+# Split on whitespace into an array rather than interpolating $LAUNCHER bare:
+# it carries arguments ("torchrun --standalone --nproc_per_node=4"), so it has
+# to word-split, but an unquoted expansion would also glob and would trip
+# `set -u` when unset.
+read -ra launcher <<< "${LAUNCHER:-python3}"
 
 TRAIN_DIR="${TRAIN_DIR:-/data/datasets/LibriSpeech/train-clean-100}"
 VALID_DIR="${VALID_DIR:-/data/datasets/LibriSpeech/dev-clean}"
@@ -85,8 +96,8 @@ case "$DIRECTION" in
     ;;
 esac
 
-echo "=== [1/2] Training: recipe=$train_recipe ==="
-PYTHONPATH=src python3 -m audioseal_robust.train \
+echo "=== [1/2] Training: recipe=$train_recipe (launcher: ${launcher[*]}) ==="
+PYTHONPATH=src "${launcher[@]}" -m audioseal_robust.train \
   recipe="$train_recipe" \
   data.train_dir="$TRAIN_DIR" \
   data.valid_dir="$VALID_DIR" \
@@ -102,7 +113,7 @@ if [ -z "$last_ckpt" ]; then
 fi
 
 echo "=== [2/2] Evaluating: recipe=$eval_recipe, checkpoint=$last_ckpt ==="
-MPLBACKEND=Agg PYTHONPATH=src python3 -m audioseal_robust.evaluate \
+MPLBACKEND=Agg PYTHONPATH=src "${launcher[@]}" -m audioseal_robust.evaluate \
   recipe="$eval_recipe" \
   eval_dir="$EVAL_DIR" \
   label="swap_${DIRECTION}" \

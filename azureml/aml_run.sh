@@ -126,23 +126,88 @@ export CHECKPOINT_DIR="$ARTIFACTS/checkpoints"
 mkdir -p "$CHECKPOINT_DIR"
 
 # --- Tracking ---------------------------------------------------------------
-# wandb only if a key actually reached the container. Without this guard a
-# missing key makes wandb.init() block on an interactive login prompt against
-# a stdin that is never going to answer, i.e. the job hangs until its timeout
-# rather than failing -- strictly worse than logging to stdout.
+# Backend selection, in priority order:
+#
+#   wandb   only when a key actually reached the container. Without this guard
+#           a missing key makes wandb.init() block on an interactive login
+#           prompt against a stdin that is never going to answer, i.e. the job
+#           hangs until its timeout rather than failing -- strictly worse than
+#           logging to stdout.
+#   mlflow  the default inside any AzureML job. MLflow's tracking URI is
+#           injected by the runtime, so metrics land on the Studio run with no
+#           outbound network access at all. This is the ONLY correct choice on
+#           a compliant cluster (Singularity/manifold): wandb is an external
+#           endpoint, and tracking.py's WandbTracker uploads audio samples and
+#           figures, not just scalars -- that is training data leaving the
+#           compliance boundary, not just telemetry.
+#   none    outside AML with no key: console logging.
+#
+# Set TRACKING_BACKEND explicitly to override the detection.
 tracking_args=()
-if [ -n "${WANDB_API_KEY:-}" ]; then
-  WANDB_PROJECT="${WANDB_PROJECT:-audioseal-robust}"
-  tracking_args+=(tracking.backend=wandb tracking.project="$WANDB_PROJECT" tracking.wandb_mode=online)
-  # Cross-reference the two systems: AML's run id becomes the wandb run name,
-  # so a wandb chart can be traced back to the AML job that produced it.
-  if [ -n "${AZUREML_RUN_ID:-}" ]; then
-    tracking_args+=(tracking.run_name="$AZUREML_RUN_ID")
+TRACKING_BACKEND="${TRACKING_BACKEND:-}"
+if [ -z "$TRACKING_BACKEND" ]; then
+  if [ -n "${WANDB_API_KEY:-}" ]; then
+    TRACKING_BACKEND=wandb
+  elif [ -n "${AZUREML_RUN_ID:-}" ]; then
+    TRACKING_BACKEND=mlflow
+  else
+    TRACKING_BACKEND=none
   fi
-  echo "tracking: wandb project=$WANDB_PROJECT entity=${WANDB_ENTITY:-<default>}"
+fi
+
+case "$TRACKING_BACKEND" in
+  wandb)
+    if [ -z "${WANDB_API_KEY:-}" ]; then
+      echo "TRACKING_BACKEND=wandb but WANDB_API_KEY is unset -- wandb.init() would block on a login prompt" >&2
+      exit 1
+    fi
+    WANDB_PROJECT="${WANDB_PROJECT:-audioseal-robust}"
+    tracking_args+=(tracking.backend=wandb tracking.project="$WANDB_PROJECT" tracking.wandb_mode=online)
+    # Cross-reference the two systems: AML's run id becomes the wandb run name,
+    # so a wandb chart can be traced back to the AML job that produced it.
+    if [ -n "${AZUREML_RUN_ID:-}" ]; then
+      tracking_args+=(tracking.run_name="$AZUREML_RUN_ID")
+    fi
+    echo "tracking: wandb project=$WANDB_PROJECT entity=${WANDB_ENTITY:-<default>}"
+    ;;
+  mlflow)
+    if [ -n "${WANDB_API_KEY:-}" ]; then
+      echo "note: WANDB_API_KEY is set but TRACKING_BACKEND=mlflow -- not contacting wandb" >&2
+    fi
+    tracking_args+=(tracking.backend=mlflow)
+    if [ -n "${AZUREML_RUN_ID:-}" ]; then
+      tracking_args+=(tracking.run_name="$AZUREML_RUN_ID")
+    fi
+    echo "tracking: mlflow -> the AzureML run (no external egress)"
+    ;;
+  none)
+    tracking_args+=(tracking.backend=none)
+    echo "tracking: disabled -- falling back to console logging"
+    ;;
+  *)
+    echo "Unknown TRACKING_BACKEND '$TRACKING_BACKEND' -- expected wandb, mlflow or none" >&2
+    exit 1
+    ;;
+esac
+
+# --- Launcher (single process vs. torchrun DDP) -----------------------------
+# NPROC defaults to every visible GPU, so a 4xA100 node uses all four without
+# the job YAML having to know the SKU. One process per GPU is the DDP
+# convention; data.batch_size stays PER GPU, so the effective batch scales by
+# NPROC and optim.lr is NOT rescaled automatically (see docs/MULTI_GPU.md).
+if [ -z "${NPROC:-}" ]; then
+  if command -v nvidia-smi >/dev/null 2>&1; then
+    NPROC="$(nvidia-smi -L 2>/dev/null | grep -c '^GPU ' || echo 1)"
+  else
+    NPROC=1
+  fi
+fi
+if [ "$NPROC" -gt 1 ]; then
+  # --standalone: single node, rendezvous over localhost. Multi-node would
+  # need the AML-provided MASTER_ADDR/NODE_RANK instead.
+  export LAUNCHER="torchrun --standalone --nproc_per_node=$NPROC"
 else
-  tracking_args+=(tracking.backend=none)
-  echo "tracking: WANDB_API_KEY not set -- falling back to console logging"
+  export LAUNCHER="python3"
 fi
 
 # The same tracking config has to reach evaluate.py, which "$@" does not
@@ -176,6 +241,8 @@ echo "AUDIOLDM_CHECKPOINT  : $AUDIOLDM_CHECKPOINT"
 echo "AUDIOLDM_CONFIG      : $AUDIOLDM_CONFIG"
 echo "CHECKPOINT_DIR       : $CHECKPOINT_DIR"
 echo "EVAL_EXTRA_ARGS      : $EVAL_EXTRA_ARGS"
+echo "tracking backend     : $TRACKING_BACKEND"
+echo "launcher             : $LAUNCHER (NPROC=$NPROC)"
 echo "train.py overrides   : $* ${tracking_args[*]}"
 echo "=============================================================="
 
