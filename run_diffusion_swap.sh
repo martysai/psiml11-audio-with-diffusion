@@ -44,6 +44,16 @@ shared_args=()
 # weights file (downloads its own from HF), so it's free to always include.
 eval_extra_args=(attack.mbd.checkpoint=auto)
 
+# "$@" reaches train.py only, so without this there is no way to override an
+# evaluate.py-only setting -- tracking.project, n_eval_batches, headline_strength
+# etc. Space-separated, applied after the recipe so it wins, e.g.:
+#   EVAL_EXTRA_ARGS="tracking.project=my-wandb-proj n_eval_batches=2" \
+#     ./run_diffusion_swap.sh audioldm epochs=1
+if [ -n "${EVAL_EXTRA_ARGS:-}" ]; then
+  read -ra _eval_overrides <<< "$EVAL_EXTRA_ARGS"
+  eval_extra_args+=("${_eval_overrides[@]}")
+fi
+
 case "$DIRECTION" in
   audioldm)
     train_recipe="audioldm"

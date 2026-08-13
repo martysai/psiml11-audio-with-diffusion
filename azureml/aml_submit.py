@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """Config-driven AzureML submitter for the diffusion-swap experiment.
 
 One YAML per experiment direction under azureml/configs/, one submit call:
@@ -53,8 +53,8 @@ def load_config(path: Path) -> Dict[str, Any]:
     for required in ("direction", "compute", "environment", "inputs"):
         if required not in cfg:
             die(f"config {path} is missing required key: {required}")
-    if cfg["direction"] not in ("sgmse", "diff_erase"):
-        die(f"direction must be 'sgmse' or 'diff_erase', got {cfg['direction']!r}")
+    if cfg["direction"] not in ("sgmse", "audioldm"):
+        die(f"direction must be 'sgmse' or 'audioldm', got {cfg['direction']!r}")
     return cfg
 
 

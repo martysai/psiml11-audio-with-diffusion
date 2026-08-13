@@ -1,0 +1,97 @@
+$schema: https://azuremlschemas.azureedge.net/latest/commandJob.schema.json
+
+# az ml job create -f azureml/jobs/smoke_audioldm.yaml
+#
+# Stage 1 of 2. Same code path, same assets, same compute and the same
+# direction as train_audioldm.yaml -- only the step counts differ. The point
+# is to buy the answer to "does any of this work on Azure at all" for a few
+# minutes of A100 instead of finding out twelve hours into the real run.
+#
+# What it actually exercises, end to end:
+#   * image pull + the never-before-built dependency stack
+#   * the 6.8 GB data download and the 10.9 GB checkpoint mount
+#   * preflight (CUDA present, splits readable, AudioLDM layout intact)
+#   * AudioLDMAttack construction -- the chdir + relative-sibling resolution
+#     that attacks.py:418-426 is so particular about
+#   * a real train step, i.e. backprop through the diffusion reverse loop
+#   * checkpoint write to the output mount
+#   * evaluate.py, including the held-out SGMSE and MBD probes
+#   * wandb reaching api.wandb.ai from the compute
+#
+# Everything except runtime. If this is green, the only thing the full run can
+# still discover is that it is too slow -- which is what its numbers are for.
+type: command
+
+experiment_name: audioseal-robust-diffusion-swap
+display_name: smoke-audioldm
+description: >-
+  Cheap end-to-end validation of the AudioLDM-direction pipeline: a handful of
+  train steps and a reduced eval, purely to prove the Azure path works before
+  committing an A100 to the full run.
+
+code: ../..
+environment: azureml:audioseal-robust-diffusion@latest
+compute: azureml:gpu-cluster
+
+inputs:
+  librispeech:
+    type: uri_folder
+    path: azureml:librispeech-asr:1
+    # download, not ro_mount -- data.py:36 walks the tree once per audio
+    # extension per split, and directory listings over blobfuse are network
+    # round-trips. See train_audioldm.yaml for the full reasoning.
+    mode: download
+  checkpoints:
+    type: custom_model
+    path: azureml:psiml-diffusion-checkpoints:1
+    mode: ro_mount
+
+outputs:
+  artifacts:
+    type: uri_folder
+    mode: rw_mount
+
+# epochs=1 x updates_per_epoch=5 = 5 optimizer steps. batch_size=2 and
+# segment_duration=2.0 keep each one small; the smoke is not measuring
+# anything, it is proving the path executes.
+#
+# eval_every=2 forces train.py's eval_step branch to run inside those 5 steps
+# rather than never (it defaults to 0 = off), so the valid_dir path is
+# exercised too -- train.py:303-305 pairs eval_every with data.valid_dir and
+# aml_run.sh always sets the latter.
+#
+# n_eval_batches/n_curve_batches are evaluate.py-only settings, so they travel
+# via EVAL_EXTRA_ARGS rather than the `--` overrides, which reach train.py
+# alone. Defaults are 20 and 6; at 7 t*-grid points x 2 strength-sensitive
+# attacks the curve is what actually costs, hence trimming both.
+command: >-
+  bash azureml/aml_run.sh audioldm
+  --librispeech ${{inputs.librispeech}}
+  --checkpoints ${{inputs.checkpoints}}
+  --artifacts ${{outputs.artifacts}}
+  --
+  epochs=1
+  updates_per_epoch=5
+  log_every=1
+  eval_every=2
+  data.batch_size=2
+  data.num_workers=2
+  data.segment_duration=2.0
+  attack.sgmse.num_steps=10
+
+environment_variables:
+  PYTHONUNBUFFERED: "1"
+  AZUREML_ARTIFACTS_DEFAULT_TIMEOUT: "1200"
+  EVAL_EXTRA_ARGS: "n_eval_batches=2 n_curve_batches=1"
+  # WANDB_API_KEY / WANDB_PROJECT / WANDB_ENTITY are injected at submit time
+  # (--set environment_variables.WANDB_API_KEY=...), never committed here.
+  # aml_run.sh falls back to console logging if the key is absent.
+
+resources:
+  instance_count: 1
+
+limits:
+  # 2h. Generous for ~5 steps: the budget is dominated by the one-time image
+  # pull and the 6.8 GB download, not by the training itself. If it does hit
+  # this, that is a finding worth having before the 12h run.
+  timeout: 7200

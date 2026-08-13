@@ -1,6 +1,6 @@
 ﻿# python azureml/aml_submit.py --config azureml/configs/sgmse.yaml
 #
-# Trains against SGMSE, holds DiffErase + MBD out (recipes.yaml's `sgmse` /
+# Trains against SGMSE, holds AudioLDM + MBD out (recipes.yaml's `sgmse` /
 # `after_sgmse_training` pair). The static equivalent is
 # azureml/jobs/train_sgmse.yaml -- keep the two in sync, or pick one.
 
@@ -22,7 +22,7 @@ experiment_name: audioseal-robust-diffusion-swap
 display_name: swap-sgmse
 description: >-
   Generator-only robustness fine-tuning against the SGMSE attack, then eval
-  with DiffErase and MBD held out.
+  with AudioLDM and MBD held out.
 
 inputs:
   librispeech: azureml:librispeech-asr:1
