@@ -138,7 +138,12 @@ def build_job(cfg: Dict[str, Any]):
             "librispeech": Input(
                 type=AssetTypes.URI_FOLDER,
                 path=inputs_cfg["librispeech"],
-                mode=InputOutputModes.RO_MOUNT,
+                # DOWNLOAD, not RO_MOUNT: data.py:36 walks the tree once per
+                # audio extension and train.py builds one dataset per split, so
+                # a mount pays ~6 recursive blob listings before step 1 and blob
+                # latency on every __getitem__ after. Keep in sync with
+                # azureml/jobs/*.yaml.
+                mode=InputOutputModes.DOWNLOAD,
             ),
             "checkpoints": Input(
                 type=AssetTypes.CUSTOM_MODEL,
