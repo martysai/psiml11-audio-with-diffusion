@@ -53,6 +53,7 @@ beyond wrapping the model:
 import contextlib
 import itertools
 import logging
+import math
 import os
 import typing as tp
 from datetime import datetime
@@ -299,6 +300,38 @@ def _grad_norm(module: nn.Module) -> float:
     return total_sq**0.5
 
 
+def _normalize_grad_(module: nn.Module, target_norm: float, floor: float) -> float:
+    """Rescale `module`'s gradients so their global L2 norm equals
+    `target_norm`. Returns the norm *before* rescaling.
+
+    Unlike clip_grad_norm_ this scales up as well as down, which is the point:
+    it makes each step's contribution independent of which attack branch
+    produced it (see OptimConfig.normalize_grad for the measurements that
+    motivated it). The direction is untouched -- every gradient is multiplied
+    by the same scalar.
+
+    Under DDP this needs no extra synchronization: backward() has already
+    all-reduced the gradients, so every rank computes an identical norm and
+    therefore an identical scale, and the replicas stay bit-identical.
+    """
+    total = _grad_norm(module)
+    if not math.isfinite(total):
+        raise RuntimeError(
+            f"non-finite gradient norm ({total}) -- refusing to rescale. This mirrors "
+            "clip_grad_norm_(error_if_nonfinite=True); a NaN/Inf gradient means something "
+            "upstream is broken rather than merely large."
+        )
+    # Below the floor there is no direction worth preserving, and scaling up to
+    # target_norm would amplify numerical noise into a full-sized step.
+    if total < floor:
+        return total
+    scale = target_norm / total
+    for p in module.parameters():
+        if p.grad is not None:
+            p.grad.mul_(scale)
+    return total
+
+
 def _clip_grad_norm_per_sample(grad: torch.Tensor, max_norm: float) -> torch.Tensor:
     """Clip each batch item's L2 norm without changing its direction."""
     if max_norm <= 0:
@@ -398,8 +431,21 @@ def train_step(
     total_loss.backward()
     grad_norm_generator = _grad_norm(unwrap_generator(embedder))
     grad_norm_attack = _grad_norm(attack)  # expected: always 0.0, see _grad_norm's docstring
-    if cfg.optim.max_norm is not None:
+    if cfg.optim.normalize_grad:
+        # Mutually exclusive with clipping by construction: rescaling to
+        # exactly max_norm already satisfies the clip bound, so running
+        # clip_grad_norm_ afterwards would be a no-op.
+        if cfg.optim.max_norm is None:
+            raise ValueError("optim.normalize_grad requires optim.max_norm (it is the target norm)")
+        _normalize_grad_(
+            unwrap_generator(embedder), cfg.optim.max_norm, cfg.optim.normalize_grad_floor
+        )
+        grad_scale = cfg.optim.max_norm / grad_norm_generator if grad_norm_generator else 1.0
+    elif cfg.optim.max_norm is not None:
         torch.nn.utils.clip_grad_norm_(unwrap_generator(embedder).parameters(), cfg.optim.max_norm, error_if_nonfinite=True)
+        grad_scale = min(1.0, cfg.optim.max_norm / grad_norm_generator) if grad_norm_generator else 1.0
+    else:
+        grad_scale = 1.0
     optimizer.step()
 
     return {
@@ -410,6 +456,13 @@ def train_step(
         "perceptual_loss": perc_loss.item(),
         "presence_prob": p.mean().item(),
         "grad_norm_generator": grad_norm_generator,
+        # The scalar actually applied to the generator's gradient before
+        # optimizer.step(). Under plain clipping this is <1 on branches whose
+        # gradients explode and 1.0 on the rest, which is exactly the silent
+        # per-branch reweighting OptimConfig.normalize_grad exists to remove --
+        # so logging it makes that imbalance visible per step instead of
+        # something to reconstruct from a log afterwards.
+        "grad_scale_applied": grad_scale,
         "grad_norm_attack": grad_norm_attack,
         "grad_norm_x_wm": activation_grad_norms.get("x_wm", 0.0),
         "grad_norm_x_wm_clipped": activation_grad_norms.get(
