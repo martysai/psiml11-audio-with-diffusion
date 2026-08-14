@@ -45,6 +45,54 @@ import torch.nn.functional as F
 import torch.utils.checkpoint
 
 
+def _tile_or_crop(wav: torch.Tensor, target_len: int) -> torch.Tensor:
+    """Fit `wav` (B, T) to exactly `target_len` samples, tiling if it is short.
+
+    AudioLDM's backbone consumes a fixed 10.24s window (`duration` in
+    audioldm_original.yaml), so anything shorter has to be extended somehow.
+
+    Tiling rather than zero-padding, because zero-padding this model is
+    catastrophic rather than merely wasteful. Its mel goes through
+    log(clamp(m, min=1e-5)), so digital silence becomes a constant -11.51
+    plateau while speech sits near 0. At the 2.0s segments used for training
+    that leaves 80.5% of the spectrogram pinned at the floor and a mel whose
+    mean is ~-9.0, against ~+1.0 for natural audio -- far outside anything the
+    pretrained VAE and UNet ever saw. Nor does it stay confined to the padded
+    region: with use_spatial_transformer the UNet's attention spans all 256
+    latent frames, so the silence mixes into the real-content region, and
+    cropping the output afterwards cannot undo it.
+
+    Measured, from a 4x A100 smoke evaluation: AudioLDM scored
+    attack_sisnr = -50 dB -- the "attacked" audio essentially uncorrelated
+    with its input -- while MBD, also a diffusion resynthesis but run at the
+    audio's native length with no padding, scored -8.8 dB. A 41 dB gap between
+    two comparable methods, from the padding alone.
+
+    Relationship to the eval-side fix in this branch: building a
+    fixed-duration eval set of files that are genuinely >= 10.24s is strictly
+    better where it applies, since the model then sees real contiguous audio
+    and nothing is synthesised at all. This covers the cases that cannot
+    reach: the TRAINING path (train_step feeds whatever
+    data.segment_duration produces, and shortening it is the point -- longer
+    segments make detection easier for free, because the detector
+    time-averages both presence and the message bits, see
+    audioseal/models.py:decode_message), and any evaluation run against a
+    dataset that has not been pre-curated, such as the AzureML mounts where
+    `test-clean-fixed` does not exist.
+
+    Tiling's own cost is repeated content and a seam at each wrap, which is
+    far smaller than an 80% silence plateau. Gradients flow back through every
+    tile onto the same input samples, which is simply the true Jacobian of
+    tile-then-crop.
+    """
+    length = wav.shape[-1]
+    if length == 0:
+        raise ValueError("cannot fit an empty waveform to a target length")
+    if length < target_len:
+        wav = wav.repeat(1, target_len // length + 1)
+    return wav[..., :target_len]
+
+
 class IdentityAttack(nn.Module):
     """No-op attack: returns the input unchanged. Always available, has no
     parameters, and is trivially differentiable (gradient is the identity)."""
@@ -622,10 +670,7 @@ class AudioLDMAttack(nn.Module):
         target_len = int(round(self._model_sample_rate * self._duration))
 
         wav = x.squeeze(1).clamp(-1.0, 1.0)  # (B, T)
-        if wav.shape[-1] < target_len:
-            wav = F.pad(wav, (0, target_len - wav.shape[-1]))
-        else:
-            wav = wav[..., :target_len]
+        wav = _tile_or_crop(wav, target_len)
 
         mel, *_ = self._stft.mel_spectrogram(wav)  # (B, n_mel, T_frames)
         mel_input = mel.permute(0, 2, 1).unsqueeze(1)  # (B, 1, T_frames, n_mel)
