@@ -23,6 +23,7 @@ recipe: null
 
 lambda_det: 1.0
 lambda_perc: 1.0
+lambda_bit: 1.0
 
 # Per-example watermark SNR (dB), sampled uniformly per training step -- see
 # TrainConfig.watermark_snr_db_{min,max} in config.py for how this range was

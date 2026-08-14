@@ -273,7 +273,7 @@ def train_step(
         p = presence[:, 1, :].mean(dim=-1)  # presence prob per example, pooled over time
 
         # 4. losses
-        det_loss, presence_loss, bit_loss = detection_loss_components(p, m_hat, message)
+        det_loss, presence_loss, bit_loss = detection_loss_components(p, m_hat, message, bit_weight=cfg.lambda_bit)
         perc_loss = perceptual_loss_fn(x, x_wm)  # pre-attack, per spec
         total_loss = cfg.lambda_det * det_loss + cfg.lambda_perc * perc_loss
 
@@ -327,7 +327,7 @@ def eval_step(
             x_att, attack_name = attack(x_wm)
             presence, m_hat = detector.forward(x_att)
             p = presence[:, 1, :].mean(dim=-1)
-            det_loss, presence_loss, bit_loss = detection_loss_components(p, m_hat, message)
+            det_loss, presence_loss, bit_loss = detection_loss_components(p, m_hat, message, bit_weight=cfg.lambda_bit)
             perc_loss = perceptual_loss_fn(x, x_wm)
             total_loss = cfg.lambda_det * det_loss + cfg.lambda_perc * perc_loss
     finally:
