@@ -50,7 +50,11 @@ from audioseal_robust.evaluate import (
     prepare_eval_batches,
 )
 from audioseal_robust.losses import PsychoacousticMelLoss, detection_loss
-from audioseal_robust.train import _clip_grad_norm_per_sample, embed_watermark
+from audioseal_robust.train import (
+    _clip_and_capture_activation_grad,
+    _clip_grad_norm_per_sample,
+    embed_watermark,
+)
 
 
 def _tiny_seanet_config() -> SEANetConfig:
@@ -244,6 +248,24 @@ def test_clip_grad_norm_per_sample_only_scales_outlier():
 
     assert torch.allclose(clipped[0], torch.tensor([[0.6, 0.8]]))
     assert torch.equal(clipped[1], grad[1])
+
+
+def test_clip_and_capture_activation_grad():
+    grad = torch.tensor([[[3.0, 4.0]]])
+    norms = {}
+
+    clipped = _clip_and_capture_activation_grad("activation", norms, max_norm=1.0)(grad)
+
+    assert norms["activation"] == 5.0
+    assert norms["activation_clipped"] == 1.0
+    assert torch.allclose(clipped, torch.tensor([[[0.6, 0.8]]]))
+
+    unclipped_norms = {}
+    unchanged = _clip_and_capture_activation_grad("activation", unclipped_norms, max_norm=None)(grad)
+
+    assert torch.equal(unchanged, grad)
+    assert unclipped_norms["activation"] == 5.0
+    assert "activation_clipped" not in unclipped_norms
 
 
 def test_sampled_attack_only_picks_enabled_branches():
