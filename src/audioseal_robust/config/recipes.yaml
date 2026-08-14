@@ -34,6 +34,21 @@ train:
       weights:
         identity: 0.0
         sgmse: 1.0
+  # Same direction as `sgmse` above, but half the steps are identity
+  # (unattacked) instead of forcing the full SGMSE attack every single step.
+  # Two motivations: (1) the generator gets some easy/unattacked steps to
+  # anchor bit accuracy on, rather than only ever seeing the hardest case;
+  # (2) SGMSEAttack's Langevin corrector has occasional gradient
+  # instability (huge grad_norm_x_wm/x_att spikes, see its
+  # AnnealedLangevinDynamics.update_fn), which this halves the exposure to.
+  # A separate recipe rather than editing `sgmse` above -- same recipe name
+  # silently changing what it trains against would be its own source of
+  # confusion (old runs/notes referencing `recipe=sgmse` meant sgmse-only).
+  sgmse_mixed:
+    attack:
+      weights:
+        identity: 0.5
+        sgmse: 0.5
 
 eval:
   # Pair with `recipe=audioldm` at train time: reports AudioLDM alongside

@@ -23,6 +23,7 @@ recipe: null
 
 lambda_det: 1.0
 lambda_perc: 1.0
+lambda_bit: 1.0
 
 # Per-example watermark SNR (dB), sampled uniformly per training step -- see
 # TrainConfig.watermark_snr_db_{min,max} in config.py for how this range was
@@ -68,6 +69,7 @@ optim:
   betas: [0.5, 0.9]
   weight_decay: 0.0
   max_norm: 3.0
+  max_x_wm_grad_norm: 1000.0
 
 data:
   train_dir: ???

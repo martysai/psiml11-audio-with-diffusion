@@ -24,11 +24,23 @@ probabilities / sigmoid probabilities), so they use `BCELoss` rather than
 `BCEWithLogitsLoss` -- see `detection_loss` below.
 """
 
+import contextlib
 import typing as tp
 
 import torch
 import torch.nn as nn
 import torchaudio
+
+
+def _no_autocast(device: torch.device) -> tp.ContextManager[None]:
+    """Force-disable autocast for an op that can't tolerate it (see
+    detection_loss_components). cuda/cpu only, matching train.py's
+    _autocast -- torch.autocast's device_type is validated even when
+    enabled=False, and MPS's autocast support is inconsistent across torch
+    versions, so skip it there rather than risk an unsupported device_type."""
+    if device.type in ("cuda", "cpu"):
+        return torch.autocast(device_type=device.type, enabled=False)
+    return contextlib.nullcontext()
 
 
 def detection_loss_components(
@@ -37,24 +49,44 @@ def detection_loss_components(
     message: torch.Tensor,
     presence_target: float = 1.0,
     eps: float = 1e-6,
+    bit_weight: float = 1.0,
 ) -> tp.Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Same computation as `detection_loss`, but also returns the two terms
     separately -- for logging (see train.py's train_step), where "all the
     losses" means presence and bit-message loss individually, not just their
     sum.
 
-    Args: same as `detection_loss`.
+    Args: same as `detection_loss`, plus:
+        bit_weight: extra weight on bit_loss within this function's own sum
+            (presence_loss + bit_weight * bit_loss) -- see
+            TrainConfig.lambda_bit for why you'd raise this above 1.0.
+            Returned presence_loss/bit_loss are still the raw, UNweighted
+            per-term values (so logging shows the actual loss, not the
+            scaled contribution) -- only the combined first return value
+            includes bit_weight.
 
     Returns:
-        (presence_loss + bit_loss, presence_loss, bit_loss) -- all scalars.
+        (presence_loss + bit_weight * bit_loss, presence_loss, bit_loss).
     """
-    bce = nn.BCELoss()
-    target_presence = torch.full_like(p, presence_target)
-    presence_loss = bce(p.clamp(eps, 1 - eps), target_presence)
+    # Forces fp32 regardless of any ambient bf16/fp16 autocast (see train.py's
+    # _autocast): BCELoss/binary_cross_entropy raises rather than silently
+    # casting under autocast -- "Many models use a sigmoid layer right before
+    # the binary cross entropy layer... combine the two ... using
+    # binary_cross_entropy_with_logits" -- but p/m_hat here are
+    # AudioSealDetector's own already-activated outputs (frozen pretrained
+    # model; see this module's docstring), not logits we control, so
+    # switching to the *WithLogits variant isn't an option -- force the
+    # precision this op actually requires instead.
+    with _no_autocast(p.device):
+        p = p.float()
+        m_hat = m_hat.float()
+        bce = nn.BCELoss()
+        target_presence = torch.full_like(p, presence_target)
+        presence_loss = bce(p.clamp(eps, 1 - eps), target_presence)
 
-    bit_loss = bce(m_hat.clamp(eps, 1 - eps), message.float())
+        bit_loss = bce(m_hat.clamp(eps, 1 - eps), message.float())
 
-    return presence_loss + bit_loss, presence_loss, bit_loss
+    return presence_loss + bit_weight * bit_loss, presence_loss, bit_loss
 
 
 def detection_loss(
