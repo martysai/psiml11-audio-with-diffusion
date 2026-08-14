@@ -196,8 +196,21 @@ def prepare_eval_batches(
     evaluates the same audio whether it runs on 1 GPU or 4 -- it just splits
     the work. Per-rank scores are pooled with `all_gather_*` before any
     metric is computed (see `evaluate_attack`).
+
+    A rank whose shard is legitimately empty (fewer batches requested than
+    there are ranks -- `shard_size` gives the surplus ranks 0) returns an
+    empty list rather than raising: it still has to enter every collective
+    downstream, and `evaluate_attack`/`evaluate_perceptual` are built to let
+    it contribute nothing (see `_cat_or_empty`). Raising here would take the
+    job down on exactly the configuration that support is meant to cover.
     """
     local_n_batches = shard_size(cfg.n_eval_batches, env)
+    if env.is_distributed and local_n_batches == 0:
+        logger.warning(
+            "rank %d gets no batches: n_eval_batches=%d is below world_size=%d, so this rank only "
+            "sits in the collectives. The numbers stay correct -- the GPU is just wasted.",
+            env.rank, cfg.n_eval_batches, env.world_size,
+        )
     prepared = []
     for batch_index, batch in enumerate(dataloader):
         if batch_index >= local_n_batches:
@@ -211,11 +224,14 @@ def prepare_eval_batches(
         # produce unscaled, an operating point training never sees.
         x_wm = embed_watermark(generator, x, message, cfg.watermark_snr_db, cfg.watermark_snr_db)
         prepared.append((x.cpu(), x_wm.cpu(), message.cpu()))
-    if not prepared:
+    # Only an *asked-for* batch that never arrived is an error: the dataloader
+    # itself came up empty (dataset too small for this batch_size, or sharded
+    # past `drop_last`), which no amount of collective-friendliness fixes.
+    if not prepared and local_n_batches > 0:
         raise RuntimeError(
             f"Evaluation dataloader produced no batches (rank {env.rank}, "
-            f"wanted {local_n_batches}). Under DDP each rank needs at least "
-            "one batch: lower batch_size, or use fewer GPUs for this dataset."
+            f"wanted {local_n_batches}). Under DDP each rank's shard must be "
+            "reachable: lower batch_size, or use fewer GPUs for this dataset."
         )
     return prepared
 
@@ -358,11 +374,13 @@ def evaluate_perceptual(
     """No attack: x vs x_wm only."""
     sisnr_values = []
     pesq_values = []
+    last_pair: tp.Optional[tp.Tuple[torch.Tensor, torch.Tensor]] = None
 
     progress = tqdm(eval_batches, desc="perceptual", unit="batch", leave=False, disable=not env.is_main)
     for x_cpu, x_wm_cpu, _ in progress:
         x = x_cpu.to(device)
         x_wm = x_wm_cpu.to(device)
+        last_pair = (x, x_wm)
 
         if cfg.compute_sisnr:
             sisnr_values.append(sisnr_score(x, x_wm))
@@ -386,9 +404,9 @@ def evaluate_perceptual(
         metrics["sisnr"] = sum(sisnr_values) / len(sisnr_values)
     if pesq_values:
         metrics["pesq"] = sum(pesq_values) / len(pesq_values)
-    if cfg.compute_visqol:
+    if cfg.compute_visqol and last_pair is not None:
         try:
-            metrics["visqol"] = visqol_score(x, x_wm, cfg.sample_rate)
+            metrics["visqol"] = visqol_score(*last_pair, cfg.sample_rate)
         except NotImplementedError as e:
             logger.warning("visqol_score not available, skipping: %s", e)
     return metrics

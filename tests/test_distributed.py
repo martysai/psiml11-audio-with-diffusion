@@ -170,23 +170,57 @@ class _FakeSampler:
         self.epochs_set.append(epoch)
 
 
-@pytest.mark.parametrize("loader_len,updates_per_epoch", [(445, 1000), (1783, 1000), (1, 5), (1000, 1000)])
-def test_epoch_runs_exactly_updates_per_epoch_steps(loader_len, updates_per_epoch):
-    """Regression test: an epoch must be `updates_per_epoch` optimizer steps
-    regardless of how short the per-rank loader is.
+@pytest.mark.parametrize(
+    "loader_len,world_size,updates_per_epoch,expected",
+    [
+        # train-clean-100 at batch_size=16 -- 1783 batches on 1 GPU, 445 per
+        # rank on 4. Same config, same 1000-step epoch either way.
+        (1783, 1, 1000, 1000),
+        (445, 4, 1000, 1000),
+        # run_train_10h.sh's subset: ~167 batches on 1 GPU, ~41 per rank on 4.
+        # The 1000-step cap is never reached, so it must NOT become a target.
+        (167, 1, 1000, 167),
+        (41, 4, 1000, 164),
+        (1000, 1, 1000, 1000),
+    ],
+)
+def test_epoch_length_is_the_same_on_any_gpu_count(loader_len, world_size, updates_per_epoch, expected):
+    """Regression test: an epoch must be the same number of optimizer steps
+    regardless of how many ranks the data was sharded over.
 
-    Sharding the data across 4 ranks divides the per-rank loader length by 4,
-    so with LibriSpeech train-clean-100 the loader drops from 1783 batches to
-    445. A plain `for batch in dataloader` + break would then end the epoch at
-    445 instead of 1000 -- 2.25x fewer optimizer steps and twice as many
-    checkpoints, from a config the user did not change.
+    Sharding across 4 ranks divides the per-rank loader length by 4, so a
+    plain `for batch in dataloader` + break would end a train-clean-100 epoch
+    at 445 steps instead of 1000 -- 2.25x fewer optimizer steps and twice as
+    many checkpoints, from a config the user did not change. Cycling fixes
+    that, but only for the sharded case: when one pass over the data is
+    genuinely shorter than `updates_per_epoch` (the 10h subset rows), the
+    epoch has to end there on every GPU count, or the cap silently turns into
+    a target and a 16.7k-step run becomes a 100k-step one.
     """
     loader = [torch.tensor([float(i)]) for i in range(loader_len)]
     sampler = _FakeSampler()
-    iterator = EpochBatchIterator(loader, sampler, updates_per_epoch)
+    iterator = EpochBatchIterator(loader, sampler, updates_per_epoch, world_size)
 
+    assert iterator.steps_per_epoch == expected
     for _ in range(3):  # several epochs, to catch state leaking between them
-        assert len(list(iterator.epoch())) == updates_per_epoch
+        assert len(list(iterator.epoch())) == expected
+
+
+def test_single_process_never_replays_an_exhausted_loader():
+    """The single-GPU path must behave exactly like the pre-DDP loop: stop
+    when the data runs out, never restart it to reach `updates_per_epoch`.
+
+    run_train_10h.sh depends on this. Its 10h subset exhausts at ~167
+    steps/epoch, which is what bounds the run at ~16.7k steps; cycling it
+    would run the configured 100 x 1000 = 100k steps instead, replaying the
+    same 10h roughly six times over.
+    """
+    loader = [torch.tensor([float(i)]) for i in range(167)]
+    sampler = _FakeSampler()
+    iterator = EpochBatchIterator(loader, sampler, 1000, world_size=1)
+
+    assert len(list(iterator.epoch())) == 167
+    assert sampler.epochs_set == [0], "a single pass must not restart the loader"
 
 
 def test_epoch_iterator_reshuffles_each_pass():
@@ -194,7 +228,7 @@ def test_epoch_iterator_reshuffles_each_pass():
     replays the identical order and the extra passes add no diversity."""
     loader = [torch.tensor([float(i)]) for i in range(10)]
     sampler = _FakeSampler()
-    iterator = EpochBatchIterator(loader, sampler, 25)
+    iterator = EpochBatchIterator(loader, sampler, 25, world_size=4)
 
     list(iterator.epoch())
     assert len(sampler.epochs_set) >= 3, "expected multiple passes over a 10-batch loader"
@@ -202,10 +236,11 @@ def test_epoch_iterator_reshuffles_each_pass():
 
 
 def test_epoch_iterator_works_without_a_sampler():
-    """Single-GPU path: no DistributedSampler to set_epoch on."""
+    """Single-GPU path: no DistributedSampler to set_epoch on, and the loader
+    is the thing that ends the epoch."""
     loader = [torch.tensor([float(i)]) for i in range(4)]
     iterator = EpochBatchIterator(loader, None, 10)
-    assert len(list(iterator.epoch())) == 10
+    assert len(list(iterator.epoch())) == 4
 
 
 def test_epoch_iterator_rejects_an_empty_loader():
