@@ -46,7 +46,15 @@ from audioseal import AudioSeal
 from audioseal.loader import load_state_dict as audioseal_load_state_dict
 from audioseal.models import AudioSealDetector, AudioSealWM
 
-from .attacks import AudioLDMAttack, BigVGANAttack, DACAttack, IdentityAttack, MBDAttack, SGMSEAttack
+from .attacks import (
+    AudioLDMAttack,
+    BigVGANAttack,
+    DACAttack,
+    HopSkipJumpAttack,
+    IdentityAttack,
+    MBDAttack,
+    SGMSEAttack,
+)
 from .config import EvalConfig, load_eval_config
 from .data import build_dataloader
 from .device import resolve_device
@@ -65,6 +73,7 @@ _ATTACK_CLASSES: tp.Dict[str, tp.Type[nn.Module]] = {
     "sgmse": SGMSEAttack,
     "audioldm": AudioLDMAttack,
     "mbd": MBDAttack,
+    "hopskipjump": HopSkipJumpAttack,
 }
 
 # Attacks with a meaningful `strength` (t*) axis: these are the ones that get
@@ -316,6 +325,17 @@ def run(cfg: EvalConfig) -> tp.Dict[str, tp.Any]:
     all_attack_names = list(cfg.eval_attacks) + list(cfg.held_out_attacks)
     attacks, skipped_at_construction = build_eval_attacks(all_attack_names, device, cfg)
     held_out = set(cfg.held_out_attacks)
+
+    # Query-based attacks (currently just HopSkipJumpAttack) need the
+    # detector under test at forward() time, unlike every resynthesis
+    # attack -- see HopSkipJumpAttack's class docstring for why. Duck-typed
+    # via bind_detector rather than threading the detector through every
+    # attack's constructor/forward signature, so this stays a no-op for
+    # every other attack.
+    for attack in attacks.values():
+        bind_detector = getattr(attack, "bind_detector", None)
+        if bind_detector is not None:
+            bind_detector(detector)
 
     dataloader = build_dataloader(
         cfg.eval_dir,
