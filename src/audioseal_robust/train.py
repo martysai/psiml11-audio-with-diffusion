@@ -205,6 +205,80 @@ def _grad_norm(module: nn.Module) -> float:
     return total_sq**0.5
 
 
+_BYTES_PER_GIB = float(1024**3)
+
+
+class CudaMemoryProbe:
+    """Per-step CUDA allocator instrumentation, split around the backward pass.
+
+    This exists to answer "is the activation checkpointing in attacks.py
+    actually buying anything?", which the usual dashboards cannot: wandb's
+    "GPU Memory Allocated" system panels (and `nvidia-smi`) read NVML, i.e.
+    the memory the *process* holds from the driver, which is PyTorch's
+    caching allocator pool. That pool only ever grows to the run's
+    high-water mark and then sits flat, so it looks identical whether
+    checkpointing is on or off, and flat there is NOT evidence that
+    checkpointing isn't happening. The numbers that actually move are the
+    allocator's own:
+
+      mem/activations_gib -- memory still live at the end of the forward
+        pass that wasn't live before it, i.e. what autograd is holding for
+        backward. This is precisely what checkpointing trades away, so it's
+        the most direct signal: it should drop sharply once a checkpointed
+        sampler loop (attacks.py's `_pc_step` / `_ddpm_step`) is in the
+        graph, and scale with num_steps if checkpointing were off.
+      mem/forward_peak_gib, mem/backward_peak_gib -- peak allocation within
+        each half of the step. Uncheckpointed, the peak sits in the forward;
+        checkpointed, the forward peak drops and the backward peak rises,
+        since each segment's activations are recomputed there.
+      mem/reserved_gib -- the allocator pool: the flat number the system
+        panels show. Logged alongside so the gap against the allocated
+        figures above is visible rather than mysterious.
+
+    Every method only reads/resets allocator counters -- no device
+    synchronisation, so this does not perturb the step time it sits next to.
+    Off CUDA, or with `tracking.log_memory=false`, all methods are no-ops
+    and no keys are emitted at all.
+    """
+
+    def __init__(self, device: torch.device, enabled: bool = True) -> None:
+        self._enabled = enabled and device.type == "cuda"
+        self._device = device
+        self._allocated_before = 0
+        self._metrics: tp.Dict[str, float] = {}
+
+    def start(self) -> None:
+        if not self._enabled:
+            return
+        # Peak counters are cumulative until explicitly reset, so without
+        # this every step after the first would just re-report the run's
+        # high-water mark -- a flat line, i.e. exactly the artifact this
+        # probe exists to avoid.
+        torch.cuda.reset_peak_memory_stats(self._device)
+        self._allocated_before = torch.cuda.memory_allocated(self._device)
+
+    def mark_forward_end(self) -> None:
+        if not self._enabled:
+            return
+        allocated = torch.cuda.memory_allocated(self._device)
+        self._metrics["mem/forward_peak_gib"] = (
+            torch.cuda.max_memory_allocated(self._device) / _BYTES_PER_GIB
+        )
+        self._metrics["mem/activations_gib"] = (allocated - self._allocated_before) / _BYTES_PER_GIB
+        torch.cuda.reset_peak_memory_stats(self._device)  # so the backward peak is measured on its own
+
+    def mark_backward_end(self) -> None:
+        if not self._enabled:
+            return
+        self._metrics["mem/backward_peak_gib"] = (
+            torch.cuda.max_memory_allocated(self._device) / _BYTES_PER_GIB
+        )
+        self._metrics["mem/reserved_gib"] = torch.cuda.memory_reserved(self._device) / _BYTES_PER_GIB
+
+    def metrics(self) -> tp.Dict[str, float]:
+        return dict(self._metrics)
+
+
 def _clip_grad_norm_per_sample(grad: torch.Tensor, max_norm: float) -> torch.Tensor:
     """Clip each batch item's L2 norm without changing its direction."""
     if max_norm <= 0:
@@ -248,6 +322,9 @@ def train_step(
 ) -> tp.Dict[str, tp.Union[float, str]]:
     x = batch.to(device)  # clean audio, (B, 1, T), 16kHz
     message = random_message(cfg.nbits, x.size(0), device=x.device)
+
+    memory = CudaMemoryProbe(device, enabled=cfg.tracking.log_memory)
+    memory.start()
 
     # 1-4 under bf16 autocast (see _autocast's docstring): forward through
     # the generator, attack, and detector, plus loss computation. Backward
@@ -295,8 +372,10 @@ def train_step(
         total_loss = cfg.lambda_det * det_loss + cfg.lambda_perc * perc_loss
 
     # 5. backprop through detector + attack (frozen but differentiable) into G_theta
+    memory.mark_forward_end()  # before zero_grad/backward frees or adds anything
     optimizer.zero_grad(set_to_none=True)
     total_loss.backward()
+    memory.mark_backward_end()
     grad_norm_generator = _grad_norm(generator)
     grad_norm_attack = _grad_norm(attack)  # expected: always 0.0, see _grad_norm's docstring
     if cfg.optim.max_norm is not None:
@@ -318,6 +397,7 @@ def train_step(
         ),
         "grad_norm_x_att": activation_grad_norms.get("x_att", 0.0),
         "attack": attack_name,
+        **memory.metrics(),  # empty off CUDA / with tracking.log_memory=false
     }
 
 
