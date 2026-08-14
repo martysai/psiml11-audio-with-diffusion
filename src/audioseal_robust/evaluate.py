@@ -30,6 +30,7 @@ attack's real numbers as its checkpoint gets configured without any change
 to this script.
 """
 
+import csv
 import logging
 import random
 import time
@@ -39,6 +40,7 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn as nn
+import torchaudio
 from omegaconf import OmegaConf
 from tqdm import tqdm
 
@@ -190,6 +192,41 @@ def prepare_eval_batches(
     return prepared
 
 
+def _save_row_artifacts(
+    out_dir: Path,
+    row_index: int,
+    x: torch.Tensor,
+    x_wm: torch.Tensor,
+    x_att: torch.Tensor,
+    sample_rate: int,
+    row_writer: "csv._writer",
+    per_example_bit_acc: torch.Tensor,
+    presence_pos: torch.Tensor,
+    presence_neg: torch.Tensor,
+    per_example_sisnr: torch.Tensor,
+) -> None:
+    """Writes one example's (x, x_wm, x_att) as .wav under out_dir/audio/ and
+    appends its per-example metrics as a CSV row. row_index is the running
+    index across all batches (not reset per batch), so filenames/row indices
+    stay unique and stable across the whole eval_batches sweep."""
+    audio_dir = out_dir / "audio"
+    audio_dir.mkdir(parents=True, exist_ok=True)
+    for tag, wav in (("x", x), ("x_wm", x_wm), ("x_att", x_att)):
+        torchaudio.save(str(audio_dir / f"{row_index:05d}_{tag}.wav"), wav.cpu(), sample_rate)
+    row_writer.writerow(
+        {
+            "row_index": row_index,
+            "bit_accuracy": per_example_bit_acc.item(),
+            "presence_pos": presence_pos.item(),
+            "presence_neg": presence_neg.item(),
+            "attack_sisnr": per_example_sisnr.item(),
+            "x_wav": f"audio/{row_index:05d}_x.wav",
+            "x_wm_wav": f"audio/{row_index:05d}_x_wm.wav",
+            "x_att_wav": f"audio/{row_index:05d}_x_att.wav",
+        }
+    )
+
+
 @torch.no_grad()
 def evaluate_attack(
     detector: AudioSealDetector,
@@ -200,6 +237,7 @@ def evaluate_attack(
     strength: tp.Optional[float] = None,
     n_batches: tp.Optional[int] = None,
     progress_desc: str = "attack",
+    row_artifacts_name: tp.Optional[str] = None,
 ) -> tp.Dict[str, float]:
     """Robustness metrics for one attack (optionally at one fixed t*
     strength): bit accuracy and TPR@FPR, where the "negative" (unwatermarked)
@@ -220,6 +258,14 @@ def evaluate_attack(
     `progress_desc` labels this call's progress bar -- the diffusion attacks
     run for minutes per batch, so without it a long run is indistinguishable
     from a hung one.
+
+    `row_artifacts_name` (e.g. the attack's name): when set AND
+    `cfg.save_row_artifacts` is True, writes every example's (x, x_wm,
+    x_att_pos) plus its own per-example metrics under
+    f"{cfg.output_dir}/{cfg.label}_{row_artifacts_name}_rows/" -- see
+    `_save_row_artifacts`. None (the default) skips this entirely, so
+    callers that don't pass it (e.g. the robustness-curve sweep) never pay
+    for it.
     """
     if n_batches is None:
         n_batches = cfg.n_eval_batches
@@ -229,27 +275,77 @@ def evaluate_attack(
     bit_accs = []
     attack_sisnr_values = []
 
+    row_writer = None
+    row_file = None
+    if row_artifacts_name is not None and cfg.save_row_artifacts:
+        rows_dir = Path(cfg.output_dir) / f"{cfg.label}_{row_artifacts_name}_rows"
+        rows_dir.mkdir(parents=True, exist_ok=True)
+        row_file = open(rows_dir / "rows.csv", "w", newline="")
+        row_writer = csv.DictWriter(
+            row_file,
+            fieldnames=[
+                "row_index",
+                "bit_accuracy",
+                "presence_pos",
+                "presence_neg",
+                "attack_sisnr",
+                "x_wav",
+                "x_wm_wav",
+                "x_att_wav",
+            ],
+        )
+        row_writer.writeheader()
+
+    row_index = 0
     progress = tqdm(eval_batches[:n_batches], desc=progress_desc, unit="batch", leave=False)
-    for x_cpu, x_wm_cpu, message_cpu in progress:
-        x = x_cpu.to(device)
-        x_wm = x_wm_cpu.to(device)
-        message = message_cpu.to(device)
+    try:
+        for x_cpu, x_wm_cpu, message_cpu in progress:
+            x = x_cpu.to(device)
+            x_wm = x_wm_cpu.to(device)
+            message = message_cpu.to(device)
 
-        x_att_pos = attack(x_wm, strength=strength)
-        x_att_neg = attack(x, strength=strength)
+            x_att_pos = attack(x_wm, strength=strength)
+            x_att_neg = attack(x, strength=strength)
 
-        presence_pos, m_hat = detector.forward(x_att_pos)
-        presence_neg, _ = detector.forward(x_att_neg)
+            presence_pos, m_hat = detector.forward(x_att_pos)
+            presence_neg, _ = detector.forward(x_att_neg)
 
-        positive_scores.append(presence_pos[:, 1, :].mean(dim=-1).cpu())
-        negative_scores.append(presence_neg[:, 1, :].mean(dim=-1).cpu())
-        bit_accs.append(bit_accuracy(m_hat, message))
-        # SNR the attack itself imposes (watermarked-before vs. watermarked-after),
-        # so t_star_grid's values can be checked against real degradation instead
-        # of the hand-picked curriculum table they were calibrated from.
-        attack_sisnr_values.append(sisnr_score(x_wm, x_att_pos))
+            presence_pos_per_example = presence_pos[:, 1, :].mean(dim=-1)
+            presence_neg_per_example = presence_neg[:, 1, :].mean(dim=-1)
+            positive_scores.append(presence_pos_per_example.cpu())
+            negative_scores.append(presence_neg_per_example.cpu())
+            bit_accs.append(bit_accuracy(m_hat, message))
+            # SNR the attack itself imposes (watermarked-before vs. watermarked-after),
+            # so t_star_grid's values can be checked against real degradation instead
+            # of the hand-picked curriculum table they were calibrated from.
+            attack_sisnr_values.append(sisnr_score(x_wm, x_att_pos))
 
-    progress.close()
+            if row_writer is not None:
+                decoded = (m_hat > 0.5).float()
+                per_example_bit_acc = (decoded == message.float()).float().mean(dim=-1)
+                for i in range(x.shape[0]):
+                    _save_row_artifacts(
+                        Path(cfg.output_dir) / f"{cfg.label}_{row_artifacts_name}_rows",
+                        row_index,
+                        x[i],
+                        x_wm[i],
+                        x_att_pos[i],
+                        cfg.sample_rate,
+                        row_writer,
+                        per_example_bit_acc[i],
+                        presence_pos_per_example[i],
+                        presence_neg_per_example[i],
+                        # Per-example SI-SNR: reuses sisnr_score (rather than a
+                        # separate hand-rolled formula) on a size-1 slice, so
+                        # this can't silently drift from the aggregate number
+                        # above -- same function, just one example at a time.
+                        torch.tensor(sisnr_score(x_wm[i : i + 1], x_att_pos[i : i + 1])),
+                    )
+                    row_index += 1
+    finally:
+        progress.close()
+        if row_file is not None:
+            row_file.close()
 
     positive_cat = torch.cat(positive_scores)
     negative_cat = torch.cat(negative_scores)
@@ -413,6 +509,7 @@ def run(cfg: EvalConfig) -> tp.Dict[str, tp.Any]:
                     device,
                     strength=headline_strength,
                     progress_desc=f"{name} (headline)",
+                    row_artifacts_name=name,
                 )
                 robustness["seconds"] = time.perf_counter() - attack_started
                 robustness.update(_peak_memory_metrics(device))

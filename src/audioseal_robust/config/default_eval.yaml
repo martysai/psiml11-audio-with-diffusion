@@ -41,6 +41,7 @@ n_curve_batches: 6
 # forward passes on the main thread (a CPU stall between every batch).
 num_workers: 4
 output_dir: ./eval_outputs
+save_row_artifacts: false
 
 # See EvalConfig.t_star_grid in config.py for how these were calibrated
 # (mentor's curriculum table: t*=0.3..40 out of T=1000, NOT [0,1] fractions
