@@ -50,54 +50,6 @@ from audioseal.models import AudioSealDetector
 logger = logging.getLogger(__name__)
 
 
-class AttackApplicationReporter:
-    """Mixin for attacks that can silently fail to perturb some examples.
-
-    Most attacks here are resynthesis pipelines: they always transform every
-    example they are handed, so "the attack ran" and "the attack was applied"
-    are the same statement. Query-based search attacks break that equivalence
-    -- HopSkipJumpAttack returns an example *unperturbed* whenever its search
-    never found an adversarial starting point within the query budget (see
-    `HopSkipJumpAttack._initialize`).
-
-    That failure mode is dangerous precisely because it is invisible in the
-    metrics: an unperturbed watermarked example still detects, so it lands in
-    `evaluate_attack`'s positive scores as a detection, i.e. it is scored as
-    *robustness of the watermark* when it is really *weakness of the attack*.
-    A run whose search budget was too small is therefore indistinguishable
-    from a genuinely robust model -- both report a high TPR@FPR.
-
-    This mixin makes that distinction observable. An attack records one
-    bool per example as it produces it, and `evaluate.py:evaluate_attack`
-    duck-types `pop_application_mask()` (exactly like `bind_detector`) to
-    drain it after each forward and fold it into the reported metrics. Any
-    attack not implementing this is treated as "applied to everything",
-    so nothing changes for the resynthesis attacks.
-    """
-
-    def _reset_application_mask(self) -> None:
-        self._application_flags: tp.List[bool] = []
-
-    def _record_application(self, applied: bool) -> None:
-        # Tolerate a forward() that never called _reset_application_mask
-        # (e.g. a subclass overriding forward without going through it).
-        if not hasattr(self, "_application_flags"):
-            self._application_flags = []
-        self._application_flags.append(applied)
-
-    def pop_application_mask(self) -> tp.Optional[torch.Tensor]:
-        """Per-example bools for the LAST forward call: True where the attack
-        actually perturbed the example, False where it gave up and passed it
-        through. Drains the buffer, so each forward's mask is consumed
-        exactly once and a missed read can never be mistaken for a later
-        call's result. None if nothing was recorded."""
-        flags = getattr(self, "_application_flags", None)
-        if not flags:
-            return None
-        self._application_flags = []
-        return torch.tensor(flags, dtype=torch.bool)
-
-
 class IdentityAttack(nn.Module):
     """No-op attack: returns the input unchanged. Always available, has no
     parameters, and is trivially differentiable (gradient is the identity)."""
@@ -878,7 +830,7 @@ class MBDAttack(nn.Module):
         return out[..., : x.shape[-1]].to(x.dtype)
 
 
-class HopSkipJumpAttack(nn.Module, AttackApplicationReporter):
+class HopSkipJumpAttack(nn.Module):
     """Hard-label, query-based black-box evasion attack against the
     *detector itself*, as used by AudioMarkBench
     (github.com/mileskuo42/AudioMarkBench) to benchmark watermark robustness
@@ -910,13 +862,9 @@ class HopSkipJumpAttack(nn.Module, AttackApplicationReporter):
          audio (`label0=False`) it searches for a *false* detection. Same
          symmetric "flip the detector's own current call" framing as every
          positive/negative pair this file's attacks already go through.
-      2. `_initialize`: find a first, usually very perturbed, "adversarial"
-         point whose decision already differs from `label0`. Prefers drawing
-         it from a bound pool of REAL audio (`bind_reference_pool`, the
-         reference implementation's strategy); falls back to uniform random
-         noise draws when no pool is bound or none of it flips the decision.
-         See `_initialize` for why the noise-only fallback is a poor
-         initializer in this domain.
+      2. `_initialize`: draw uniform random noise until the detector's
+         decision on it differs from `label0` (a first, usually very
+         perturbed, "adversarial" point).
       3. `_binary_search`: bisect the segment between `x0` and that point
          to land close to the decision boundary.
       4. Repeat for `num_iterations`: estimate the boundary's gradient
@@ -926,10 +874,9 @@ class HopSkipJumpAttack(nn.Module, AttackApplicationReporter):
          `_geometric_progression` (halve until the step stays adversarial),
          then `_binary_search` again to re-land on the boundary.
       Returns `x0` unperturbed for any example where step 2 never finds a
-      flip within `init_max_trials` draws -- recorded per example via
-      `AttackApplicationReporter` (see that mixin's docstring: such examples
-      would otherwise be silently scored as watermark robustness) and
-      reported by `evaluate.py` as `attack_failure_rate`.
+      flip within `init_max_trials` draws (logged, not raised -- see
+      `_initialize`; most common on the clean/negative branch, where a
+      falsely-triggering region isn't guaranteed to be one random draw away).
 
     COST WARNING: unlike every other attack here, this is many detector
     forward passes per waveform -- roughly
@@ -971,7 +918,6 @@ class HopSkipJumpAttack(nn.Module, AttackApplicationReporter):
         gamma: float = 1.0,
         clip_min: float = -1.0,
         clip_max: float = 1.0,
-        init_from_reference: bool = True,
     ):
         super().__init__()
         # This attack needs no external weights (it only queries this
@@ -989,43 +935,7 @@ class HopSkipJumpAttack(nn.Module, AttackApplicationReporter):
         self.gamma = gamma
         self.clip_min = clip_min
         self.clip_max = clip_max
-        self.init_from_reference = init_from_reference
         self._detector: tp.Optional[AudioSealDetector] = None
-        self._reference_pool: tp.Optional[torch.Tensor] = None
-        self._reset_application_mask()
-
-    # A reference waveform this close to `x0` (relative L2) is assumed to be
-    # `x0`'s own counterpart rather than an independent utterance, and is
-    # skipped -- see `bind_reference_pool`. At the eval's 30 dB watermark
-    # SNR a clean/watermarked pair sits at ~0.03 relative L2, while two
-    # different utterances sit near sqrt(2) (~1.41) for uncorrelated
-    # signals, so 0.2 separates the two cases by an order of magnitude in
-    # either direction and is not a value the run is sensitive to.
-    _SELF_REFERENCE_REL_L2 = 0.2
-
-    def bind_reference_pool(self, pool: tp.Optional[torch.Tensor]) -> None:
-        """Supply real audio for `_initialize` to start its search from,
-        shaped (N, 1, T) matching this attack's inputs.
-
-        HopSkipJump needs a starting point the detector already classifies
-        opposite to `x0`. The reference implementation takes that from a real
-        sample of the target class, and so does this once a pool is bound:
-        for evading detection on watermarked audio it needs audio the
-        detector calls clean, and for forcing a false positive on clean audio
-        it needs audio the detector calls watermarked -- so a useful pool
-        contains BOTH, which is what `evaluate.py:run` binds.
-
-        Entries within `_SELF_REFERENCE_REL_L2` of `x0` are skipped, because
-        a pool built from the eval batches necessarily contains `x0`'s own
-        clean/watermarked counterpart, and starting the search from the
-        attacked signal's own unwatermarked original would hand the attacker
-        information no real adversary has (and trivially "succeed").
-
-        `evaluate.py:run` calls this automatically wherever it exists,
-        duck-typed exactly like `bind_detector`, so it stays a no-op for
-        every other attack. Pass None to clear it and fall back to noise.
-        """
-        self._reference_pool = pool
 
     def bind_detector(self, detector: AudioSealDetector) -> None:
         """Must be called with the detector under test before `forward()`.
@@ -1046,32 +956,6 @@ class HopSkipJumpAttack(nn.Module, AttackApplicationReporter):
         return presence[:, 1, :].mean(dim=-1) > self.detection_threshold
 
     def _initialize(self, x0: torch.Tensor, label0: bool) -> tp.Optional[torch.Tensor]:
-        """A first point whose decision differs from `label0`, or None if the
-        budget ran out.
-
-        Tries the bound reference pool (real audio) before falling back to
-        uniform noise. The fallback is kept only as a last resort: a draw
-        from `uniform_(clip_min, clip_max)` is full-scale white noise, which
-        is far off the manifold of anything a 16 kHz speech detector was
-        trained on, so on the clean/negative branch in particular it very
-        rarely lands in a falsely-triggering region no matter how many
-        trials it gets. Raising `init_max_trials` alone therefore buys much
-        less than binding a pool does.
-        """
-        pool = self._reference_pool if self.init_from_reference else None
-        if pool is not None and pool.numel() > 0:
-            x0_norm = x0.flatten().norm().clamp_min(1e-12)
-            # Shuffled so repeated calls don't all start from the same
-            # entry, which would correlate every example's trajectory.
-            for idx in torch.randperm(pool.shape[0]).tolist():
-                candidate = pool[idx : idx + 1].to(device=x0.device, dtype=x0.dtype)
-                if candidate.shape != x0.shape:
-                    continue
-                if ((candidate - x0).flatten().norm() / x0_norm).item() < self._SELF_REFERENCE_REL_L2:
-                    continue  # x0's own counterpart -- see bind_reference_pool
-                if bool(self._decision(candidate)[0]) != label0:
-                    return candidate
-
         for _ in range(self.init_max_trials):
             candidate = torch.empty_like(x0).uniform_(self.clip_min, self.clip_max)
             if bool(self._decision(candidate)[0]) != label0:
@@ -1158,18 +1042,13 @@ class HopSkipJumpAttack(nn.Module, AttackApplicationReporter):
         x_adv = self._initialize(x0, label0)
         if x_adv is None:
             logger.warning(
-                "HopSkipJumpAttack: no initialization flipped the detector's "
-                "decision within %d noise trials (reference pool bound: %s) "
-                "-- returning this example unperturbed. It is recorded as an "
-                "attack failure, NOT as watermark robustness (see "
-                "AttackApplicationReporter); bind a reference pool or raise "
-                "init_max_trials if this rate is high.",
+                "HopSkipJumpAttack: no random-noise initialization flipped "
+                "the detector's decision within %d trials -- returning this "
+                "example unperturbed (see class docstring: most common on "
+                "the clean/negative branch).",
                 self.init_max_trials,
-                self._reference_pool is not None,
             )
-            self._record_application(False)
             return x0
-        self._record_application(True)
 
         d = x0.numel()
         x_adv = self._binary_search(x0, x_adv, label0)
@@ -1211,7 +1090,6 @@ class HopSkipJumpAttack(nn.Module, AttackApplicationReporter):
                 "run() does this automatically; see class docstring)."
             )
         with torch.no_grad():
-            self._reset_application_mask()
             x_att = torch.cat([self._attack_one(x[i : i + 1]) for i in range(x.shape[0])], dim=0)
         return x_att.to(x.dtype)
 

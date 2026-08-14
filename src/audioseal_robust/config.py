@@ -143,21 +143,8 @@ class HopSkipJumpAttackConfig:
     max_num_evals: int = 100
     # Random-noise draws attempted before giving up on finding ANY
     # adversarial starting point for an example (see
-    # HopSkipJumpAttack._initialize). Only reached when the reference pool
-    # below is unavailable or fails to supply one.
+    # HopSkipJumpAttack._initialize).
     init_max_trials: int = 100
-    # Start the search from real audio of the opposite detector class
-    # (bound by evaluate.py via bind_reference_pool) instead of going
-    # straight to uniform noise. This is what the reference implementation
-    # does, and it is the difference between a search that usually
-    # initializes and one that usually gives up: full-scale uniform noise is
-    # far off the speech manifold, so it rarely lands in a falsely-triggering
-    # region on the clean/negative branch. Examples that still fail to
-    # initialize are reported as attack_failure_rate rather than silently
-    # scored as watermark robustness -- see attacks.py's
-    # AttackApplicationReporter. Set False only to reproduce the old
-    # noise-only behavior.
-    init_from_reference: bool = True
     # Bisection steps used to re-land on the decision boundary after each
     # gradient step (and for the initial random point).
     binary_search_steps: int = 10

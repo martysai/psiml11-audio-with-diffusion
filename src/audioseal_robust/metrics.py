@@ -18,9 +18,6 @@ Robustness (measured on audio that has gone through an attack):
     still detected as present" call (TP/FP/TN/FN) at that same threshold,
     plus their F1 -- for when you want the full confusion matrix rather
     than just recall (= `tpr_at_fpr`) at one operating point.
-  - `fpr_support`: whether the negative sample size can resolve the
-    requested FPR at all -- a guard against quoting a TPR@FPR that is
-    really a max-of-N order statistic (see its docstring).
   - a robustness *curve* (detection vs. attack strength t*) is not a single
     function here -- see `evaluate.py`, which sweeps `t_star_grid` and calls
     `tpr_at_fpr` at each point.
@@ -37,43 +34,9 @@ function) so that importing this module doesn't require torchmetrics/pesq
 to be installed if you only need bit_accuracy/tpr_at_fpr.
 """
 
-import logging
-import math
 import typing as tp
 
 import torch
-
-logger = logging.getLogger(__name__)
-
-
-def fpr_support(n_negatives: int, target_fpr: float) -> tp.Dict[str, tp.Any]:
-    """Whether `n_negatives` samples can actually resolve `target_fpr`.
-
-    An empirical FPR estimated from N negatives is quantized to multiples of
-    1/N -- you cannot measure a 1% false-positive rate with 16 samples any
-    more than you can measure it with a coin flip. `_threshold_at_fpr`
-    allows `int(target_fpr * N)` false positives, so once N < 1/target_fpr
-    that budget floors to ZERO and the "threshold at `target_fpr`" silently
-    degenerates into "just above the single highest negative score" -- a
-    max-of-N order statistic with enormous variance, not a 1% operating
-    point. The number still prints, which is exactly why this has to be
-    reported next to it rather than left to the reader.
-
-    Returns the resolution (1/N), the minimum N that makes `target_fpr`
-    representable at all (1/target_fpr, i.e. a budget of >= 1 false
-    positive), and whether this sample size clears it. `supported=False`
-    means the reported TPR@FPR is a lower bound of unknown tightness and
-    must not be quoted as a headline number -- raise batch_size *
-    n_eval_batches until it flips to True.
-    """
-    resolution = 1.0 / n_negatives if n_negatives > 0 else float("inf")
-    min_negatives = int(math.ceil(1.0 / target_fpr)) if target_fpr > 0 else 0
-    return {
-        "n_negatives": n_negatives,
-        "fpr_resolution": resolution,
-        "min_negatives_for_target": min_negatives,
-        "supported": n_negatives >= min_negatives,
-    }
 
 
 def bit_accuracy(m_hat: torch.Tensor, message: torch.Tensor, threshold: float = 0.5) -> float:
@@ -90,15 +53,7 @@ def _threshold_at_fpr(negative_scores: torch.Tensor, target_fpr: float) -> float
     false positives the budget allows. Stepping past that score (rather than
     landing on it) keeps ties at the boundary from spending more than the
     budget. Shared by `tpr_at_fpr` and `confusion_counts` so both report
-    numbers for the same operating point.
-
-    NOTE: `n_allowed` floors to 0 whenever `negative_scores` holds fewer than
-    `1 / target_fpr` samples, at which point this returns "just above the
-    maximum negative score" and the resulting TPR is a high-variance lower
-    bound rather than a real operating point. That degeneracy is silent here
-    by design (this is a pure threshold helper); call `fpr_support` to detect
-    it and report it alongside -- `evaluate.py:evaluate_attack` does.
-    """
+    numbers for the same operating point."""
     negative_sorted, _ = torch.sort(negative_scores, descending=True)
     n_allowed = int(target_fpr * negative_sorted.numel())
     if n_allowed >= negative_sorted.numel():

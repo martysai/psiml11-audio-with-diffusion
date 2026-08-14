@@ -47,14 +47,6 @@ output_dir: ./eval_outputs
 # of full strength -- the old [0.0 .. 1.0] grid went ~25x past their "hard
 # regime" and just destroys the audio).
 fpr_target: 0.01
-# NOTE: an FPR of f can only be resolved with at least 1/f negative
-# examples (batch_size * n_eval_batches of them, since every eval batch
-# contributes one negative per example). Below that the threshold search
-# degenerates to "just above the highest negative score" and the reported
-# tpr_at_fpr is a high-variance lower bound -- so fpr_target=0.01 needs
-# >= 100 negatives to be meaningful at all, and ~1000 to be stable.
-# evaluate.py reports this as fpr_support and warns when it isn't met;
-# it does NOT silently relax the target.
 t_star_grid: [0.0, 0.0003, 0.002, 0.006, 0.015, 0.04, 0.08]
 # The one t* the headline number is measured at for sgmse/audioldm (the
 # other attacks ignore strength). 0.04 = t*=40 = the mentor table's "hard
@@ -119,12 +111,6 @@ attack:
     num_iterations: 20
     init_num_evals: 20
     max_num_evals: 100
-    # Initialize the search from real opposite-class audio rather than
-    # uniform noise (see HopSkipJumpAttackConfig.init_from_reference).
-    # Examples the search still can't initialize on are reported as
-    # attack_failure_rate + tpr_at_fpr_attacked instead of counting as
-    # watermark robustness.
-    init_from_reference: true
 
 tracking:
   backend: wandb
