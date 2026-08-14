@@ -31,6 +31,7 @@ import logging
 import os
 import random
 import typing as tp
+from datetime import datetime
 
 import numpy as np
 import torch
@@ -285,7 +286,7 @@ def train_step(
         p = presence[:, 1, :].mean(dim=-1)  # presence prob per example, pooled over time
 
         # 4. losses
-        det_loss, presence_loss, bit_loss = detection_loss_components(p, m_hat, message)
+        det_loss, presence_loss, bit_loss = detection_loss_components(p, m_hat, message, bit_weight=cfg.lambda_bit)
         perc_loss = perceptual_loss_fn(x, x_wm)  # pre-attack, per spec
         total_loss = cfg.lambda_det * det_loss + cfg.lambda_perc * perc_loss
 
@@ -339,7 +340,7 @@ def eval_step(
             x_att, attack_name = attack(x_wm)
             presence, m_hat = detector.forward(x_att)
             p = presence[:, 1, :].mean(dim=-1)
-            det_loss, presence_loss, bit_loss = detection_loss_components(p, m_hat, message)
+            det_loss, presence_loss, bit_loss = detection_loss_components(p, m_hat, message, bit_weight=cfg.lambda_bit)
             perc_loss = perceptual_loss_fn(x, x_wm)
             total_loss = cfg.lambda_det * det_loss + cfg.lambda_perc * perc_loss
     finally:
@@ -415,7 +416,11 @@ def train(cfg: TrainConfig) -> None:
         )
         valid_iter = itertools.cycle(valid_dataloader)  # valid set is usually far smaller than epochs*updates
 
-    os.makedirs(cfg.checkpoint_dir, exist_ok=True)
+    # Each run gets its own timestamped subfolder under cfg.checkpoint_dir so
+    # that consecutive runs never overwrite each other's generator_epochN.pth
+    # files (previously all runs shared the same flat directory).
+    run_checkpoint_dir = os.path.join(cfg.checkpoint_dir, datetime.now().strftime("%Y%m%d_%H%M%S"))
+    os.makedirs(run_checkpoint_dir, exist_ok=True)
 
     step = 0
     try:
@@ -464,7 +469,7 @@ def train(cfg: TrainConfig) -> None:
                     break
 
             progress.close()
-            ckpt_path = f"{cfg.checkpoint_dir}/generator_epoch{epoch}.pth"
+            ckpt_path = f"{run_checkpoint_dir}/generator_epoch{epoch}.pth"
             torch.save({"model": generator.state_dict(), "xp.cfg": cfg}, ckpt_path)
             logger.info("saved checkpoint to %s", ckpt_path)
     finally:
