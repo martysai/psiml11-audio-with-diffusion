@@ -128,6 +128,27 @@ YAML therefore sets no key at all and lands on `mlflow`, whose tracking URI the
 AzureML runtime injects; metrics go to the Studio run with no outbound network.
 Use wandb for playground runs only.
 
+The `mlflow` path needs the **`azureml-mlflow`** plugin in the image, and it is
+easy to miss: AzureML injects a tracking URI of the form
+`azureml://<region>.api.azureml.ms/mlflow/v1.0/...`, and that `azureml://`
+scheme is registered by the *plugin*, not by mlflow itself. Without it every
+job dies at the first `mlflow.set_experiment()` with
+
+```
+UnsupportedModelRegistryStoreURIException: ... got unsupported URI 'azureml://...'
+```
+
+which names the *model registry* even though it is the tracking store that
+failed to resolve. `import mlflow` succeeds either way, so a build check has to
+perform the scheme lookup itself — the Dockerfile does. The plugin also caps
+`mlflow<=3.13.0`, so mlflow is pinned in the image constraints; left open it
+resolves to 3.15+ and `pip check` fails.
+
+Tracking is never load-bearing: if the backend cannot be constructed, or starts
+failing mid-run, `tracking.py` falls back to `ConsoleTracker` and training
+continues (metrics keep going to the job log). A telemetry outage should not
+kill a 24-hour GPU job.
+
 Two non-obvious details this handles for you:
 
 - The AML run id becomes the wandb/mlflow run name, so a chart traces back to
@@ -240,9 +261,21 @@ interactive login, against a stdin that will never answer — the job hangs to i
 timeout instead of erroring out. `aml_run.sh` guards on `WANDB_API_KEY` being
 non-empty for exactly this reason. Don't remove that check.
 
-**MLflow.** `tracking.py:84-85` calls `set_experiment()` then `start_run()`,
-while AML has already started a run for the job. Untested here; the wandb path
-is the supported one.
+**MLflow.** `tracking.py` calls `set_experiment()` then `start_run()` while AML
+has already started a run for the job. This is now the *default* path on
+manifold and is exercised there — `azureml-mlflow` reuses the ambient run
+rather than creating a competing one, so metrics land on the job you submitted.
+It needs that plugin in the image; see "Experiment tracking" above.
+
+**Registering an environment does not build it.** `az ml environment create`
+returns in well under a minute — it only registers the asset. The Docker build
+happens on the *first job that uses that version*, takes ~20 minutes, and is
+logged to that job's `azureml-logs/20_image_build_log.txt`, not to any
+environment view. So a job that looks stuck in `Preparing` for 20 minutes on a
+freshly registered version is usually just building. Two consequences: a build
+failure surfaces as a *job* failure, and `environment: azureml:...@latest`
+resolves at **submit** time — submit before registering and you silently pin the
+old version.
 
 **`eval_every` needs `data.valid_dir`.** `train.py:303-305` raises if you set one
 without the other. `aml_run.sh` always sets `VALID_DIR`, so overriding
