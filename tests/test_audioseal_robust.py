@@ -37,6 +37,7 @@ from audioseal.builder import (
 )
 from audioseal_robust.attacks import (
     AudioLDMAttack,
+    HopSkipJumpAttack,
     IdentityAttack,
     MBDAttack,
     SampledReconstructionAttack,
@@ -468,6 +469,102 @@ def test_audioldm_mel_gradients_stay_finite_on_silence():
 
     assert wav.grad is not None
     assert torch.isfinite(wav.grad).all()
+
+
+class _LevelDetector(torch.nn.Module):
+    """Deterministic, non-trained stand-in for AudioSealDetector: decides
+    "watermarked" purely from mean absolute amplitude vs. a threshold. Used
+    to test HopSkipJumpAttack's search logic exactly (a real detector's
+    decision surface can't be reasoned about analytically), matching the
+    stub-Detector style already used by test_evaluate_attack_uses_prepared_batches."""
+
+    def __init__(self, threshold: float = 0.5):
+        super().__init__()
+        self.threshold = threshold
+
+    def forward(self, x):
+        level = x.abs().mean(dim=(1, 2))
+        watermarked = (level > self.threshold).float()
+        presence = torch.stack([1 - watermarked, watermarked], dim=1).unsqueeze(-1)
+        message = torch.zeros(x.shape[0], 1)
+        return presence, message
+
+
+def test_hopskipjump_attack_without_checkpoint_stays_a_stub():
+    attack = HopSkipJumpAttack()
+    attack.bind_detector(_LevelDetector())
+    with pytest.raises(NotImplementedError, match="without being enabled"):
+        attack(torch.randn(1, 1, 1600))
+
+
+def test_hopskipjump_attack_requires_a_bound_detector():
+    attack = HopSkipJumpAttack(checkpoint="auto")
+    with pytest.raises(RuntimeError, match="no detector bound"):
+        attack(torch.randn(1, 1, 1600))
+
+
+def test_hopskipjump_attack_finds_a_decision_flip_near_the_boundary():
+    """HopSkipJumpAttack should return a waveform the detector decides
+    DIFFERENTLY on than x0 itself (the "label0" framing in its class
+    docstring -- correct for both the watermarked and clean branch
+    evaluate_attack calls it on), landing close to the decision boundary
+    thanks to binary search rather than just returning the crude random
+    initialization."""
+    torch.manual_seed(0)
+    detector = _LevelDetector(threshold=0.5)
+    attack = HopSkipJumpAttack(
+        checkpoint="auto",
+        num_iterations=15,
+        init_num_evals=10,
+        max_num_evals=30,
+        init_max_trials=200,
+        binary_search_steps=10,
+    )
+    attack.bind_detector(detector)
+
+    x0 = torch.full((1, 1, 2000), 0.9)
+    label0 = bool((detector.forward(x0)[0][:, 1, :].mean(dim=-1) > 0.5).item())
+    assert label0 is True  # sanity: x0 starts on the "watermarked" side
+
+    x_adv = attack(x0)
+
+    assert x_adv.shape == x0.shape
+    assert x_adv.dtype == x0.dtype
+    label_adv = bool((detector.forward(x_adv)[0][:, 1, :].mean(dim=-1) > 0.5).item())
+    assert label_adv is False  # decision flipped
+
+    level_adv = x_adv.abs().mean().item()
+    assert 0.3 < level_adv < 0.5  # close to the threshold, not raw random noise
+
+
+def test_hopskipjump_attack_gives_up_gracefully_when_init_never_flips():
+    """A detector that ALWAYS returns the same decision (e.g. a degenerate
+    or saturated one) has no adversarial region for random init to find --
+    the attack should return x0 unperturbed (and log a warning) rather than
+    hang or raise, per _initialize's documented fallback."""
+
+    class ConstantDetector(torch.nn.Module):
+        def forward(self, x):
+            presence = torch.zeros(x.shape[0], 2, 1)
+            presence[:, 0, :] = 1.0  # always "not watermarked"
+            return presence, torch.zeros(x.shape[0], 1)
+
+    attack = HopSkipJumpAttack(checkpoint="auto", init_max_trials=5)
+    attack.bind_detector(ConstantDetector())
+
+    x0 = torch.randn(1, 1, 500)
+    x_adv = attack(x0)
+
+    assert torch.equal(x_adv, x0)
+
+
+def test_build_eval_attacks_threads_hopskipjump_config_through():
+    cfg = load_eval_config(
+        ["eval_dir=.", "attack.hopskipjump.checkpoint=auto", "attack.hopskipjump.num_iterations=3"]
+    )
+    attacks, skipped = build_eval_attacks(["identity", "hopskipjump"], torch.device("cpu"), cfg)
+    assert not skipped
+    assert attacks["hopskipjump"].num_iterations == 3
 
 
 def test_build_eval_attacks_threads_per_attack_config_through():

@@ -114,6 +114,48 @@ class MBDAttackConfig:
 
 
 @dataclass
+class HopSkipJumpAttackConfig:
+    """Wires HopSkipJumpAttack (attacks.py) -- AudioMarkBench's hard-label,
+    black-box evasion attack against the detector itself (Chen et al. 2019),
+    not a resynthesis attack against the signal. Needs no external weights
+    (it only queries this project's own frozen detector), so `checkpoint`
+    here is a pure enable/disable gate -- same convention as
+    MBDAttackConfig -- not an actual model/weights path. Eval-only: see
+    attacks.py:HopSkipJumpAttack's docstring for why this must never be
+    given a nonzero weight in TrainConfig's AttackWeights.
+    """
+
+    # Any non-None value (e.g. "auto") enables this attack. None (default)
+    # keeps it a stub -- query-based black-box search costs hundreds of
+    # detector forward passes PER WAVEFORM (far more than every other
+    # attack here), so it must be opted into deliberately, together with a
+    # much smaller batch_size/n_eval_batches than the other attacks use.
+    checkpoint: tp.Optional[str] = None
+    # Presence-probability threshold the detector's hard "watermarked?"
+    # decision is read off at -- 0.5 matches AudioSeal's own
+    # detect_watermark default.
+    detection_threshold: float = 0.5
+    # Outer gradient-estimate/step-search iterations per example.
+    num_iterations: int = 20
+    # Monte Carlo queries per gradient estimate at iteration 1, growing as
+    # init_num_evals * sqrt(iteration), capped at max_num_evals.
+    init_num_evals: int = 20
+    max_num_evals: int = 100
+    # Random-noise draws attempted before giving up on finding ANY
+    # adversarial starting point for an example (see
+    # HopSkipJumpAttack._initialize).
+    init_max_trials: int = 100
+    # Bisection steps used to re-land on the decision boundary after each
+    # gradient step (and for the initial random point).
+    binary_search_steps: int = 10
+    # L2 step-size scaling constant (theta = gamma / d**1.5) -- see
+    # HopSkipJumpAttack._select_delta.
+    gamma: float = 1.0
+    clip_min: float = -1.0
+    clip_max: float = 1.0
+
+
+@dataclass
 class AttackWeights:
     # Sampling weight for each attack branch (need not sum to 1; normalized
     # internally). A weight of 0 disables that branch. Identity is the only
@@ -250,6 +292,7 @@ class EvalAttackConfig:
     sgmse: SGMSEAttackConfig = field(default_factory=SGMSEAttackConfig)
     audioldm: AudioLDMAttackConfig = field(default_factory=AudioLDMAttackConfig)
     mbd: MBDAttackConfig = field(default_factory=MBDAttackConfig)
+    hopskipjump: HopSkipJumpAttackConfig = field(default_factory=HopSkipJumpAttackConfig)
 
 
 @dataclass
