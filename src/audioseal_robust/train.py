@@ -200,6 +200,18 @@ def _grad_norm(module: nn.Module) -> float:
     return total_sq**0.5
 
 
+def _clip_grad_norm_per_sample(grad: torch.Tensor, max_norm: float) -> torch.Tensor:
+    """Clip each batch item's L2 norm without changing its direction."""
+    if max_norm <= 0:
+        raise ValueError("max_x_wm_grad_norm must be positive")
+
+    norms = grad.detach().float().flatten(start_dim=1).norm(2, dim=1)
+    finite_scales = (max_norm / norms.clamp_min(1e-12)).clamp(max=1.0)
+    scales = torch.where(torch.isfinite(norms), finite_scales, torch.ones_like(norms))
+    shape = (grad.shape[0],) + (1,) * (grad.ndim - 1)
+    return grad * scales.to(dtype=grad.dtype).view(shape)
+
+
 def train_step(
     generator: AudioSealWM,
     detector: AudioSealDetector,
@@ -241,7 +253,16 @@ def train_step(
 
             return hook
 
-        x_wm.register_hook(_capture_activation_grad_norm("x_wm"))
+        def _clip_and_capture_x_wm_grad(grad: torch.Tensor) -> torch.Tensor:
+            activation_grad_norms["x_wm"] = grad.detach().float().norm(2).item()
+            if cfg.optim.max_x_wm_grad_norm is None:
+                return grad
+
+            clipped = _clip_grad_norm_per_sample(grad, cfg.optim.max_x_wm_grad_norm)
+            activation_grad_norms["x_wm_clipped"] = clipped.detach().float().norm(2).item()
+            return clipped
+
+        x_wm.register_hook(_clip_and_capture_x_wm_grad)
 
         # 2. sampled reconstruction attack (frozen, graph stays connected)
         x_att, attack_name = attack(x_wm)
@@ -262,7 +283,7 @@ def train_step(
     grad_norm_generator = _grad_norm(generator)
     grad_norm_attack = _grad_norm(attack)  # expected: always 0.0, see _grad_norm's docstring
     if cfg.optim.max_norm is not None:
-        torch.nn.utils.clip_grad_norm_(generator.parameters(), cfg.optim.max_norm)
+        torch.nn.utils.clip_grad_norm_(generator.parameters(), cfg.optim.max_norm, error_if_nonfinite=True)
     optimizer.step()
 
     return {
@@ -275,6 +296,9 @@ def train_step(
         "grad_norm_generator": grad_norm_generator,
         "grad_norm_attack": grad_norm_attack,
         "grad_norm_x_wm": activation_grad_norms.get("x_wm", 0.0),
+        "grad_norm_x_wm_clipped": activation_grad_norms.get(
+            "x_wm_clipped", activation_grad_norms.get("x_wm", 0.0)
+        ),
         "grad_norm_x_att": activation_grad_norms.get("x_att", 0.0),
         "attack": attack_name,
     }
