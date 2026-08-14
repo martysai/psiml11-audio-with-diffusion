@@ -36,6 +36,7 @@ import time
 import typing as tp
 from pathlib import Path
 
+import numpy as np
 import torch
 import torch.nn as nn
 from omegaconf import OmegaConf
@@ -300,7 +301,11 @@ def evaluate_perceptual(
 
 def run(cfg: EvalConfig) -> tp.Dict[str, tp.Any]:
     device = resolve_device(cfg.device)
+    # See train.py's train() for why all four (not just torch's default CPU
+    # generator) need seeding here too.
     torch.manual_seed(cfg.seed)
+    torch.cuda.manual_seed_all(cfg.seed)
+    np.random.seed(cfg.seed)
     random.seed(cfg.seed)
 
     generator = load_generator_under_test(cfg.generator_checkpoint, cfg.nbits, device)

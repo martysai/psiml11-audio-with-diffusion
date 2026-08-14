@@ -157,6 +157,7 @@ class OptimConfig:
     betas: tp.Tuple[float, float] = (0.5, 0.9)
     weight_decay: float = 0.0
     max_norm: tp.Optional[float] = 3.0
+    max_x_wm_grad_norm: tp.Optional[float] = 1000.0
 
 
 @dataclass
@@ -224,6 +225,19 @@ class TrainConfig:
     # overlap with if that solver were used instead/also.
     lambda_det: float = 1.0
     lambda_perc: float = 1.0
+    # Extra weight on bit_loss specifically, within detection_loss_components'
+    # (presence_loss + lambda_bit * bit_loss) -- separate from lambda_det,
+    # which scales the whole presence+bit sum together and so can't rebalance
+    # the two against each other. Default 1.0 == old unweighted behavior
+    # (equivalent to no bit_loss field at all). See run_train_10h.sh's
+    # lambda_bit=2.0 override for why: presence_loss is the "easy" half of
+    # detection_loss (the generator can win it just by embedding *something*
+    # detectable, without correctly encoding bits), so it drops fast and
+    # plateaus while bit_loss doesn't move (see the comic-snowball-9 run's
+    # eval/bit_loss curve) -- weighting bit_loss higher pushes optimization
+    # toward the actually-hard sub-problem instead of letting it settle for
+    # the cheap presence-only win.
+    lambda_bit: float = 1.0
 
     # Per-example watermark SNR (dB) is sampled uniformly from this range
     # every training step (see train.py:embed_watermark) rather than using

@@ -31,7 +31,9 @@ import logging
 import os
 import random
 import typing as tp
+from datetime import datetime
 
+import numpy as np
 import torch
 import torch.nn as nn
 from omegaconf import OmegaConf
@@ -273,6 +275,37 @@ class CudaMemoryProbe:
         return dict(self._metrics)
 
 
+def _clip_grad_norm_per_sample(grad: torch.Tensor, max_norm: float) -> torch.Tensor:
+    """Clip each batch item's L2 norm without changing its direction."""
+    if max_norm <= 0:
+        raise ValueError("max_x_wm_grad_norm must be positive")
+
+    norms = grad.detach().float().flatten(start_dim=1).norm(2, dim=1)
+    finite_scales = (max_norm / norms.clamp_min(1e-12)).clamp(max=1.0)
+    scales = torch.where(torch.isfinite(norms), finite_scales, torch.ones_like(norms))
+    shape = (grad.shape[0],) + (1,) * (grad.ndim - 1)
+    return grad * scales.to(dtype=grad.dtype).view(shape)
+
+
+def _clip_and_capture_activation_grad(
+    name: str,
+    activation_grad_norms: tp.Dict[str, float],
+    max_norm: tp.Optional[float],
+) -> tp.Callable[[torch.Tensor], torch.Tensor]:
+    """Record an activation's grad norm, then optionally clip it per sample."""
+
+    def hook(grad: torch.Tensor) -> torch.Tensor:
+        activation_grad_norms[name] = grad.detach().float().norm(2).item()
+        if max_norm is None:
+            return grad
+
+        clipped = _clip_grad_norm_per_sample(grad, max_norm)
+        activation_grad_norms[f"{name}_clipped"] = clipped.detach().float().norm(2).item()
+        return clipped
+
+    return hook
+
+
 def train_step(
     generator: AudioSealWM,
     detector: AudioSealDetector,
@@ -317,7 +350,9 @@ def train_step(
 
             return hook
 
-        x_wm.register_hook(_capture_activation_grad_norm("x_wm"))
+        x_wm.register_hook(
+            _clip_and_capture_activation_grad("x_wm", activation_grad_norms, cfg.optim.max_x_wm_grad_norm)
+        )
 
         # 2. sampled reconstruction attack (frozen, graph stays connected)
         x_att, attack_name = attack(x_wm)
@@ -328,7 +363,7 @@ def train_step(
         p = presence[:, 1, :].mean(dim=-1)  # presence prob per example, pooled over time
 
         # 4. losses
-        det_loss, presence_loss, bit_loss = detection_loss_components(p, m_hat, message)
+        det_loss, presence_loss, bit_loss = detection_loss_components(p, m_hat, message, bit_weight=cfg.lambda_bit)
         perc_loss = perceptual_loss_fn(x, x_wm)  # pre-attack, per spec
         total_loss = cfg.lambda_det * det_loss + cfg.lambda_perc * perc_loss
 
@@ -340,7 +375,7 @@ def train_step(
     grad_norm_generator = _grad_norm(generator)
     grad_norm_attack = _grad_norm(attack)  # expected: always 0.0, see _grad_norm's docstring
     if cfg.optim.max_norm is not None:
-        torch.nn.utils.clip_grad_norm_(generator.parameters(), cfg.optim.max_norm)
+        torch.nn.utils.clip_grad_norm_(generator.parameters(), cfg.optim.max_norm, error_if_nonfinite=True)
     optimizer.step()
 
     return {
@@ -353,6 +388,9 @@ def train_step(
         "grad_norm_generator": grad_norm_generator,
         "grad_norm_attack": grad_norm_attack,
         "grad_norm_x_wm": activation_grad_norms.get("x_wm", 0.0),
+        "grad_norm_x_wm_clipped": activation_grad_norms.get(
+            "x_wm_clipped", activation_grad_norms.get("x_wm", 0.0)
+        ),
         "grad_norm_x_att": activation_grad_norms.get("x_att", 0.0),
         "attack": attack_name,
         **memory.metrics(),  # empty off CUDA / with tracking.log_memory=false
@@ -382,7 +420,7 @@ def eval_step(
             x_att, attack_name = attack(x_wm)
             presence, m_hat = detector.forward(x_att)
             p = presence[:, 1, :].mean(dim=-1)
-            det_loss, presence_loss, bit_loss = detection_loss_components(p, m_hat, message)
+            det_loss, presence_loss, bit_loss = detection_loss_components(p, m_hat, message, bit_weight=cfg.lambda_bit)
             perc_loss = perceptual_loss_fn(x, x_wm)
             total_loss = cfg.lambda_det * det_loss + cfg.lambda_perc * perc_loss
     finally:
@@ -413,7 +451,17 @@ def build_experiment_tracker(cfg: TrainConfig) -> ExperimentTracker:
 
 
 def train(cfg: TrainConfig) -> None:
+    # All RNG sources actually touched by this pipeline: torch.manual_seed
+    # alone only seeds the default CPU generator, not CUDA's per-device ones
+    # (torch.cuda.manual_seed_all covers every visible GPU, harmless no-op if
+    # none); numpy has its own independent RNG state (soundfile/librosa/scipy
+    # in the sgmse/data path can draw from it); random.seed covers Python
+    # stdlib (random_message doesn't use it, but attacks.py's AudioLDMAttack
+    # None-strength sampling and SampledReconstructionAttack's attack-name
+    # choice do).
     torch.manual_seed(cfg.seed)
+    torch.cuda.manual_seed_all(cfg.seed)
+    np.random.seed(cfg.seed)
     random.seed(cfg.seed)
 
     device = resolve_device(cfg.device)
@@ -448,7 +496,11 @@ def train(cfg: TrainConfig) -> None:
         )
         valid_iter = itertools.cycle(valid_dataloader)  # valid set is usually far smaller than epochs*updates
 
-    os.makedirs(cfg.checkpoint_dir, exist_ok=True)
+    # Each run gets its own timestamped subfolder under cfg.checkpoint_dir so
+    # that consecutive runs never overwrite each other's generator_epochN.pth
+    # files (previously all runs shared the same flat directory).
+    run_checkpoint_dir = os.path.join(cfg.checkpoint_dir, datetime.now().strftime("%Y%m%d_%H%M%S"))
+    os.makedirs(run_checkpoint_dir, exist_ok=True)
 
     step = 0
     try:
@@ -497,7 +549,7 @@ def train(cfg: TrainConfig) -> None:
                     break
 
             progress.close()
-            ckpt_path = f"{cfg.checkpoint_dir}/generator_epoch{epoch}.pth"
+            ckpt_path = f"{run_checkpoint_dir}/generator_epoch{epoch}.pth"
             torch.save({"model": generator.state_dict(), "xp.cfg": cfg}, ckpt_path)
             logger.info("saved checkpoint to %s", ckpt_path)
     finally:
