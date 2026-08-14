@@ -201,6 +201,10 @@ def build_generator(cfg: TrainConfig, device: torch.device) -> AudioSealWM:
     left fully trainable -- this fine-tunes it further, it does not train
     from scratch."""
     generator = AudioSeal.load_generator(cfg.generator.checkpoint, nbits=cfg.nbits, device=device)
+    if cfg.generator.resume_from:
+        state = torch.load(cfg.generator.resume_from, map_location=device, weights_only=False)
+        generator.load_state_dict(state["model"])
+        logger.info("resumed generator weights from %s", cfg.generator.resume_from)
     generator.train()
     return generator
 
