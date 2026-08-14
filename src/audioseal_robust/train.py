@@ -487,36 +487,69 @@ def build_experiment_tracker(cfg: TrainConfig, env: DistEnv = DistEnv()) -> Expe
 
 
 class EpochBatchIterator:
-    """Yields exactly `updates_per_epoch` batches per epoch, restarting the
-    dataloader with a fresh shuffle whenever it runs out.
+    """Yields one epoch of batches, restarting the dataloader with a fresh
+    shuffle only when sharding left this rank's loader too short to cover the
+    epoch on its own.
 
-    Without this, `updates_per_epoch` silently stops being the thing that
-    ends an epoch as soon as the data is sharded. A DistributedSampler gives
-    each rank `len(dataset) / world_size` examples, so the per-rank loader has
-    1/world_size as many batches: with LibriSpeech train-clean-100 at
-    batch_size=16 that is 1783 batches on one GPU but 445 on each of four, so
-    a plain `for batch in dataloader` with a `break` at 1000 would end the
-    epoch at 1000 steps on one GPU and at 445 on four -- 2.25x fewer optimizer
-    steps and checkpoints written twice as often, from an unchanged config.
-    Cycling keeps the optimizer-step schedule identical to the single-GPU run.
+    An epoch is `min(updates_per_epoch, batches_per_pass * world_size)`
+    optimizer steps, where `batches_per_pass` is the length of THIS rank's
+    loader. Both halves of that minimum matter:
 
-    The consequence, which is inherent to a 4x larger effective batch rather
-    than to this class: an epoch now consumes more than one pass over the
-    data (~2.25 passes in the example above), since each step consumes
-    world_size batches. `set_epoch` is called with a monotonically increasing
-    pass index, so every pass is shuffled differently rather than replaying
-    the same order.
+    - `updates_per_epoch` is the configured cap. On the full ~100h
+      train-clean-100 at batch_size=16, a single GPU's loader holds 1783
+      batches and the cap of 1000 is what ends the epoch.
+    - `batches_per_pass * world_size` is how many steps one pass over the
+      *dataset* supports, which does not depend on the GPU count. A
+      DistributedSampler hands each rank `len(dataset) / world_size`
+      examples, so the per-rank loader has 1/world_size as many batches --
+      445 on each of four GPUs in the example above. Multiplying back by
+      `world_size` is what keeps a 4-GPU epoch the same 1000 steps as the
+      1-GPU epoch of the same config instead of 445 (2.25x fewer optimizer
+      steps and checkpoints written twice as often, from an unchanged
+      config). This is the only case in which this class cycles.
+
+    On one process the two terms collapse to the pre-DDP loop -- `for batch
+    in dataloader` with a break at `updates_per_epoch` -- so a single-GPU run
+    still ends its epoch when the data runs out and the cap stays a cap
+    rather than becoming a target. That distinction is load-bearing for
+    run_train_10h.sh: its 10h subset exhausts at ~167 steps/epoch and is
+    meant to stop there (~16.7k steps over 100 epochs), not to replay itself
+    up to the config's 100k.
+
+    The consequence of cycling, inherent to a `world_size`x larger effective
+    batch rather than to this class: such an epoch consumes `world_size`
+    passes over the data, since each step consumes `world_size` batches.
+    `set_epoch` is called with a monotonically increasing pass index, so
+    every pass is shuffled differently rather than replaying the same order.
 
     All ranks advance in lockstep -- `drop_last=True` gives them equal loader
     lengths, so they exhaust and restart on the same step.
     """
 
-    def __init__(self, dataloader, sampler: tp.Optional[DistributedSampler], updates_per_epoch: int):
+    def __init__(
+        self,
+        dataloader,
+        sampler: tp.Optional[DistributedSampler],
+        updates_per_epoch: int,
+        world_size: int = 1,
+    ):
         self._dataloader = dataloader
         self._sampler = sampler
         self._updates_per_epoch = updates_per_epoch
+        self._world_size = max(1, world_size)
         self._pass_index = 0
         self._iterator: tp.Optional[tp.Iterator[torch.Tensor]] = None
+
+    @property
+    def batches_per_pass(self) -> int:
+        """Batches in one pass over this rank's shard."""
+        return len(self._dataloader)
+
+    @property
+    def steps_per_epoch(self) -> int:
+        """Exact number of steps `epoch()` will yield, so the progress bar's
+        total and the epoch itself cannot disagree."""
+        return min(self._updates_per_epoch, self.batches_per_pass * self._world_size)
 
     def _start_pass(self) -> None:
         if self._sampler is not None:
@@ -525,7 +558,12 @@ class EpochBatchIterator:
         self._iterator = iter(self._dataloader)
 
     def epoch(self) -> tp.Iterator[torch.Tensor]:
-        for _ in range(self._updates_per_epoch):
+        if self.batches_per_pass == 0:
+            raise RuntimeError(
+                "dataloader produced no batches -- not enough audio for this batch_size "
+                f"(and world size {self._world_size})"
+            )
+        for _ in range(self.steps_per_epoch):
             if self._iterator is None:
                 self._start_pass()
             try:
@@ -596,13 +634,22 @@ def train(cfg: TrainConfig) -> None:
         os.makedirs(cfg.checkpoint_dir, exist_ok=True)
     barrier(env)  # no rank may reach the first torch.save before the dir exists
 
-    batch_iterator = EpochBatchIterator(dataloader, sampler, cfg.updates_per_epoch)
-    if len(dataloader) < cfg.updates_per_epoch:
+    batch_iterator = EpochBatchIterator(dataloader, sampler, cfg.updates_per_epoch, env.world_size)
+    steps_per_epoch = batch_iterator.steps_per_epoch
+    if steps_per_epoch < cfg.updates_per_epoch:
         logger.info(
-            "per-rank loader has %d batches but updates_per_epoch=%d, so each epoch makes ~%.2f "
+            "epoch is %d steps, not updates_per_epoch=%d: one pass over the data supports only "
+            "that many (this rank's loader holds %d batches at world_size=%d). "
+            "updates_per_epoch is a cap, not a target -- see EpochBatchIterator",
+            steps_per_epoch, cfg.updates_per_epoch, batch_iterator.batches_per_pass, env.world_size,
+        )
+    elif batch_iterator.batches_per_pass < steps_per_epoch:
+        logger.info(
+            "per-rank loader has %d batches but an epoch is %d steps, so each epoch makes ~%.2f "
             "passes over this rank's shard (see EpochBatchIterator -- the optimizer-step schedule "
-            "is kept, the data is revisited)",
-            len(dataloader), cfg.updates_per_epoch, cfg.updates_per_epoch / max(len(dataloader), 1),
+            "matches the single-GPU run, the data is revisited)",
+            batch_iterator.batches_per_pass, steps_per_epoch,
+            steps_per_epoch / max(batch_iterator.batches_per_pass, 1),
         )
 
     step = 0
@@ -612,7 +659,7 @@ def train(cfg: TrainConfig) -> None:
             # interleave into unreadable output. EpochBatchIterator makes the
             # total exact, so the bar always ends where the epoch does.
             progress = tqdm(
-                total=cfg.updates_per_epoch,
+                total=steps_per_epoch,
                 desc=f"epoch {epoch}",
                 unit="step",
                 leave=False,

@@ -50,11 +50,11 @@ split across ranks rather than multiplied by them.
 
 ### Epochs consume more than one pass over the data
 
-`updates_per_epoch` is the real end of an epoch: an epoch runs exactly that
-many optimizer steps, on any number of GPUs. Since each step now consumes
-`world_size` batches, an epoch gets through proportionally more data --
+An epoch is `min(updates_per_epoch, batches_per_pass x world_size)` optimizer
+steps, where `batches_per_pass` is the length of *this rank's* loader. That
+comes out to the same number on any number of GPUs, which is the point.
 `EpochBatchIterator` (in `train.py`) restarts the loader with a fresh shuffle
-whenever it runs out.
+when -- and only when -- sharding left this rank short of that number.
 
 This matters because the alternative is worse and silent. A
 `DistributedSampler` hands each rank `len(dataset) / world_size` examples, so
@@ -64,6 +64,12 @@ the epoch when the loader runs dry would mean the same config runs 445-step
 epochs instead of 1000-step ones on 4 GPUs -- 2.25x fewer optimizer steps
 over the run, and checkpoints written twice as often -- with nothing in the
 config or the logs saying so.
+
+`updates_per_epoch` stays a **cap**, never a target. When one pass over the
+data is genuinely shorter than it, the epoch ends there on every GPU count:
+`run_train_10h.sh`'s 10h subset exhausts at ~167 steps/epoch, so it runs
+~16.7k steps over 100 epochs rather than replaying itself up to the config's
+100 x 1000. The startup log says which of the two bounds is in force.
 
 If you would rather have "one epoch = one pass over the data", set
 `updates_per_epoch` to the per-rank loader length yourself
