@@ -48,9 +48,11 @@ from audioseal_robust.evaluate import (
     build_eval_attacks,
     evaluate_attack,
     evaluate_perceptual,
+    load_generator_under_test,
     prepare_eval_batches,
 )
 from audioseal_robust.losses import PsychoacousticMelLoss, detection_loss
+from audioseal_robust.model_init import build_untrained_generator
 from audioseal_robust.train import embed_watermark
 
 
@@ -556,6 +558,32 @@ def test_hopskipjump_attack_gives_up_gracefully_when_init_never_flips():
     x_adv = attack(x0)
 
     assert torch.equal(x_adv, x0)
+
+
+def test_load_generator_under_test_accepts_a_legacy_named_checkpoint(tmp_path):
+    """Regression test: train.py's checkpoints (torch.save({"model":
+    generator.state_dict()...})) use the pre-torchscripting-update flat conv
+    naming (".conv.weight"/".conv.bias"), but this Python (>=3.10) build's
+    AudioSealWM wraps those an extra "inner_conv" level (Moshi's SEANet) --
+    load_generator_under_test's .pth branch called audioseal_load_state_dict
+    directly, skipping the convert_state_dict_for_scriptable_model step that
+    AudioSeal.load_generator/load_detector already apply for the model-card
+    path, and raised "Missing/Unexpected key(s)" for every conv layer on a
+    real fine-tuned checkpoint saved by train.py running on a different box."""
+    reference = build_untrained_generator(nbits=4, device=torch.device("cpu"))
+    legacy_state = {k.replace("inner_conv.", ""): v for k, v in reference.state_dict().items()}
+    assert legacy_state != reference.state_dict()  # sanity: the rename actually did something
+
+    ckpt_path = tmp_path / "generator_epoch3.pth"
+    torch.save({"model": legacy_state}, ckpt_path)
+
+    loaded = load_generator_under_test(str(ckpt_path), nbits=4, device=torch.device("cpu"))
+
+    for (name, ref_param), (loaded_name, loaded_param) in zip(
+        reference.state_dict().items(), loaded.state_dict().items()
+    ):
+        assert name == loaded_name
+        assert torch.equal(ref_param, loaded_param)
 
 
 def test_build_eval_attacks_threads_hopskipjump_config_through():
