@@ -43,6 +43,7 @@ from omegaconf import OmegaConf
 from tqdm import tqdm
 
 from audioseal import AudioSeal
+from audioseal.loader import convert_state_dict_for_scriptable_model
 from audioseal.loader import load_state_dict as audioseal_load_state_dict
 from audioseal.models import AudioSealDetector, AudioSealWM
 
@@ -123,7 +124,18 @@ def load_generator_under_test(checkpoint: str, nbits: int, device: torch.device)
         logger.info("loading fine-tuned generator from %s", path)
         state = torch.load(path, map_location=device, weights_only=False)
         generator = build_untrained_generator(nbits=nbits, device=device)
-        audioseal_load_state_dict(generator, state["model"])
+        # Same conversion AudioSeal.load_generator/load_detector apply
+        # internally (see loader.py) before their own load_state_dict call --
+        # train.py's checkpoints (torch.save({"model": generator.state_dict()...}))
+        # use the pre-torchscripting-update flat conv naming
+        # (".conv.weight"/".conv.bias"), while this Python (>=3.10) build
+        # of AudioSealWM's Moshi-based SEANet wraps those in an extra
+        # "inner_conv" level. Skipping this raised "Missing/Unexpected
+        # key(s)" for every conv layer on a real fine-tuned checkpoint --
+        # confirmed by hand -- since only the model-card loading path
+        # applied it before now.
+        state_dict = convert_state_dict_for_scriptable_model(state["model"])
+        audioseal_load_state_dict(generator, state_dict)
         return generator
     logger.info("loading generator checkpoint/card %r", checkpoint)
     return AudioSeal.load_generator(checkpoint, nbits=nbits, device=device)
