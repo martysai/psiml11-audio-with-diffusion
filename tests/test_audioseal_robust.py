@@ -50,7 +50,7 @@ from audioseal_robust.evaluate import (
     prepare_eval_batches,
 )
 from audioseal_robust.losses import PsychoacousticMelLoss, detection_loss
-from audioseal_robust.train import embed_watermark
+from audioseal_robust.train import _clip_grad_norm_per_sample, embed_watermark
 
 
 def _tiny_seanet_config() -> SEANetConfig:
@@ -235,6 +235,15 @@ def test_gradients_flow_to_generator_only():
         assert torch.equal(detector_state_before[key], detector_state_after[key]), (
             f"detector param {key} changed after optimizer.step()"
         )
+
+
+def test_clip_grad_norm_per_sample_only_scales_outlier():
+    grad = torch.tensor([[[3.0, 4.0]], [[0.3, 0.4]]])
+
+    clipped = _clip_grad_norm_per_sample(grad, max_norm=1.0)
+
+    assert torch.allclose(clipped[0], torch.tensor([[0.6, 0.8]]))
+    assert torch.equal(clipped[1], grad[1])
 
 
 def test_sampled_attack_only_picks_enabled_branches():
