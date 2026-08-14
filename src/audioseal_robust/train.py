@@ -55,6 +55,7 @@ import itertools
 import logging
 import os
 import typing as tp
+from datetime import datetime
 
 import torch
 import torch.nn as nn
@@ -82,6 +83,7 @@ from .distributed import (
     barrier,
     cleanup_distributed,
     configure_logging,
+    gather_objects,
     init_distributed,
     seed_everything,
     unwrap_module,
@@ -387,7 +389,7 @@ def train_step(
         p = presence[:, 1, :].mean(dim=-1)  # presence prob per example, pooled over time
 
         # 4. losses
-        det_loss, presence_loss, bit_loss = detection_loss_components(p, m_hat, message)
+        det_loss, presence_loss, bit_loss = detection_loss_components(p, m_hat, message, bit_weight=cfg.lambda_bit)
         perc_loss = perceptual_loss_fn(x, x_wm)  # pre-attack, per spec
         total_loss = cfg.lambda_det * det_loss + cfg.lambda_perc * perc_loss
 
@@ -449,7 +451,7 @@ def eval_step(
             x_att, attack_name = attack(x_wm)
             presence, m_hat = detector.forward(x_att)
             p = presence[:, 1, :].mean(dim=-1)
-            det_loss, presence_loss, bit_loss = detection_loss_components(p, m_hat, message)
+            det_loss, presence_loss, bit_loss = detection_loss_components(p, m_hat, message, bit_weight=cfg.lambda_bit)
             perc_loss = perceptual_loss_fn(x, x_wm)
             total_loss = cfg.lambda_det * det_loss + cfg.lambda_perc * perc_loss
     finally:
@@ -630,8 +632,22 @@ def train(cfg: TrainConfig) -> None:
         # adding reshuffling noise to it.
         valid_iter = itertools.cycle(valid_dataloader)  # valid set is usually far smaller than epochs*updates
 
+    # Each run gets its own timestamped subfolder under cfg.checkpoint_dir so
+    # that consecutive runs never overwrite each other's generator_epochN.pth
+    # files (previously all runs shared the same flat directory).
+    #
+    # The timestamp is taken from rank 0 and shared, not computed per rank:
+    # four independent datetime.now() calls can straddle a second boundary and
+    # produce up to four different folder names. Only rank 0 writes
+    # checkpoints today, so a split would be latent rather than fatal -- but
+    # it would make the path rank-dependent, which anything added later
+    # (resume, per-rank artifacts) would inherit as a bug. gather_objects
+    # returns every rank's value in rank order, so [0] is rank 0's.
+    run_checkpoint_dir = gather_objects(
+        os.path.join(cfg.checkpoint_dir, datetime.now().strftime("%Y%m%d_%H%M%S")), env
+    )[0]
     if env.is_main:
-        os.makedirs(cfg.checkpoint_dir, exist_ok=True)
+        os.makedirs(run_checkpoint_dir, exist_ok=True)
     barrier(env)  # no rank may reach the first torch.save before the dir exists
 
     batch_iterator = EpochBatchIterator(dataloader, sampler, cfg.updates_per_epoch, env.world_size)
@@ -708,7 +724,7 @@ def train(cfg: TrainConfig) -> None:
                 # WatermarkEmbedder state_dict has every key prefixed
                 # `module.generator.`, which evaluate.py's
                 # load_generator_under_test could not load.
-                ckpt_path = f"{cfg.checkpoint_dir}/generator_epoch{epoch}.pth"
+                ckpt_path = f"{run_checkpoint_dir}/generator_epoch{epoch}.pth"
                 torch.save({"model": unwrap_generator(embedder).state_dict(), "xp.cfg": cfg}, ckpt_path)
                 logger.info("saved checkpoint to %s", ckpt_path)
             barrier(env)  # keep ranks in lockstep across the epoch boundary
