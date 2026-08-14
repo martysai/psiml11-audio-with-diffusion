@@ -157,6 +157,7 @@ class OptimConfig:
     betas: tp.Tuple[float, float] = (0.5, 0.9)
     weight_decay: float = 0.0
     max_norm: tp.Optional[float] = 3.0
+    max_x_wm_grad_norm: tp.Optional[float] = 1000.0
 
 
 @dataclass
