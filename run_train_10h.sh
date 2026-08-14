@@ -120,6 +120,12 @@ build_subset "$VALID_SOURCE_DIR" "$VALID_SUBSET_DIR" "$VALID_TARGET_MINUTES"
 # mask or compete with what detection_loss alone is doing. Not a permanent
 # default -- re-enable (drop this override) once detection-side training is
 # actually working, since perceptual quality still matters for the real run.
+# lambda_bit=2.0: presence_loss is the "easy" half of detection_loss (the
+# generator can win it just by embedding *something* detectable, without
+# correctly encoding bits) -- that's why comic-snowball-9's presence_loss
+# dropped fast while bit_loss never moved. Weighting bit_loss 2x pushes
+# optimization toward the actually-hard sub-problem instead of letting it
+# settle for the cheap presence-only win. See TrainConfig.lambda_bit.
 set +e
 PYTHONUNBUFFERED=1 PYTHONPATH=src python3 -m audioseal_robust.train \
   recipe=sgmse_mixed \
@@ -128,6 +134,7 @@ PYTHONUNBUFFERED=1 PYTHONPATH=src python3 -m audioseal_robust.train \
   data.valid_dir="$VALID_SUBSET_DIR" \
   eval_every=100 \
   lambda_perc=0.0 \
+  lambda_bit=2.0 \
   device=auto \
   2>&1 | tee "$LOG"
 STATUS=${PIPESTATUS[0]}
