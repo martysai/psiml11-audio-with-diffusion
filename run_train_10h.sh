@@ -36,6 +36,14 @@ if [ ! -f "$SGMSE_CHECKPOINT" ]; then
   exit 1
 fi
 
+# default.yaml's batch_size=16 OOMs on a 40GB A100 here: SGMSEAttack.forward
+# (attacks.py) unrolls num_steps=30 reverse-diffusion steps deliberately NOT
+# under torch.no_grad (the attack must stay differentiable for training), so
+# autograd retains all 30 steps' activations at once -- memory scales with
+# num_steps * batch_size, not just weights. Lower this via env var if it
+# still OOMs, or raise it if profiling shows headroom.
+BATCH_SIZE="${BATCH_SIZE:-8}"
+
 # Validation: dev-clean (never in train-clean-100, so eval_step measures
 # something meaningful instead of re-scoring the training set under a
 # different name). 60min target -- see the reasoning this was picked with:
@@ -132,6 +140,7 @@ PYTHONUNBUFFERED=1 PYTHONPATH=src python3 -m audioseal_robust.train \
   attack.sgmse.checkpoint="$SGMSE_CHECKPOINT" \
   data.train_dir="$TRAIN_SUBSET_DIR" \
   data.valid_dir="$VALID_SUBSET_DIR" \
+  data.batch_size="$BATCH_SIZE" \
   eval_every=100 \
   lambda_perc=0.0 \
   lambda_bit=2.0 \
