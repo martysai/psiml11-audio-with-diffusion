@@ -31,6 +31,7 @@ import logging
 import os
 import random
 import typing as tp
+from datetime import datetime
 
 import numpy as np
 import torch
@@ -403,7 +404,11 @@ def train(cfg: TrainConfig) -> None:
         )
         valid_iter = itertools.cycle(valid_dataloader)  # valid set is usually far smaller than epochs*updates
 
-    os.makedirs(cfg.checkpoint_dir, exist_ok=True)
+    # Each run gets its own timestamped subfolder under cfg.checkpoint_dir so
+    # that consecutive runs never overwrite each other's generator_epochN.pth
+    # files (previously all runs shared the same flat directory).
+    run_checkpoint_dir = os.path.join(cfg.checkpoint_dir, datetime.now().strftime("%Y%m%d_%H%M%S"))
+    os.makedirs(run_checkpoint_dir, exist_ok=True)
 
     step = 0
     try:
@@ -452,7 +457,7 @@ def train(cfg: TrainConfig) -> None:
                     break
 
             progress.close()
-            ckpt_path = f"{cfg.checkpoint_dir}/generator_epoch{epoch}.pth"
+            ckpt_path = f"{run_checkpoint_dir}/generator_epoch{epoch}.pth"
             torch.save({"model": generator.state_dict(), "xp.cfg": cfg}, ckpt_path)
             logger.info("saved checkpoint to %s", ckpt_path)
     finally:
