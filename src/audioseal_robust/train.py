@@ -212,6 +212,25 @@ def _clip_grad_norm_per_sample(grad: torch.Tensor, max_norm: float) -> torch.Ten
     return grad * scales.to(dtype=grad.dtype).view(shape)
 
 
+def _clip_and_capture_activation_grad(
+    name: str,
+    activation_grad_norms: tp.Dict[str, float],
+    max_norm: tp.Optional[float],
+) -> tp.Callable[[torch.Tensor], torch.Tensor]:
+    """Record an activation's grad norm, then optionally clip it per sample."""
+
+    def hook(grad: torch.Tensor) -> torch.Tensor:
+        activation_grad_norms[name] = grad.detach().float().norm(2).item()
+        if max_norm is None:
+            return grad
+
+        clipped = _clip_grad_norm_per_sample(grad, max_norm)
+        activation_grad_norms[f"{name}_clipped"] = clipped.detach().float().norm(2).item()
+        return clipped
+
+    return hook
+
+
 def train_step(
     generator: AudioSealWM,
     detector: AudioSealDetector,
@@ -253,16 +272,9 @@ def train_step(
 
             return hook
 
-        def _clip_and_capture_x_wm_grad(grad: torch.Tensor) -> torch.Tensor:
-            activation_grad_norms["x_wm"] = grad.detach().float().norm(2).item()
-            if cfg.optim.max_x_wm_grad_norm is None:
-                return grad
-
-            clipped = _clip_grad_norm_per_sample(grad, cfg.optim.max_x_wm_grad_norm)
-            activation_grad_norms["x_wm_clipped"] = clipped.detach().float().norm(2).item()
-            return clipped
-
-        x_wm.register_hook(_clip_and_capture_x_wm_grad)
+        x_wm.register_hook(
+            _clip_and_capture_activation_grad("x_wm", activation_grad_norms, cfg.optim.max_x_wm_grad_norm)
+        )
 
         # 2. sampled reconstruction attack (frozen, graph stays connected)
         x_att, attack_name = attack(x_wm)
