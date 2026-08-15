@@ -26,7 +26,7 @@ The workspace this was set up against:
 
 | | |
 |---|---|
-| subscription | `<redacted-subscription>` (Azure ML) |
+| subscription | Azure ML — resolved at submit time, never committed (this repo is public) |
 | resource group | `gpu-resource-group` |
 | workspace | `gpu-workspace` (<region>) |
 | compute | `gpu-cluster` — `STANDARD_NC24ADS_A100_V4`, 1× A100 80GB |
@@ -37,8 +37,12 @@ larger clusters would leave GPUs idle.
 ```bash
 az login
 az extension add -n ml
-az account set --subscription <redacted-subscription>
+az account set --subscription <your-subscription-id>   # Azure ML
 az configure --defaults group=gpu-resource-group workspace=gpu-workspace
+
+# Everything below resolves the subscription from the CLI session above, so no
+# subscription id is committed anywhere in this repo. To pin it explicitly
+# instead, export AZUREML_SUBSCRIPTION_ID.
 
 az ml data create -f azureml/assets/librispeech.yaml
 az ml model create -f azureml/assets/diffusion_checkpoints.yaml
@@ -183,10 +187,18 @@ az ml data create -f azureml/assets/diffusion_checkpoints_cluster.yaml `
 az ml environment create -f azureml/environment.yaml `
   --resource-group $rg --workspace-name $ws
 
-# then, per run:
-az ml job create -f azureml/jobs/smoke_audioldm_cluster.yaml `
-  --name "smoke-audioldm-cluster-$(Get-Date -Format 'MMdd-HHmmss')" `
-  --resource-group $rg --workspace-name $ws
+# then, per run -- via the wrapper, which fills in the subscription id the
+# cluster YAMLs carry as a ${AZUREML_SUBSCRIPTION_ID} placeholder (a virtual
+# cluster is targeted by full ARM id, and this repo is public). It already
+# passes --resource-group/--workspace-name above; everything after the YAML
+# path is forwarded to `az ml job create`.
+python azureml/submit_job.py azureml/jobs/smoke_audioldm_cluster.yaml `
+  --name "smoke-audioldm-cluster-$(Get-Date -Format 'MMdd-HHmmss')"
+
+# the three HopSkipJump eval arms submit the same way:
+python azureml/submit_job.py azureml/jobs/eval_hsj_baseline_cluster.yaml
+python azureml/submit_job.py azureml/jobs/eval_hsj_sgmse_epoch3_cluster.yaml
+python azureml/submit_job.py azureml/jobs/eval_hsj_audioldm_epoch18_cluster.yaml
 ```
 
 Three things about this that are not obvious:

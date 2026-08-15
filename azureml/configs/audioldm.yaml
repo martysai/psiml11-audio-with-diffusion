@@ -3,8 +3,10 @@
 # The opposite direction from sgmse.yaml: trains against AudioLDM (AudioLDM),
 # holds SGMSE + MBD out. Static equivalent: azureml/jobs/train_audioldm.yaml.
 
+# `subscription_id` is deliberately absent: this repo is PUBLIC. aml_submit.py
+# resolves it at submit time from $AZUREML_SUBSCRIPTION_ID, then `az account
+# show` -- see make_client().
 workspace:
-  subscription_id: <redacted-subscription>  # Azure ML
   resource_group_name: gpu-resource-group
   workspace_name: gpu-workspace
 
