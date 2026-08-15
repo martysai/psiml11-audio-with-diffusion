@@ -41,3 +41,4 @@ tags:
   files: "22978"
   hours: "65.36"
   splits: train-clean-100-fixed
+path: azureml://datastores/workspaceblobstore/paths/psiml-assets/librispeech-train-fixed-10s
