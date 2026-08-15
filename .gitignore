@@ -150,6 +150,7 @@ activemq-data/
 # Environments
 .env
 .envrc
+.env.local
 .venv
 env/
 venv/
@@ -222,3 +223,9 @@ mlflow.db
 mlruns/
 wandb/
 checkpoints/
+
+# run_train_10h.sh / run_hopskipjump_eval.sh: local dataset subsets built
+# under the repo (symlink farms / downloaded subsets), not source.
+data/
+logs/
+eval_outputs/
