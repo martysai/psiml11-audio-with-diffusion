@@ -37,29 +37,40 @@ from audioseal.builder import (
     create_generator,
 )
 from audioseal_robust.attacks import (
-    DiffEraseAttack,
+    AttackApplicationReporter,
+    AudioLDMAttack,
+    HopSkipJumpAttack,
     IdentityAttack,
     MBDAttack,
     SampledReconstructionAttack,
     SGMSEAttack,
 )
 from audioseal_robust.config import load_config, load_eval_config
+from audioseal_robust.distributed import DistEnv
 from audioseal_robust.evaluate import (
     SNR_AUDIBLE_DB,
     SNR_NEAR_SILENT_DB,
     STOCK_DETECTOR_CARD,
     STOCK_GENERATOR_CARD,
+    _print_results_table,
     apply_stock_baseline,
     build_eval_attacks,
     check_watermark_snr,
     evaluate_attack,
     evaluate_perceptual,
+    load_generator_under_test,
     prepare_eval_batches,
     stock_baseline_verdict,
 )
 from audioseal_robust.losses import PsychoacousticMelLoss, detection_loss
-from audioseal_robust.metrics import watermark_report, watermark_snr_db
-from audioseal_robust.train import embed_watermark
+from audioseal_robust.metrics import fpr_support, watermark_report, watermark_snr_db
+from audioseal_robust.model_init import build_untrained_generator
+from audioseal_robust.train import (
+    CudaMemoryProbe,
+    _clip_and_capture_activation_grad,
+    _clip_grad_norm_per_sample,
+    embed_watermark,
+)
 
 
 def _tiny_seanet_config() -> SEANetConfig:
@@ -179,7 +190,9 @@ def test_prepare_eval_batches_flags_a_collapsed_generator():
     near-chance detection, which looks identical to a broken detector."""
 
     class CollapsedGenerator(torch.nn.Module):
-        def get_watermark(self, x, message=None):
+        # Not an AudioSealWM, so embed_watermark calls it through forward
+        # (see train._watermark_delta).
+        def forward(self, x, message=None):
             return torch.zeros_like(x)
 
     cfg = load_eval_config(["eval_dir=.", "nbits=4", "n_eval_batches=1"])
@@ -209,7 +222,9 @@ def test_prepare_eval_batches_sees_collapse_that_normalization_hides():
     still tell the two apart."""
 
     class NearlyCollapsedGenerator(torch.nn.Module):
-        def get_watermark(self, x, message=None):
+        # Not an AudioSealWM, so embed_watermark calls it through forward
+        # (see train._watermark_delta).
+        def forward(self, x, message=None):
             return 1e-9 * torch.randn_like(x)
 
     cfg = load_eval_config(["eval_dir=.", "nbits=4", "n_eval_batches=1", "watermark_snr_db=30.0"])
@@ -238,7 +253,9 @@ def test_prepare_eval_batches_stays_quiet_on_a_healthy_generator():
     passes both the target assertion and every quality gate."""
 
     class HealthyGenerator(torch.nn.Module):
-        def get_watermark(self, x, message=None):
+        # Not an AudioSealWM, so embed_watermark calls it through forward
+        # (see train._watermark_delta).
+        def forward(self, x, message=None):
             return 0.01 * torch.randn_like(x)
 
     cfg = load_eval_config(["eval_dir=.", "nbits=4", "n_eval_batches=1", "watermark_snr_db=30.0"])
@@ -403,6 +420,40 @@ def test_stock_baseline_verdict_fails_when_a_number_is_missing():
     assert all("MISSING" in line for line in lines)
 
 
+def test_prepare_eval_batches_allows_an_idle_ranks_empty_shard():
+    """Fewer global batches than ranks is a supported configuration: the
+    surplus ranks get a zero-size shard from `shard_size` and contribute
+    nothing to the all-gathers (see `_cat_or_empty`). Raising here would kill
+    the job before any rank reached a collective -- i.e. exactly on the setup
+    the idle-rank support exists for."""
+    generator = _tiny_generator(nbits=4).eval()
+    cfg = load_eval_config(["eval_dir=.", "nbits=4", "n_eval_batches=2"])
+    dataloader = [torch.randn(2, 1, 4000), torch.randn(2, 1, 4000)]
+    idle = DistEnv(rank=3, world_size=4)  # shard_size(2, rank 3 of 4) == 0
+
+    # Nothing measured on this rank, so no watermark diagnostics either.
+    assert prepare_eval_batches(generator, dataloader, cfg, torch.device("cpu"), idle) == ([], {})
+
+
+def test_prepare_eval_batches_still_rejects_a_starved_nonempty_shard():
+    """A rank that was asked for batches and got none is a real failure (the
+    dataset is too small for this batch_size / GPU count), and must not be
+    quietly turned into an idle rank."""
+    generator = _tiny_generator(nbits=4).eval()
+    cfg = load_eval_config(["eval_dir=.", "nbits=4", "n_eval_batches=2"])
+    busy = DistEnv(rank=0, world_size=2)  # shard_size(2, rank 0 of 2) == 1
+
+    with pytest.raises(RuntimeError, match="no batches"):
+        prepare_eval_batches(generator, [], cfg, torch.device("cpu"), busy)
+
+
+def test_evaluate_perceptual_tolerates_an_empty_shard():
+    """The empty-shard path must reach the all-gathers, not die on a
+    loop-scoped variable that was never bound."""
+    cfg = load_eval_config(["eval_dir=.", "nbits=4", "compute_visqol=true"])
+    assert evaluate_perceptual([], cfg, torch.device("cpu")) == {}
+
+
 def test_evaluate_attack_uses_prepared_batches():
     class Detector(torch.nn.Module):
         def forward(self, x):
@@ -507,6 +558,33 @@ def test_gradients_flow_to_generator_only():
         assert torch.equal(detector_state_before[key], detector_state_after[key]), (
             f"detector param {key} changed after optimizer.step()"
         )
+
+
+def test_clip_grad_norm_per_sample_only_scales_outlier():
+    grad = torch.tensor([[[3.0, 4.0]], [[0.3, 0.4]]])
+
+    clipped = _clip_grad_norm_per_sample(grad, max_norm=1.0)
+
+    assert torch.allclose(clipped[0], torch.tensor([[0.6, 0.8]]))
+    assert torch.equal(clipped[1], grad[1])
+
+
+def test_clip_and_capture_activation_grad():
+    grad = torch.tensor([[[3.0, 4.0]]])
+    norms = {}
+
+    clipped = _clip_and_capture_activation_grad("activation", norms, max_norm=1.0)(grad)
+
+    assert norms["activation"] == 5.0
+    assert norms["activation_clipped"] == 1.0
+    assert torch.allclose(clipped, torch.tensor([[[0.6, 0.8]]]))
+
+    unclipped_norms = {}
+    unchanged = _clip_and_capture_activation_grad("activation", unclipped_norms, max_norm=None)(grad)
+
+    assert torch.equal(unchanged, grad)
+    assert unclipped_norms["activation"] == 5.0
+    assert "activation_clipped" not in unclipped_norms
 
 
 def test_sampled_attack_only_picks_enabled_branches():
@@ -671,20 +749,20 @@ def test_mbd_attack_without_checkpoint_stays_a_stub():
         attack(torch.randn(1, 1, 1600))
 
 
-def test_diff_erase_attack_without_checkpoint_stays_a_stub():
-    attack = DiffEraseAttack()
+def test_audioldm_attack_without_checkpoint_stays_a_stub():
+    attack = AudioLDMAttack()
     with pytest.raises(NotImplementedError, match="constructed without a checkpoint"):
         attack(torch.randn(1, 1, 1600))
 
 
-def test_diff_erase_attack_checkpoint_without_config_raises_clear_error(tmp_path):
+def test_audioldm_attack_checkpoint_without_config_raises_clear_error(tmp_path):
     fake_ckpt = tmp_path / "fake.ckpt"
     fake_ckpt.write_bytes(b"not a real checkpoint")
     with pytest.raises(NotImplementedError, match="needs `config` set"):
-        DiffEraseAttack(checkpoint=str(fake_ckpt))
+        AudioLDMAttack(checkpoint=str(fake_ckpt))
 
 
-def test_diff_erase_attack_checkpoint_wrong_layout_fails_before_any_import(tmp_path):
+def test_audioldm_attack_checkpoint_wrong_layout_fails_before_any_import(tmp_path):
     """checkpoint must live at <weights_root>/data/checkpoints/<file> -- that's
     the relative layout get_vocoder()/reload_from_ckpt hardcode. A checkpoint
     anywhere else should get a clear error, not a confusing failure deep
@@ -694,12 +772,12 @@ def test_diff_erase_attack_checkpoint_wrong_layout_fails_before_any_import(tmp_p
     fake_config = tmp_path / "fake.yaml"
     fake_config.write_text("preprocessing: {}\n")
     with pytest.raises(ValueError, match="data/checkpoints"):
-        DiffEraseAttack(checkpoint=str(fake_ckpt), config=str(fake_config))
+        AudioLDMAttack(checkpoint=str(fake_ckpt), config=str(fake_config))
 
 
 def _tacotron_stft():
-    """Skips unless the diff_erase extras are installed -- audioldm_train pulls
-    in pandas et al. (see requirements-diff-erase.txt), which the base
+    """Skips unless the audioldm extras are installed -- audioldm_train pulls
+    in pandas et al. (see requirements-audioldm.txt), which the base
     training/eval stack deliberately does not."""
     stft = pytest.importorskip("audioldm_train.utilities.audio.stft")
     return stft.TacotronSTFT(
@@ -714,8 +792,8 @@ def _tacotron_stft():
 
 
 def test_audioldm_mel_reaches_the_waveform():
-    """DiffEraseAttack is eval-only here, but making it trainable (the point of
-    the diff_erase training direction) requires this front-end to be
+    """AudioLDMAttack is eval-only here, but making it trainable (the point of
+    the audioldm training direction) requires this front-end to be
     differentiable at all. `mel_spectrogram` used to call `.data`, which
     detached -- so the mel came back with grad_fn None and the detection loss
     silently stopped reaching the generator."""
@@ -742,6 +820,325 @@ def test_audioldm_mel_gradients_stay_finite_on_silence():
     assert torch.isfinite(wav.grad).all()
 
 
+class _LevelDetector(torch.nn.Module):
+    """Deterministic, non-trained stand-in for AudioSealDetector: decides
+    "watermarked" purely from mean absolute amplitude vs. a threshold. Used
+    to test HopSkipJumpAttack's search logic exactly (a real detector's
+    decision surface can't be reasoned about analytically), matching the
+    stub-Detector style already used by test_evaluate_attack_uses_prepared_batches."""
+
+    def __init__(self, threshold: float = 0.5):
+        super().__init__()
+        self.threshold = threshold
+
+    def forward(self, x):
+        level = x.abs().mean(dim=(1, 2))
+        watermarked = (level > self.threshold).float()
+        presence = torch.stack([1 - watermarked, watermarked], dim=1).unsqueeze(-1)
+        message = torch.zeros(x.shape[0], 1)
+        return presence, message
+
+
+def test_hopskipjump_attack_without_checkpoint_stays_a_stub():
+    attack = HopSkipJumpAttack()
+    attack.bind_detector(_LevelDetector())
+    with pytest.raises(NotImplementedError, match="without being enabled"):
+        attack(torch.randn(1, 1, 1600))
+
+
+def test_hopskipjump_attack_requires_a_bound_detector():
+    attack = HopSkipJumpAttack(checkpoint="auto")
+    with pytest.raises(RuntimeError, match="no detector bound"):
+        attack(torch.randn(1, 1, 1600))
+
+
+def test_hopskipjump_attack_finds_a_decision_flip_near_the_boundary():
+    """HopSkipJumpAttack should return a waveform the detector decides
+    DIFFERENTLY on than x0 itself (the "label0" framing in its class
+    docstring -- correct for both the watermarked and clean branch
+    evaluate_attack calls it on), landing close to the decision boundary
+    thanks to binary search rather than just returning the crude random
+    initialization."""
+    torch.manual_seed(0)
+    detector = _LevelDetector(threshold=0.5)
+    attack = HopSkipJumpAttack(
+        checkpoint="auto",
+        num_iterations=15,
+        init_num_evals=10,
+        max_num_evals=30,
+        init_max_trials=200,
+        binary_search_steps=10,
+    )
+    attack.bind_detector(detector)
+
+    x0 = torch.full((1, 1, 2000), 0.9)
+    label0 = bool((detector.forward(x0)[0][:, 1, :].mean(dim=-1) > 0.5).item())
+    assert label0 is True  # sanity: x0 starts on the "watermarked" side
+
+    x_adv = attack(x0)
+
+    assert x_adv.shape == x0.shape
+    assert x_adv.dtype == x0.dtype
+    label_adv = bool((detector.forward(x_adv)[0][:, 1, :].mean(dim=-1) > 0.5).item())
+    assert label_adv is False  # decision flipped
+
+    level_adv = x_adv.abs().mean().item()
+    assert 0.3 < level_adv < 0.5  # close to the threshold, not raw random noise
+
+
+def test_hopskipjump_attack_gives_up_gracefully_when_init_never_flips():
+    """A detector that ALWAYS returns the same decision (e.g. a degenerate
+    or saturated one) has no adversarial region for random init to find --
+    the attack should return x0 unperturbed (and log a warning) rather than
+    hang or raise, per _initialize's documented fallback."""
+
+    class ConstantDetector(torch.nn.Module):
+        def forward(self, x):
+            presence = torch.zeros(x.shape[0], 2, 1)
+            presence[:, 0, :] = 1.0  # always "not watermarked"
+            return presence, torch.zeros(x.shape[0], 1)
+
+    attack = HopSkipJumpAttack(checkpoint="auto", init_max_trials=5)
+    attack.bind_detector(ConstantDetector())
+
+    x0 = torch.randn(1, 1, 500)
+    x_adv = attack(x0)
+
+    assert torch.equal(x_adv, x0)
+    # The give-up must be *reported*, not just logged: an unperturbed
+    # watermarked example still detects, so without this it would be scored
+    # as watermark robustness (see AttackApplicationReporter).
+    mask = attack.pop_application_mask()
+    assert mask is not None
+    assert mask.tolist() == [False]
+
+
+def test_hopskipjump_application_mask_reports_success_and_drains():
+    """The mask is per-forward: a successful attack reports True, and
+    reading it twice must not replay the previous call's result."""
+    torch.manual_seed(0)
+    attack = HopSkipJumpAttack(checkpoint="auto", num_iterations=2, init_max_trials=200)
+    attack.bind_detector(_LevelDetector(threshold=0.5))
+
+    attack(torch.full((1, 1, 500), 0.9))
+
+    assert attack.pop_application_mask().tolist() == [True]
+    assert attack.pop_application_mask() is None  # drained
+
+
+def test_hopskipjump_initializes_from_a_bound_reference_pool():
+    """With the noise fallback disabled (init_max_trials=0), the attack can
+    only start from the bound pool -- so this isolates that path: it fails
+    without a pool and succeeds with one."""
+    detector = _LevelDetector(threshold=0.5)
+    x0 = torch.full((1, 1, 500), 0.9)  # "watermarked" side
+
+    without_pool = HopSkipJumpAttack(checkpoint="auto", num_iterations=2, init_max_trials=0)
+    without_pool.bind_detector(detector)
+    assert torch.equal(without_pool(x0), x0)
+    assert without_pool.pop_application_mask().tolist() == [False]
+
+    with_pool = HopSkipJumpAttack(checkpoint="auto", num_iterations=2, init_max_trials=0)
+    with_pool.bind_detector(detector)
+    with_pool.bind_reference_pool(torch.full((1, 1, 500), 0.1))  # "clean" side
+    x_adv = with_pool(x0)
+
+    assert with_pool.pop_application_mask().tolist() == [True]
+    assert not torch.equal(x_adv, x0)
+    assert bool((detector.forward(x_adv)[0][:, 1, :].mean(dim=-1) > 0.5).item()) is False
+
+
+def test_hopskipjump_reference_pool_skips_the_examples_own_counterpart():
+    """A pool built from the eval batches necessarily contains x0's own
+    clean/watermarked counterpart. Starting from it would hand the attacker
+    the original signal, so entries within _SELF_REFERENCE_REL_L2 must be
+    skipped even though their detector label is the opposite one."""
+    detector = _LevelDetector(threshold=0.5)
+    x0 = torch.full((1, 1, 500), 0.55)  # watermarked side, just above threshold
+    counterpart = torch.full((1, 1, 500), 0.48)  # opposite label, ~13% away in L2
+    unrelated = torch.full((1, 1, 500), 0.1)  # opposite label, ~82% away
+
+    only_counterpart = HopSkipJumpAttack(checkpoint="auto", num_iterations=2, init_max_trials=0)
+    only_counterpart.bind_detector(detector)
+    only_counterpart.bind_reference_pool(counterpart)
+    assert torch.equal(only_counterpart(x0), x0)  # skipped -> no init -> gave up
+    assert only_counterpart.pop_application_mask().tolist() == [False]
+
+    with_unrelated = HopSkipJumpAttack(checkpoint="auto", num_iterations=2, init_max_trials=0)
+    with_unrelated.bind_detector(detector)
+    with_unrelated.bind_reference_pool(torch.cat([counterpart, unrelated]))
+    assert not torch.equal(with_unrelated(x0), x0)  # the far one is still usable
+    assert with_unrelated.pop_application_mask().tolist() == [True]
+
+
+def test_hopskipjump_init_from_reference_can_be_disabled():
+    detector = _LevelDetector(threshold=0.5)
+    attack = HopSkipJumpAttack(
+        checkpoint="auto", num_iterations=2, init_max_trials=0, init_from_reference=False
+    )
+    attack.bind_detector(detector)
+    attack.bind_reference_pool(torch.full((1, 1, 500), 0.1))
+
+    x0 = torch.full((1, 1, 500), 0.9)
+    assert torch.equal(attack(x0), x0)  # pool ignored, and noise fallback disabled
+
+
+def test_print_results_table_tolerates_missing_perceptual_metrics(capsys):
+    """compute_pesq=false (or a missing `pesq` package) leaves that key out
+    entirely -- the summary must still print, since it runs only after the
+    expensive attack passes have already completed."""
+    _print_results_table({"label": "t", "perceptual": {"sisnr": 30.0}, "attacks": {}})
+
+    out = capsys.readouterr().out
+    assert "SI-SNR: 30.00 dB" in out
+    assert "PESQ" not in out
+
+
+def test_print_results_table_flags_failures_and_thin_negatives(capsys):
+    """Both caveats must appear inline in the table, not just in the log."""
+    _print_results_table(
+        {
+            "label": "t",
+            "attacks": {
+                "hopskipjump": {
+                    "tag": "held_out",
+                    "bit_accuracy": 0.9,
+                    "tpr_at_fpr": 0.8,
+                    "tpr_at_fpr_attacked": 0.2,
+                    "f1": 0.5,
+                    "attack_failure_rate": 0.75,
+                    "n_attack_failures": 3,
+                    "fpr_support": {
+                        "n_negatives": 4,
+                        "fpr_resolution": 0.25,
+                        "min_negatives_for_target": 100,
+                        "supported": False,
+                    },
+                }
+            },
+        }
+    )
+
+    out = capsys.readouterr().out
+    assert "did not perturb 3 example(s)" in out
+    assert "perturbed-only: 0.200" in out
+    assert "only 4 negatives" in out
+
+
+def test_fpr_support_flags_a_sample_size_that_cannot_resolve_the_target():
+    """fpr_target=0.01 needs >= 100 negatives; below that int(0.01 * N) == 0
+    and the threshold degenerates to the max negative score."""
+    too_few = fpr_support(n_negatives=16, target_fpr=0.01)
+    assert too_few["supported"] is False
+    assert too_few["min_negatives_for_target"] == 100
+    assert too_few["fpr_resolution"] == pytest.approx(1 / 16)
+
+    enough = fpr_support(n_negatives=100, target_fpr=0.01)
+    assert enough["supported"] is True
+    assert enough["fpr_resolution"] == pytest.approx(0.01)
+
+
+def test_evaluate_attack_reports_fpr_support_and_attack_failures():
+    """evaluate_attack must surface both caveats: too few negatives to
+    resolve fpr_target, and examples the attack never perturbed."""
+
+    class Detector(torch.nn.Module):
+        def forward(self, x):
+            detected = (x.abs().sum(dim=(1, 2)) > 0).float()
+            presence = torch.stack([1 - detected, detected], dim=1).unsqueeze(-1)
+            return presence, (x[:, 0, :4] > 0).float()
+
+    class HalfFailingAttack(torch.nn.Module, AttackApplicationReporter):
+        """Perturbs nothing, and reports the second example of every batch as
+        an application failure -- the shape of HopSkipJump's give-up path."""
+
+        def forward(self, x, strength=None):
+            self._reset_application_mask()
+            for i in range(x.shape[0]):
+                self._record_application(i == 0)
+            return x
+
+    message = torch.tensor([[1, 0, 1, 0], [0, 1, 0, 1]])
+    x = torch.zeros(2, 1, 8)
+    x_wm = x.clone()
+    x_wm[:, 0, :4] = message * 2 - 1
+    cfg = load_eval_config(["eval_dir=.", "nbits=4"])
+
+    metrics = evaluate_attack(
+        Detector(), HalfFailingAttack(), [(x, x_wm, message)], cfg, torch.device("cpu")
+    )
+
+    assert metrics["n_attack_failures"] == 2  # one per branch, pos + neg
+    assert metrics["attack_failure_rate"] == pytest.approx(0.5)
+    assert "tpr_at_fpr_attacked" in metrics
+    # 2 negatives cannot resolve a 1% FPR.
+    assert metrics["fpr_support"]["supported"] is False
+    assert metrics["fpr_support"]["n_negatives"] == 2
+
+
+def test_evaluate_attack_omits_failure_keys_for_plain_attacks():
+    """Attacks that don't implement the reporter are 'applied to
+    everything' -- no failure keys, so existing numbers stay comparable."""
+
+    class Detector(torch.nn.Module):
+        def forward(self, x):
+            detected = (x.abs().sum(dim=(1, 2)) > 0).float()
+            presence = torch.stack([1 - detected, detected], dim=1).unsqueeze(-1)
+            return presence, (x[:, 0, :4] > 0).float()
+
+    message = torch.tensor([[1, 0, 1, 0]])
+    x = torch.zeros(1, 1, 8)
+    x_wm = x.clone()
+    x_wm[:, 0, :4] = message * 2 - 1
+
+    metrics = evaluate_attack(
+        Detector(),
+        IdentityAttack(),
+        [(x, x_wm, message)],
+        load_eval_config(["eval_dir=.", "nbits=4"]),
+        torch.device("cpu"),
+    )
+
+    assert "attack_failure_rate" not in metrics
+    assert "tpr_at_fpr_attacked" not in metrics
+    assert "fpr_support" in metrics  # this one is always reported
+
+
+def test_load_generator_under_test_accepts_a_legacy_named_checkpoint(tmp_path):
+    """Regression test: train.py's checkpoints (torch.save({"model":
+    generator.state_dict()...})) use the pre-torchscripting-update flat conv
+    naming (".conv.weight"/".conv.bias"), but this Python (>=3.10) build's
+    AudioSealWM wraps those an extra "inner_conv" level (Moshi's SEANet) --
+    load_generator_under_test's .pth branch called audioseal_load_state_dict
+    directly, skipping the convert_state_dict_for_scriptable_model step that
+    AudioSeal.load_generator/load_detector already apply for the model-card
+    path, and raised "Missing/Unexpected key(s)" for every conv layer on a
+    real fine-tuned checkpoint saved by train.py running on a different box."""
+    reference = build_untrained_generator(nbits=4, device=torch.device("cpu"))
+    legacy_state = {k.replace("inner_conv.", ""): v for k, v in reference.state_dict().items()}
+    assert legacy_state != reference.state_dict()  # sanity: the rename actually did something
+
+    ckpt_path = tmp_path / "generator_epoch3.pth"
+    torch.save({"model": legacy_state}, ckpt_path)
+
+    loaded = load_generator_under_test(str(ckpt_path), nbits=4, device=torch.device("cpu"))
+
+    for (name, ref_param), (loaded_name, loaded_param) in zip(
+        reference.state_dict().items(), loaded.state_dict().items()
+    ):
+        assert name == loaded_name
+        assert torch.equal(ref_param, loaded_param)
+
+
+def test_build_eval_attacks_threads_hopskipjump_config_through():
+    cfg = load_eval_config(
+        ["eval_dir=.", "attack.hopskipjump.checkpoint=auto", "attack.hopskipjump.num_iterations=3"]
+    )
+    attacks, skipped = build_eval_attacks(["identity", "hopskipjump"], torch.device("cpu"), cfg)
+    assert not skipped
+    assert attacks["hopskipjump"].num_iterations == 3
+
+
 def test_build_eval_attacks_threads_per_attack_config_through():
     """Regression test: build_eval_attacks used to construct every attack
     with zero args, silently ignoring cfg.attack.* entirely (a config field
@@ -753,39 +1150,39 @@ def test_build_eval_attacks_threads_per_attack_config_through():
     assert attacks["sgmse"].num_steps == 7
 
 
-def test_train_recipe_diff_erase_sets_weights():
-    """recipe=diff_erase (config/recipes.yaml) should train against
-    DiffErase and zero out the identity-only default.yaml fallback."""
-    cfg = load_config(["recipe=diff_erase", "data.train_dir=."])
+def test_train_recipe_audioldm_sets_weights():
+    """recipe=audioldm (config/recipes.yaml) should train against
+    AudioLDM and zero out the identity-only default.yaml fallback."""
+    cfg = load_config(["recipe=audioldm", "data.train_dir=."])
     assert cfg.attack.weights.identity == 0.0
-    assert cfg.attack.weights.diff_erase == 1.0
+    assert cfg.attack.weights.audioldm == 1.0
     assert cfg.attack.weights.sgmse == 0.0
 
 
 def test_train_recipe_sgmse_sets_weights():
     """The opposite direction: recipe=sgmse trains against SGMSE instead,
-    leaving diff_erase at its default (disabled) weight."""
+    leaving audioldm at its default (disabled) weight."""
     cfg = load_config(["recipe=sgmse", "data.train_dir=."])
     assert cfg.attack.weights.identity == 0.0
     assert cfg.attack.weights.sgmse == 1.0
-    assert cfg.attack.weights.diff_erase == 0.0
+    assert cfg.attack.weights.audioldm == 0.0
 
 
 def test_train_recipe_cli_override_wins_over_recipe():
     """Regression test for merge order: CLI overrides must be applied AFTER
     the recipe, so an explicit CLI value for a field the recipe also sets
     still wins (letting you tweak one field without forking the recipe)."""
-    cfg = load_config(["recipe=diff_erase", "data.train_dir=.", "attack.weights.diff_erase=0.5"])
-    assert cfg.attack.weights.diff_erase == 0.5
+    cfg = load_config(["recipe=audioldm", "data.train_dir=.", "attack.weights.audioldm=0.5"])
+    assert cfg.attack.weights.audioldm == 0.5
 
 
 def test_eval_recipe_after_sgmse_training_swaps_held_out():
-    """The eval-side recipe should report sgmse (not diff_erase) as the
-    trained attack and hold diff_erase out instead -- the reverse of
+    """The eval-side recipe should report sgmse (not audioldm) as the
+    trained attack and hold audioldm out instead -- the reverse of
     default_eval.yaml's plain fallback."""
     cfg = load_eval_config(["recipe=after_sgmse_training", "eval_dir=."])
     assert list(cfg.eval_attacks) == ["identity", "bigvgan", "dac", "sgmse"]
-    assert list(cfg.held_out_attacks) == ["diff_erase", "mbd"]
+    assert list(cfg.held_out_attacks) == ["audioldm", "mbd"]
 
 
 def test_unknown_recipe_raises_with_available_names():
@@ -798,8 +1195,68 @@ def test_build_eval_attacks_construction_failure_is_skipped_not_fatal():
     fix above), a misconfigured attack can now fail inside __init__/
     _load_backbone instead of only at forward() time -- that must land in
     the `skipped` dict, not raise and take down the whole eval run."""
-    cfg = load_eval_config(["eval_dir=.", "attack.diff_erase.checkpoint=/nonexistent/fake.ckpt"])
-    attacks, skipped = build_eval_attacks(["identity", "diff_erase"], torch.device("cpu"), cfg)
-    assert "diff_erase" not in attacks
-    assert "config" in skipped["diff_erase"]
+    cfg = load_eval_config(["eval_dir=.", "attack.audioldm.checkpoint=/nonexistent/fake.ckpt"])
+    attacks, skipped = build_eval_attacks(["identity", "audioldm"], torch.device("cpu"), cfg)
+    assert "audioldm" not in attacks
+    assert "config" in skipped["audioldm"]
     assert attacks["identity"] is not None
+
+
+def test_cuda_memory_probe_emits_nothing_off_cuda():
+    """train_step calls the probe unconditionally, so on a CPU box (tests,
+    laptops) it has to stay silent rather than crash or emit zeros that would
+    pollute the dashboard with a meaningless flat line."""
+    probe = CudaMemoryProbe(torch.device("cpu"))
+    probe.start()
+    probe.mark_forward_end()
+    probe.mark_backward_end()
+    assert probe.metrics() == {}
+
+
+def test_cuda_memory_probe_respects_the_disable_flag():
+    # torch.device("cuda") is just a descriptor -- constructing it touches no
+    # runtime, so this exercises the tracking.log_memory=false gate on any box.
+    probe = CudaMemoryProbe(torch.device("cuda"), enabled=False)
+    probe.start()
+    probe.mark_forward_end()
+    probe.mark_backward_end()
+    assert probe.metrics() == {}
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
+def test_cuda_memory_probe_sees_checkpointing_shrink_activations():
+    """The whole point of the mem/ metrics: they must actually distinguish a
+    checkpointed graph from an uncheckpointed one, which the reserved-memory
+    numbers on wandb's system panels cannot."""
+    device = torch.device("cuda")
+    layer = torch.nn.Linear(1024, 1024).to(device)
+
+    def _block(h: torch.Tensor) -> torch.Tensor:
+        for _ in range(8):
+            h = torch.relu(layer(h))
+        return h
+
+    def run(use_checkpoint: bool) -> dict:
+        x = torch.randn(256, 1024, device=device, requires_grad=True)
+        probe = CudaMemoryProbe(device)
+        probe.start()
+        h = x
+        for _ in range(8):
+            h = torch.utils.checkpoint.checkpoint(_block, h, use_reentrant=False) if use_checkpoint else _block(h)
+        loss = h.sum()
+        probe.mark_forward_end()
+        loss.backward()
+        probe.mark_backward_end()
+        return probe.metrics()
+
+    plain = run(use_checkpoint=False)
+    checkpointed = run(use_checkpoint=True)
+
+    assert set(plain) == {
+        "mem/forward_peak_gib",
+        "mem/activations_gib",
+        "mem/backward_peak_gib",
+        "mem/reserved_gib",
+    }
+    assert checkpointed["mem/activations_gib"] < plain["mem/activations_gib"] / 2
+    assert checkpointed["mem/forward_peak_gib"] < plain["mem/forward_peak_gib"]

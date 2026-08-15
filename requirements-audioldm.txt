@@ -1,4 +1,4 @@
-# Dependencies for the diff_erase held-out attack (DiffEraseAttack in
+# Dependencies for the audioldm attack (AudioLDMAttack in
 # src/audioseal_robust/attacks.py), which runs inference through the
 # vendored src/audioldm_train/ package (see that directory's VENDORED.md).
 # NOT needed for anything else in this project -- separate from
@@ -17,7 +17,12 @@ pytorch_lightning
 torchvision
 h5py
 torchlibrosa
-transformers
+transformers<5         # NOT unpinned: 5.x needs a much newer torch than our
+                       # 2.4, and it fails as a bare "NameError: name 'torch'
+                       # is not defined" from tensor_parallel.py rather than a
+                       # version complaint. 5.x also drops/renames APIs this
+                       # 2023-era vendored code uses (SpeechT5EncoderWithText-
+                       # Prenet, MT5EncoderModel, GPTJ*).
 ftfy
 braceexpand
 webdataset
@@ -27,9 +32,9 @@ wandb                 # imported at module level by modules/latent_encoder/autoe
 
 # Also reached during construction/forward -- these came in transitively on
 # the dev machine, so they were easy to miss until every import was verified
-# against sys.modules after a real DiffEraseAttack build + forward pass.
+# against sys.modules after a real AudioLDMAttack build + forward pass.
 # Pin-free on purpose; they're all widely-compatible pure-Python packages.
-pyyaml                # `import yaml` in attacks.py:DiffEraseAttack._load_backbone
+pyyaml                # `import yaml` in attacks.py:AudioLDMAttack._load_backbone
 soundfile             # modules/latent_{encoder/autoencoder,diffusion/ddpm}.py
 tqdm                  # utilities/tools.py
 pillow                # utilities/model_util.py (log_txt_as_img)
@@ -39,14 +44,14 @@ regex                 # modules/clap/open_clip/tokenizer.py
 
 # taming-transformers is deliberately NOT listed. AutoencoderKL builds a
 # training-time LPIPS perceptual loss in __init__ that would need it, but
-# DiffEraseAttack._load_backbone swaps that lossconfig for a no-op before
+# AudioLDMAttack._load_backbone swaps that lossconfig for a no-op before
 # construction (we only ever call encode/decode, never train the VAE). That
 # also avoids LPIPS downloading a ~500MB vgg.pth into a *relative* path,
 # which fails outright when the weights dir is a read-only mount.
 
 # Not installed via this file: the actual checkpoints (VAE, HiFiGAN, a
 # LatentDiffusion model, and -- yes, still -- a CLAP checkpoint for the
-# conditioning branch DiffEraseAttack calls get_unconditional_condition() on,
-# see the NOTE on DiffEraseAttackConfig.config in
+# conditioning branch AudioLDMAttack calls get_unconditional_condition() on,
+# see the NOTE on AudioLDMAttackConfig.config in
 # src/audioseal_robust/config.py) are multi-GB binaries, never belong in git,
-# and must be supplied separately via attack.diff_erase.checkpoint/.config.
+# and must be supplied separately via attack.audioldm.checkpoint/.config.

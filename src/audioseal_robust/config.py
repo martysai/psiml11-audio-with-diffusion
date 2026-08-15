@@ -34,6 +34,17 @@ class GeneratorConfig:
     # checkpoint, passed to audioseal.AudioSeal.load_generator.
     checkpoint: str = "audioseal_wm_16bits"
 
+    # Optional path to a train.py-saved checkpoint (a .pth with a "model"
+    # key, e.g. checkpoints/.../generator_epochN.pth) to load ON TOP of
+    # `checkpoint` above once the model is built. Kept separate from
+    # `checkpoint` because that field goes through AudioSeal.load_generator's
+    # parse_model/parse_config, which requires a full model config (asserts
+    # "seanet" in config) that our saved dicts don't carry -- only the
+    # architecture-defining pretrained checkpoint can go there. This just
+    # does a plain load_state_dict for resuming fine-tuning from a later
+    # epoch without retraining from the pretrained baseline.
+    resume_from: tp.Optional[str] = None
+
 
 @dataclass
 class DetectorConfig:
@@ -60,8 +71,8 @@ class SGMSEAttackConfig:
 
 
 @dataclass
-class DiffEraseAttackConfig:
-    """Wires DiffEraseAttack (attacks.py) to pretrained AudioLDM weights.
+class AudioLDMAttackConfig:
+    """Wires AudioLDMAttack (attacks.py) to pretrained AudioLDM weights.
     The model *code* (audioldm_train, MIT licensed) is vendored under
     src/audioldm_train/ -- see that directory's VENDORED.md -- so only the
     *weights* need to be supplied externally (multi-GB, never belongs in
@@ -71,27 +82,24 @@ class DiffEraseAttackConfig:
 
     # A full LatentDiffusion checkpoint (VAE + diffusion UNet), NOT the
     # VAE-only checkpoint -- must live at <weights_root>/data/checkpoints/<file>
-    # (see attacks.py:DiffEraseAttack._load_backbone for why: get_vocoder()
+    # (see attacks.py:AudioLDMAttack._load_backbone for why: get_vocoder()
     # and the VAE's reload_from_ckpt both hardcode that relative layout).
-    # E.g. a checkout of github.com/DiffErase/Differase's
-    # DiffErase-latent/data/checkpoints/*.ckpt -- that repo ships no
-    # pretrained checkpoint of its own though (its README is about
-    # *training* one); a generic pretrained AudioLDM checkpoint also works
-    # here -- see DiffEraseAttack's docstring for why.
+    # E.g. `audioldm-s-full` from the AudioLDM authors' Zenodo record,
+    # placed at <weights_root>/data/checkpoints/audioldm-s-full alongside
+    # the VAE/CLAP/HiFiGAN support bundle that config references by name.
     checkpoint: tp.Optional[str] = None
-    # Matching audioldm_train config, e.g. a checkout of Differase's
-    # DiffErase-latent/audioldm_train/config/**/*.yaml
-    # (2023_08_23_reproduce_audioldm/audioldm_original.yaml matches a
+    # Matching audioldm_train config -- the vendored
+    # config/2023_08_23_reproduce_audioldm/audioldm_original.yaml matches a
     # standard/small AudioLDM checkpoint's architecture). NOTE: every shipped
     # LatentDiffusion config in that repo is CLAP-conditioned, which pulls in
     # its own pretrained sub-checkpoint at model-construction time (e.g.
     # audioldm_original.yaml needs a `clap_htsat_tiny.pt` next to `checkpoint`,
-    # under the same data/checkpoints/ dir) even though DiffEraseAttack runs
+    # under the same data/checkpoints/ dir) even though AudioLDMAttack runs
     # the model fully unconditionally -- confirmed empirically, see attacks.py.
     config: tp.Optional[str] = None
-    # Caps the strength (t*) DiffEraseAttack samples when `strength=None` is
+    # Caps the strength (t*) AudioLDMAttack samples when `strength=None` is
     # passed in (random.random() * strength_max otherwise) -- see
-    # DiffEraseAttack.forward and its class docstring. Backprop through the
+    # AudioLDMAttack.forward and its class docstring. Backprop through the
     # full DDPM reverse loop (up to num_timesteps, commonly ~1000, steps at
     # strength=1.0) is not memory-tractable during training; 0.08 matches
     # EvalConfig.t_star_grid's own calibrated "hard regime" ceiling (see that
@@ -118,22 +126,178 @@ class MBDAttackConfig:
 
 
 @dataclass
+class HopSkipJumpAttackConfig:
+    """Wires HopSkipJumpAttack (attacks.py) -- AudioMarkBench's hard-label,
+    black-box evasion attack against the detector itself (Chen et al. 2019),
+    not a resynthesis attack against the signal. Needs no external weights
+    (it only queries this project's own frozen detector), so `checkpoint`
+    here is a pure enable/disable gate -- same convention as
+    MBDAttackConfig -- not an actual model/weights path. Eval-only: see
+    attacks.py:HopSkipJumpAttack's docstring for why this must never be
+    given a nonzero weight in TrainConfig's AttackWeights.
+    """
+
+    # Any non-None value (e.g. "auto") enables this attack. None (default)
+    # keeps it a stub -- query-based black-box search costs hundreds of
+    # detector forward passes PER WAVEFORM (far more than every other
+    # attack here), so it must be opted into deliberately, together with a
+    # much smaller batch_size/n_eval_batches than the other attacks use.
+    checkpoint: tp.Optional[str] = None
+    # Presence-probability threshold the detector's hard "watermarked?"
+    # decision is read off at -- 0.5 matches AudioSeal's own
+    # detect_watermark default.
+    detection_threshold: float = 0.5
+    # Outer gradient-estimate/step-search iterations per example.
+    num_iterations: int = 20
+    # Monte Carlo queries per gradient estimate at iteration 1, growing as
+    # init_num_evals * sqrt(iteration), capped at max_num_evals.
+    init_num_evals: int = 20
+    max_num_evals: int = 100
+    # Random-noise draws attempted before giving up on finding ANY
+    # adversarial starting point for an example (see
+    # HopSkipJumpAttack._initialize). Only reached when the reference pool
+    # below is unavailable or fails to supply one.
+    init_max_trials: int = 100
+    # Start the search from real audio of the opposite detector class
+    # (bound by evaluate.py via bind_reference_pool) instead of going
+    # straight to uniform noise. This is what the reference implementation
+    # does, and it is the difference between a search that usually
+    # initializes and one that usually gives up: full-scale uniform noise is
+    # far off the speech manifold, so it rarely lands in a falsely-triggering
+    # region on the clean/negative branch. Examples that still fail to
+    # initialize are reported as attack_failure_rate rather than silently
+    # scored as watermark robustness -- see attacks.py's
+    # AttackApplicationReporter. Set False only to reproduce the old
+    # noise-only behavior.
+    init_from_reference: bool = True
+    # Bisection steps used to re-land on the decision boundary after each
+    # gradient step (and for the initial random point).
+    binary_search_steps: int = 10
+    # L2 step-size scaling constant (theta = gamma / d**1.5) -- see
+    # HopSkipJumpAttack._select_delta.
+    gamma: float = 1.0
+    clip_min: float = -1.0
+    clip_max: float = 1.0
+
+
+@dataclass
+class PGDAttackConfig:
+    """Wires PGDAttack (attacks.py) -- fixed-budget, epsilon-constrained
+    white-box PGD against the detector. The white-box counterpart to
+    HopSkipJumpAttackConfig's black-box search.
+
+    Unlike hopskipjump this needs no enable/disable `checkpoint` gate: it
+    costs `num_steps` batched forward+backward passes per batch rather than
+    hundreds of un-batchable queries per example, so it is affordable at the
+    same batch_size/n_eval_batches as the resynthesis attacks. Eval-only all
+    the same -- see attacks.py:PGDAttack's docstring for why it must never
+    get a nonzero weight in TrainConfig's AttackWeights.
+    """
+
+    # L-infinity perturbation budget, in raw waveform amplitude on the
+    # [-1, 1] scale. 0.002 is roughly -54 dBFS peak, i.e. inaudible on
+    # speech, and is the value to sweep for a robustness curve (0.0005 /
+    # 0.001 / 0.002 / 0.005 / 0.01 covers "no effect" through "audible").
+    epsilon: float = 0.002
+    # Gradient-ascent steps inside the budget.
+    num_steps: int = 20
+    # Per-step L-infinity move. None -> Madry et al.'s 2.5 * epsilon /
+    # num_steps default (see attacks.py).
+    step_size: tp.Optional[float] = None
+    # Presence threshold the attack reads the detector's CURRENT decision
+    # off, to pick its direction per example (evade vs. forge). Matches
+    # HopSkipJumpAttackConfig.detection_threshold and AudioSeal's own default.
+    detection_threshold: float = 0.5
+    # Start from a uniform random point inside the ball rather than from the
+    # clean signal -- standard PGD practice, and it stops the attack from
+    # being deterministically stuck when the input sits exactly on a
+    # gradient plateau.
+    random_start: bool = True
+    clip_min: float = -1.0
+    clip_max: float = 1.0
+
+
+@dataclass
+class GaussianNoiseAttackConfig:
+    """Wires GaussianNoiseAttack (attacks.py) -- additive white noise at a
+    fixed per-example SNR. No weights, no detector queries, always available."""
+
+    # Signal-to-noise ratio of the added noise, in dB. Lower = stronger.
+    # 20 dB is clearly audible but leaves speech fully intelligible; sweep
+    # e.g. 40 / 30 / 20 / 10 / 5 for a robustness curve.
+    snr_db: float = 20.0
+
+
+@dataclass
+class LowpassAttackConfig:
+    """Wires LowpassAttack (attacks.py) -- second-order Butterworth low-pass."""
+
+    sample_rate: int = 16_000
+    # Cutoff in Hz. 4 kHz is narrowband-telephony-like on 16 kHz audio (it
+    # discards the entire upper half of the spectrum) while leaving speech
+    # intelligible. Sweep e.g. 8000 / 6000 / 4000 / 3000 / 2000.
+    cutoff_hz: float = 4_000.0
+
+
+@dataclass
+class SpeedAttackConfig:
+    """Wires SpeedAttack (attacks.py) -- resampling-based playback-speed
+    change. See that class's note on why `attack_sisnr` is not comparable
+    with the other attacks' for this one."""
+
+    sample_rate: int = 16_000
+    # Playback rate multiplier. 1.05 = 5% faster, around the threshold where
+    # listeners start to notice on speech. Sweep e.g. 0.9 / 0.95 / 1.05 / 1.1.
+    factor: float = 1.05
+
+
+@dataclass
+class QuantizationAttackConfig:
+    """Wires QuantizationAttack (attacks.py) -- uniform bit-depth reduction."""
+
+    # Bits per sample over full-scale [-1, 1]. 8 is a meaningful but survivable
+    # attack; sweep e.g. 12 / 10 / 8 / 6 / 4.
+    bits: int = 8
+
+
+@dataclass
+class CodecAttackConfig:
+    """Wires CodecAttack (attacks.py) -- lossy MP3/Opus round-trip through
+    the `ffmpeg` binary.
+
+    Instantiated twice in EvalAttackConfig (`codec_mp3`, `codec_opus`) since
+    the two codecs are separately interesting: MP3 is what most distributed
+    audio has been through, Opus is what most real-time/VoIP audio has been
+    through, and they discard quite different things.
+
+    Skipped automatically with a clear message when `ffmpeg` is not on PATH
+    -- see attacks.py:CodecAttack.
+    """
+
+    sample_rate: int = 16_000
+    codec: str = "mp3"  # "mp3" | "opus"
+    # Encoder bitrate. Lower = more information discarded = stronger attack.
+    # 64 kbps mono is transparent-ish for speech; sweep e.g. 128 / 64 / 32 / 16.
+    bitrate_kbps: int = 64
+
+
+@dataclass
 class AttackWeights:
     # Sampling weight for each attack branch (need not sum to 1; normalized
     # internally). A weight of 0 disables that branch. Identity is the only
     # branch guaranteed to work without extra setup -- see attacks.py for
     # what's needed to enable the others.
     #
-    # This project's current config trains against `diff_erase` (AudioLDM)
+    # This project's current config trains against `audioldm`
     # and holds `sgmse` out for evaluation only (see EvalConfig in this file
     # / evaluate.py's held_out_attacks) -- do not also give `sgmse` nonzero
     # weight here unless you deliberately want to give up that held-out
-    # generalization probe (see DiffEraseAttack's docstring in attacks.py).
+    # generalization probe (see AudioLDMAttack's docstring in attacks.py).
     identity: float = 1.0
     bigvgan: float = 0.0
     dac: float = 0.0
     sgmse: float = 0.0
-    diff_erase: float = 0.0
+    audioldm: float = 0.0
 
 
 @dataclass
@@ -142,7 +306,7 @@ class AttackConfig:
     bigvgan: BigVGANAttackConfig = field(default_factory=BigVGANAttackConfig)
     dac: DACAttackConfig = field(default_factory=DACAttackConfig)
     sgmse: SGMSEAttackConfig = field(default_factory=SGMSEAttackConfig)
-    diff_erase: DiffEraseAttackConfig = field(default_factory=DiffEraseAttackConfig)
+    audioldm: AudioLDMAttackConfig = field(default_factory=AudioLDMAttackConfig)
 
 
 @dataclass
@@ -161,6 +325,41 @@ class OptimConfig:
     betas: tp.Tuple[float, float] = (0.5, 0.9)
     weight_decay: float = 0.0
     max_norm: tp.Optional[float] = 3.0
+    max_x_wm_grad_norm: tp.Optional[float] = 1000.0
+    # Rescale the generator's gradient to exactly `max_norm` every step,
+    # instead of only shrinking it when it exceeds `max_norm`.
+    #
+    # This exists because plain clipping silently reweights a mixed-attack
+    # recipe. The branches produce gradients of wildly different scale: on the
+    # 4x A100 run train-audioldm-mixed-0814-155734 (recipe=audioldm_mixed, so
+    # ~50/50 identity vs audioldm), the median parameter-gradient norm was
+    #     identity 1.69   -- under max_norm=3.0, so 26/30 steps passed through
+    #                        untouched
+    #     audioldm 42.94  -- over it on 33/33 steps, scaled down 14.3x
+    # because backprop through the diffusion chain amplifies the gradient ~252x
+    # between x_att and x_wm (identity, a no-op, amplifies 1.0x). Clipping
+    # therefore let identity steps through at full strength while shrinking
+    # every audioldm step, leaving the optimizer on a ~93% identity diet -- a
+    # task the pretrained checkpoint has already solved. Measured effect: over
+    # 1550 steps the audioldm branch did not move at all (presence_prob
+    # 0.0646 -> 0.0648, bit_loss 0.6977 -> 0.6912, both statistically
+    # indistinguishable from flat), while identity drifted slightly.
+    #
+    # Adam does not rescue this. It is scale-invariant to a *uniform* rescale,
+    # but its moment estimates are shared across steps, so a branch that is
+    # consistently scaled down 14x relative to the other contributes
+    # proportionally less to the running direction.
+    #
+    # Normalizing makes every step contribute an update of comparable size
+    # regardless of which branch produced it. It discards gradient magnitude as
+    # a signal -- but clipping already discarded it for 100% of audioldm steps,
+    # so this trades an accidental, branch-dependent reweighting for a
+    # deliberate, uniform one. Off by default: it changes the update rule for
+    # every recipe, and single-attack runs do not have the imbalance it fixes.
+    normalize_grad: bool = False
+    # Below this gradient norm, normalization is skipped rather than amplifying
+    # what is essentially numerical noise up to `max_norm`.
+    normalize_grad_floor: float = 1e-6
 
 
 @dataclass
@@ -174,8 +373,13 @@ class DataConfig:
     # training-set fit again under a different name.
     valid_dir: tp.Optional[str] = None
     segment_duration: float = 1.0  # seconds
+    # PER GPU under torchrun (standard DDP convention): with
+    # --nproc_per_node=4 this is 16 examples on each of 4 GPUs, i.e. an
+    # effective batch of 64. The learning rate is NOT rescaled automatically
+    # -- see docs/MULTI_GPU.md for why that is left as a deliberate choice
+    # rather than a silent one.
     batch_size: int = 16
-    num_workers: int = 4
+    num_workers: int = 4  # per rank: a 4-GPU run spawns 4 x this many loader processes
 
 
 @dataclass
@@ -190,6 +394,13 @@ class TrackingConfig:
     mlflow_tracking_uri: tp.Optional[str] = None  # None -> local ./mlruns
     wandb_mode: str = "online"  # "online" | "offline" | "disabled"
     log_audio_every: int = 0  # 0 disables; else log one x_wm sample every N steps
+    # Per-step CUDA allocator metrics under the "mem/" prefix -- the only way
+    # to see whether the diffusion attacks' activation checkpointing is
+    # actually buying anything, since the wandb/nvidia-smi system panels
+    # report reserved (pool) memory and stay flat either way. Costs a few
+    # counter reads per step, no device sync. Ignored off CUDA. See
+    # train.py:CudaMemoryProbe.
+    log_memory: bool = True
 
 
 @dataclass
@@ -209,7 +420,7 @@ class TrainConfig:
     seed: int = 1234
 
     # Name of a bundle under config/recipes.yaml's `train:` section (e.g.
-    # "diff_erase" or "sgmse"), merged in on top of this schema/default.yaml
+    # "audioldm" or "sgmse"), merged in on top of this schema/default.yaml
     # but below explicit CLI overrides -- see load_config and recipes.yaml's
     # own header comment for what these set and why. None (default): no
     # recipe applied, falls back to whatever attack.weights.* default.yaml
@@ -221,6 +432,19 @@ class TrainConfig:
     # overlap with if that solver were used instead/also.
     lambda_det: float = 1.0
     lambda_perc: float = 1.0
+    # Extra weight on bit_loss specifically, within detection_loss_components'
+    # (presence_loss + lambda_bit * bit_loss) -- separate from lambda_det,
+    # which scales the whole presence+bit sum together and so can't rebalance
+    # the two against each other. Default 1.0 == old unweighted behavior
+    # (equivalent to no bit_loss field at all). See run_train_10h.sh's
+    # lambda_bit=2.0 override for why: presence_loss is the "easy" half of
+    # detection_loss (the generator can win it just by embedding *something*
+    # detectable, without correctly encoding bits), so it drops fast and
+    # plateaus while bit_loss doesn't move (see the comic-snowball-9 run's
+    # eval/bit_loss curve) -- weighting bit_loss higher pushes optimization
+    # toward the actually-hard sub-problem instead of letting it settle for
+    # the cheap presence-only win.
+    lambda_bit: float = 1.0
 
     # Per-example watermark SNR (dB) is sampled uniformly from this range
     # every training step (see train.py:embed_watermark) rather than using
@@ -247,13 +471,30 @@ class TrainConfig:
 class EvalAttackConfig:
     """Per-attack extra settings for evaluate.py's attacks (checkpoints etc),
     separate from TrainConfig's AttackConfig since eval also runs held-out
-    attacks (diff_erase, mbd) that training must never see."""
+    attacks (audioldm, mbd) that training must never see."""
 
     bigvgan: BigVGANAttackConfig = field(default_factory=BigVGANAttackConfig)
     dac: DACAttackConfig = field(default_factory=DACAttackConfig)
     sgmse: SGMSEAttackConfig = field(default_factory=SGMSEAttackConfig)
-    diff_erase: DiffEraseAttackConfig = field(default_factory=DiffEraseAttackConfig)
+    audioldm: AudioLDMAttackConfig = field(default_factory=AudioLDMAttackConfig)
     mbd: MBDAttackConfig = field(default_factory=MBDAttackConfig)
+    hopskipjump: HopSkipJumpAttackConfig = field(default_factory=HopSkipJumpAttackConfig)
+    # Fixed-budget attacks (AudioMarkBench's white-box adversarial + common
+    # perturbation families). Unlike hopskipjump these need no enable gate:
+    # none of them loads external weights and none is expensive enough to
+    # need opting into. See attacks.py:_SignalLevelAttack for why this whole
+    # group, and not hopskipjump, is the one that yields meaningful ROC-AUC.
+    pgd: PGDAttackConfig = field(default_factory=PGDAttackConfig)
+    gaussian_noise: GaussianNoiseAttackConfig = field(default_factory=GaussianNoiseAttackConfig)
+    lowpass: LowpassAttackConfig = field(default_factory=LowpassAttackConfig)
+    speed: SpeedAttackConfig = field(default_factory=SpeedAttackConfig)
+    quantization: QuantizationAttackConfig = field(default_factory=QuantizationAttackConfig)
+    codec_mp3: CodecAttackConfig = field(
+        default_factory=lambda: CodecAttackConfig(codec="mp3", bitrate_kbps=64)
+    )
+    codec_opus: CodecAttackConfig = field(
+        default_factory=lambda: CodecAttackConfig(codec="opus", bitrate_kbps=32)
+    )
 
 
 @dataclass
@@ -281,7 +522,7 @@ class EvalConfig:
     seed: int = 1234
 
     # Name of a bundle under config/recipes.yaml's `eval:` section (e.g.
-    # "after_diff_erase_training" or "after_sgmse_training") -- same merge
+    # "after_audioldm_training" or "after_sgmse_training") -- same merge
     # position/semantics as TrainConfig.recipe (see load_eval_config). None
     # (default): no recipe applied, falls back to default_eval.yaml's plain
     # eval_attacks/held_out_attacks.
@@ -295,7 +536,14 @@ class EvalConfig:
 
     eval_dir: str = "???"  # held-out wavs, never trained on
     segment_duration: float = 3.0
+    # PER GPU under torchrun (standard DDP convention), so a 4-GPU run
+    # processes 4 x batch_size examples at a time.
     batch_size: int = 8
+    # GLOBAL batch count, split across ranks (see distributed.shard_size) --
+    # deliberately NOT per GPU, unlike batch_size: this one controls how much
+    # audio a reported number is measured on, so scaling it with the GPU
+    # count would silently make 4-GPU results incomparable to the 1-GPU
+    # baselines already recorded.
     n_eval_batches: int = 20
     # Fixed watermark SNR (dB) for eval -- a single number, not a range like
     # TrainConfig.watermark_snr_db_{min,max}, since eval wants one
@@ -324,20 +572,34 @@ class EvalConfig:
     # torchaudio.load + resample per item) while the GPU is busy on the
     # current one; at 0 that work is serialized with the forward passes on the
     # main thread, which shows up as a CPU stall between every batch.
+    # PER RANK: a 4-GPU run spawns 4 x num_workers loader processes, so this
+    # is the knob to turn down first if the box runs out of CPU or shared
+    # memory.
     num_workers: int = 4
 
     # Where the confusion-matrix and robustness-curve PNGs (see plotting.py)
     # get written, one pair per run under f"{label}_*.png".
     output_dir: str = "./eval_outputs"
 
+    # Per-example artifacts (x, x_wm, x_att as .wav + a CSV of per-row
+    # metrics: bit_accuracy, presence_pos, presence_neg, attack_sisnr) under
+    # f"{output_dir}/{label}_{attack_name}_rows/" -- one dir per attack,
+    # every row from the HEADLINE pass only (not the robustness-curve sweep,
+    # which would multiply this by len(t_star_grid) for numbers nobody
+    # inspects per-example). Off by default: batch_size * n_eval_batches
+    # examples * 3 wavs each adds up (e.g. 8*20*3 = 480 files at the config
+    # defaults, 8*150*3=3600 for run_full_eval_1h.sh) and most runs only
+    # need the aggregate metrics evaluate_attack already returns.
+    save_row_artifacts: bool = False
+
     # Robustness (measured after the attack).
     fpr_target: float = 0.01  # TPR@FPR operating point
     # Robustness curve: detection vs. attack strength t* (diffusion
     # purification starting point -- 0 = no corruption, 1 = full
     # noise-then-regenerate). Only meaningful for attacks that implement a
-    # `strength` axis (currently sgmse, diff_erase) -- see attacks.py.
+    # `strength` axis (currently sgmse, audioldm) -- see attacks.py.
     # Fractions of num_timesteps (attack-agnostic -- each strength-aware
-    # attack maps this through its own T, see SGMSEAttack/DiffEraseAttack
+    # attack maps this through its own T, see SGMSEAttack/AudioLDMAttack
     # docstrings). Calibrated against the mentor's curriculum table (linear
     # schedule, T=1000): actual timesteps t*={0.3, 2, 6, 15, 40} correspond
     # to noise floors lambda_dB={50, 36, 30, 24, 18} -- 50dB is "barely an
@@ -351,15 +613,15 @@ class EvalConfig:
         default_factory=lambda: [0.0, 0.0003, 0.002, 0.006, 0.015, 0.04, 0.08]
     )
     # The single t* the HEADLINE robustness number is measured at, for the
-    # strength-aware attacks (sgmse, diff_erase -- the rest ignore strength
+    # strength-aware attacks (sgmse, audioldm -- the rest ignore strength
     # entirely). 0.04 = t*=40 out of T=1000 = the top of the mentor's
     # curriculum table, i.e. their "hard regime" (see t_star_grid above).
     #
     # Passing no strength at all (what evaluate.py used to do) is NOT a
     # neutral default -- it leaves strength=None, which makes each attack
     # sample its own t* ~ U[0, 1] per forward call (see
-    # SGMSEAttack/DiffEraseAttack.forward). Two problems with that:
-    #   1. Cost. DiffEraseAttack's reverse loop runs int(1000 * strength)
+    # SGMSEAttack/AudioLDMAttack.forward). Two problems with that:
+    #   1. Cost. AudioLDMAttack's reverse loop runs int(1000 * strength)
     #      sequential UNet steps, so U[0,1] averages ~500 steps/batch --
     #      ~12x this setting's 40, and still ~6x past t*=80 (t_star_grid's
     #      top point, itself already beyond the hard regime). We were paying
@@ -372,13 +634,13 @@ class EvalConfig:
     headline_strength: float = 0.04
 
     # Attacks the generator was (or will be) trained against.
-    eval_attacks: tp.List[str] = field(default_factory=lambda: ["identity", "bigvgan", "dac", "diff_erase"])
+    eval_attacks: tp.List[str] = field(default_factory=lambda: ["identity", "bigvgan", "dac", "audioldm"])
     # Held out on purpose: NEVER given nonzero weight in AttackConfig.weights
     # during training. This is the generalization probe -- "did robustness
     # transfer to an attack the generator never saw, or did it just
     # memorize the training attacks." `sgmse` is held out here (rather than
     # trained against, as in the original design) -- this project variant
-    # trains on `diff_erase` (AudioLDM) instead, so `sgmse` is the
+    # trains on `audioldm` instead, so `sgmse` is the
     # generalization probe: does robustness against latent-diffusion
     # resynthesis transfer to SGMSE's structurally different OU-VE SDE
     # attack. `mbd` remains held out either way (never wired into

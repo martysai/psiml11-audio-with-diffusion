@@ -28,20 +28,153 @@ watermarking solver (`audiocraft/utils/audio_effects.py`,
 copy of the input and reattach the *difference* with a straight-through
 estimator. That is a workaround for compression codecs that have no
 meaningful gradient (external, non-differentiable subprocess calls). Since
-BigVGAN/DAC/SGMSE/DiffErase are ordinary neural nets, we don't need that
-workaround -- we can and do backprop through them for real (DiffErase needs a
+BigVGAN/DAC/SGMSE/AudioLDM are ordinary neural nets, we don't need that
+workaround -- we can and do backprop through them for real (AudioLDM needs a
 little more care to get there -- see that class's own docstring for why).
 """
 
+import contextlib
 import functools
+import logging
 import os
 import random
+import shutil
+import subprocess
 import typing as tp
 from pathlib import Path
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.utils.checkpoint
+import torchaudio.functional as AF
+
+from audioseal.models import AudioSealDetector
+
+logger = logging.getLogger(__name__)
+
+
+class AttackApplicationReporter:
+    """Mixin for attacks that can silently fail to perturb some examples.
+
+    Most attacks here are resynthesis pipelines: they always transform every
+    example they are handed, so "the attack ran" and "the attack was applied"
+    are the same statement. Query-based search attacks break that equivalence
+    -- HopSkipJumpAttack returns an example *unperturbed* whenever its search
+    never found an adversarial starting point within the query budget (see
+    `HopSkipJumpAttack._initialize`).
+
+    That failure mode is dangerous precisely because it is invisible in the
+    metrics: an unperturbed watermarked example still detects, so it lands in
+    `evaluate_attack`'s positive scores as a detection, i.e. it is scored as
+    *robustness of the watermark* when it is really *weakness of the attack*.
+    A run whose search budget was too small is therefore indistinguishable
+    from a genuinely robust model -- both report a high TPR@FPR.
+
+    This mixin makes that distinction observable. An attack records one
+    bool per example as it produces it, and `evaluate.py:evaluate_attack`
+    duck-types `pop_application_mask()` (exactly like `bind_detector`) to
+    drain it after each forward and fold it into the reported metrics. Any
+    attack not implementing this is treated as "applied to everything",
+    so nothing changes for the resynthesis attacks.
+    """
+
+    def _reset_application_mask(self) -> None:
+        self._application_flags: tp.List[bool] = []
+
+    def _record_application(self, applied: bool) -> None:
+        # Tolerate a forward() that never called _reset_application_mask
+        # (e.g. a subclass overriding forward without going through it).
+        if not hasattr(self, "_application_flags"):
+            self._application_flags = []
+        self._application_flags.append(applied)
+
+    def pop_application_mask(self) -> tp.Optional[torch.Tensor]:
+        """Per-example bools for the LAST forward call: True where the attack
+        actually perturbed the example, False where it gave up and passed it
+        through. Drains the buffer, so each forward's mask is consumed
+        exactly once and a missed read can never be mistaken for a later
+        call's result. None if nothing was recorded."""
+        flags = getattr(self, "_application_flags", None)
+        if not flags:
+            return None
+        self._application_flags = []
+        return torch.tensor(flags, dtype=torch.bool)
+
+
+def _tile_or_crop(wav: torch.Tensor, target_len: int) -> torch.Tensor:
+    """Fit `wav` (B, T) to exactly `target_len` samples, tiling if it is short.
+
+    AudioLDM's backbone consumes a fixed 10.24s window (`duration` in
+    audioldm_original.yaml), so anything shorter has to be extended somehow.
+
+    Tiling rather than zero-padding, because zero-padding this model is
+    catastrophic rather than merely wasteful. Its mel goes through
+    log(clamp(m, min=1e-5)), so digital silence becomes a constant -11.51
+    plateau while speech sits near 0. At the 2.0s segments used for training
+    that leaves 80.5% of the spectrogram pinned at the floor and a mel whose
+    mean is ~-9.0, against ~+1.0 for natural audio -- far outside anything the
+    pretrained VAE and UNet ever saw. Nor does it stay confined to the padded
+    region: with use_spatial_transformer the UNet's attention spans all 256
+    latent frames, so the silence mixes into the real-content region, and
+    cropping the output afterwards cannot undo it.
+
+    Measured, from a 4x A100 smoke evaluation: AudioLDM scored
+    attack_sisnr = -50 dB -- the "attacked" audio essentially uncorrelated
+    with its input -- while MBD, also a diffusion resynthesis but run at the
+    audio's native length with no padding, scored -8.8 dB. A 41 dB gap between
+    two comparable methods, from the padding alone.
+
+    Relationship to the eval-side fix in this branch: building a
+    fixed-duration eval set of files that are genuinely >= 10.24s is strictly
+    better where it applies, since the model then sees real contiguous audio
+    and nothing is synthesised at all. This covers the cases that cannot
+    reach: the TRAINING path (train_step feeds whatever
+    data.segment_duration produces, and shortening it is the point -- longer
+    segments make detection easier for free, because the detector
+    time-averages both presence and the message bits, see
+    audioseal/models.py:decode_message), and any evaluation run against a
+    dataset that has not been pre-curated, such as the AzureML mounts where
+    `test-clean-fixed` does not exist.
+
+    Tiling's own cost is repeated content and a seam at each wrap, which is
+    far smaller than an 80% silence plateau. Gradients flow back through every
+    tile onto the same input samples, which is simply the true Jacobian of
+    tile-then-crop.
+    """
+    length = wav.shape[-1]
+    if length == 0:
+        raise ValueError("cannot fit an empty waveform to a target length")
+    if length < target_len:
+        wav = wav.repeat(1, target_len // length + 1)
+    return wav[..., :target_len]
+
+
+def _fit_length(wav: torch.Tensor, target_len: int) -> torch.Tensor:
+    """Force `wav` (..., T) to exactly `target_len` samples: crop if long,
+    zero-pad the tail if short.
+
+    Needed by the signal-level attacks whose corruption is not
+    length-preserving -- `speed` resamples (a 1.05x speed-up on a 3s segment
+    comes back ~143ms shorter) and lossy codecs add encoder delay/padding.
+    `evaluate.py` pairs `x_att` with `x_wm` sample-for-sample to compute
+    `attack_sisnr`, and the detector's presence is time-pooled over a tensor
+    that has to line up with the rest of the batch, so a ragged length is not
+    an option.
+
+    Deliberately NOT `_tile_or_crop` (above): that one repeats content to
+    fill, which is right for AudioLDM's fixed 10.24s window where the
+    alternative is an 80% silence plateau, but wrong here -- tiling a
+    time-stretched signal would splice unrelated content into the tail and
+    show up as an attack far more destructive than the one being measured.
+    A short zero tail is the smaller distortion.
+    """
+    cur = wav.shape[-1]
+    if cur == target_len:
+        return wav
+    if cur > target_len:
+        return wav[..., :target_len]
+    return F.pad(wav, (0, target_len - cur))
 
 
 class IdentityAttack(nn.Module):
@@ -50,7 +183,6 @@ class IdentityAttack(nn.Module):
 
     def forward(self, x: torch.Tensor, strength: tp.Optional[float] = None) -> torch.Tensor:
         return x
-
 
 class BigVGANAttack(nn.Module):
     """Resynthesis attack: extract a mel-spectrogram from `x_wm` and vocode it
@@ -147,7 +279,7 @@ class SGMSEAttack(nn.Module):
     """A diffusion-based reconstruction (SGMSE, score-based generative model
     for speech enhancement) run on `x_wm`. In this project's current config,
     this is the held-out attack instead (see `held_out_attacks` in
-    evaluate.py / EvalConfig in config.py) -- DiffEraseAttack (AudioLDM) is
+    evaluate.py / EvalConfig in config.py) -- AudioLDMAttack is
     the one trained against, and SGMSE measures whether robustness
     generalizes to it. Its forward pass stays differentiable regardless (see
     below) in case it's re-enabled for training later -- being differentiable
@@ -161,17 +293,17 @@ class SGMSEAttack(nn.Module):
     inference-time step count. Its forward pass is NOT wrapped in no_grad --
     gradients can reach back through it into the generator (frozen params
     via requires_grad_(False), but the graph stays connected, same "frozen
-    but differentiable" pattern as BigVGAN/DAC/DiffErase).
+    but differentiable" pattern as BigVGAN/DAC/AudioLDM).
 
     Wired to sp-uhh/sgmse (MIT licensed; vendored under src/sgmse/, see that
     directory's VENDORED.md), an OU-VE SDE score model for speech
     enhancement. Its mechanism is structurally different from
-    DiffEraseAttack's DDPM: there's no discrete `q_sample`/`p_sample` step
+    AudioLDMAttack's DDPM: there's no discrete `q_sample`/`p_sample` step
     index -- the SDE runs in continuous time t in [t_eps, T=1], and the
     predictor/corrector sampler always starts from the SDE's own prior at
     t=T (centered on the input `y`, i.e. `x_wm` treated as "the noisy signal
     to enhance"). To get a `strength`-parametrized *partial* corruption
-    (matching DiffEraseAttack's t* convention) rather than always running
+    (matching AudioLDMAttack's t* convention) rather than always running
     the model's default full enhancement, `forward` manually replicates
     `sgmse.sampling.get_pc_sampler`'s predictor-corrector loop (see that
     function for the reference this mirrors) but starts from
@@ -180,7 +312,7 @@ class SGMSEAttack(nn.Module):
     t_star)` -- since x0=y=Y here (we only have one signal, not a genuine
     clean/noisy pair), the mean term collapses to exactly Y and this reduces
     to "add `std(t_star)`-scaled Gaussian noise to Y, then reverse-diffuse
-    from there," the direct SDE analogue of DiffEraseAttack's
+    from there," the direct SDE analogue of AudioLDMAttack's
     `q_sample`-then-`p_sample` loop.
 
     `strength` (the t* robustness-curve axis, see evaluate.py): t*=0 means
@@ -190,7 +322,7 @@ class SGMSEAttack(nn.Module):
     spread of the curve rather than a single point; passing a float pins the
     whole batch to it, which is what evaluate.py's per-t* measurements need.
     NOTE: `t_star_grid`'s default values in config.py were calibrated against
-    DiffErase's DDPM (T=1000 discrete steps) using the mentor's timestep
+    AudioLDM's DDPM (T=1000 discrete steps) using the mentor's timestep
     table -- SGMSE's noise schedule (OU-VE SDE, continuous t in [t_eps, 1])
     is a different process, so the same strength fractions likely correspond
     to a different *qualitative* corruption level here. Not yet recalibrated
@@ -211,6 +343,9 @@ class SGMSEAttack(nn.Module):
         self.sample_rate = sample_rate
         self.checkpoint = checkpoint
         self.num_steps = num_steps
+        # Replaced with a rank-shared generator by SampledReconstructionAttack;
+        # the module default keeps standalone use working exactly as before.
+        self._strength_rng: random.Random = tp.cast(random.Random, random)
         self._model: tp.Optional[nn.Module] = None
         # Overwritten from the checkpoint's own data module in _load_backbone;
         # these are SpecsDataModule's defaults.
@@ -237,7 +372,7 @@ class SGMSEAttack(nn.Module):
         # .eval() is not just standard hygiene here -- ScoreModel overrides
         # train()/eval() to swap in EMA-smoothed weights on eval() (see
         # sgmse/model.py:ScoreModel.train), the SGMSE-native equivalent of
-        # DiffErase's ema_scope. Skipping this would silently run the raw
+        # AudioLDMAttack's ema_scope. Skipping this would silently run the raw
         # (non-EMA) training weights instead.
         model.eval()
         for p in model.parameters():
@@ -302,66 +437,112 @@ class SGMSEAttack(nn.Module):
         from sgmse.util.other import pad_spec
 
         device = x.device
-        batch_size = x.shape[0]
-        sde = self._model.sde.copy()
-        sde.N = self.num_steps
-        eps = self._model.t_eps
+        in_dtype = x.dtype
 
-        if strength is None:
-            strengths = torch.rand(batch_size, device=device)
-        else:
-            strengths = torch.full(
-                (batch_size,), float(min(max(strength, 0.0), 1.0)), device=device
-            )
-        t_star = eps + strengths * (sde.T - eps)  # (B,)
+        # Forces fp32 regardless of any ambient bf16 autocast (see train.py's
+        # _autocast): NCSN++'s upfirdn2d up/downsampling (backbones/ncsnpp_utils/
+        # op/upfirdn2d.py) goes through a hand-written CUDA kernel on GPU (the
+        # CPU path has a pure-PyTorch fallback, but that's not this path) that
+        # only has a fp32 dispatch -- "upfirdn2d_cuda" not implemented for
+        # 'BFloat16'. Activation checkpointing above is unaffected; this only
+        # gives up the *dtype* half of the memory savings for this attack, not
+        # the step-count half, which was the actual fix for the OOM.
+        # enabled=False alone only stops NEW ops in this block from being cast
+        # to bf16 -- it does not undo the dtype `x` already arrived in (bf16,
+        # since it's the output of embed_watermark/attack's own bf16-autocast
+        # forward in train_step). Cast explicitly, or the same op sees the
+        # same bf16 tensor either way.
+        with torch.autocast(device_type=device.type, enabled=False):
+            x = x.float()
+            batch_size = x.shape[0]
+            sde = self._model.sde.copy()
+            sde.N = self.num_steps
+            eps = self._model.t_eps
 
-        orig_len = x.shape[-1]
-        wav = x.squeeze(1)  # (B, T)
-        # SGMSE's own enhance() normalizes by peak amplitude before STFT and
-        # rescales back afterwards -- its score model was trained on
-        # peak-normalized inputs.
-        norm_factor = wav.abs().amax(dim=-1, keepdim=True).clamp_min(1e-8)
-        wav = wav / norm_factor
-
-        Y = self._spec_fwd(self._model._stft(wav)).unsqueeze(1)  # (B, 1, F, T_frames)
-        Y = pad_spec(Y)
-
-        # Forward-corrupt Y to t_star via the SDE's own marginal_prob. With
-        # x0=y=Y (see class docstring), the mean term is exactly Y, so this
-        # is "Y plus std(t_star)-scaled Gaussian noise" -- the SDE analogue
-        # of DiffEraseAttack's q_sample.
-        mean, std = sde.marginal_prob(Y, Y, t_star)
-        xt = mean + std[:, None, None, None] * torch.randn_like(Y)
-        xt_mean = xt
-
-        predictor = PredictorRegistry.get_by_name("reverse_diffusion")(sde, self._model, probability_flow=False)
-        corrector = CorrectorRegistry.get_by_name("ald")(sde, self._model, snr=0.5, n_steps=1)
-
-        # Mirrors sgmse.sampling.get_pc_sampler's pc_sampler() loop exactly,
-        # just starting from t_star instead of sde.T -- see that function
-        # for the reference this replicates. Deliberately NOT wrapped in
-        # torch.no_grad() (see class docstring: this attack must stay
-        # differentiable for training).
-        # (B, num_steps): row b is that example's own linspace(t_star[b], eps).
-        ramp = torch.linspace(1.0, 0.0, self.num_steps, device=device)
-        timesteps = eps + (t_star[:, None] - eps) * ramp[None, :]
-        for i in range(self.num_steps):
-            vec_t = timesteps[:, i]
-            if i != self.num_steps - 1:
-                stepsize = vec_t - timesteps[:, i + 1]
+            if strength is None:
+                # Drawn from the rank-shared RNG rather than torch's global
+                # generator, which distributed.seed_everything seeds per rank.
+                # Unlike AudioLDM the step count here is fixed (num_steps), so
+                # this is about comparability rather than cost: identical t*
+                # across ranks means every rank corrupts to the same depth, so
+                # the loss each contributes to the allreduce is measuring the
+                # same difficulty. The per-example spread within the batch is
+                # preserved -- each rank still sees different audio.
+                strengths = torch.tensor(
+                    [self._strength_rng.random() for _ in range(batch_size)],
+                    device=device,
+                )
             else:
-                stepsize = timesteps[:, -1]  # from eps to 0, as in the reference
-            xt, xt_mean = corrector.update_fn(xt, Y, vec_t)
-            xt, xt_mean = predictor.update_fn(xt, Y, vec_t, stepsize)
+                strengths = torch.full(
+                    (batch_size,), float(min(max(strength, 0.0), 1.0)), device=device
+                )
+            t_star = eps + strengths * (sde.T - eps)  # (B,)
 
-        x_hat = self._model._istft(self._spec_back(xt_mean.squeeze(1)), orig_len)
-        x_hat = x_hat * norm_factor
-        return x_hat.unsqueeze(1).to(x.dtype)
+            orig_len = x.shape[-1]
+            wav = x.squeeze(1)  # (B, T)
+            # SGMSE's own enhance() normalizes by peak amplitude before STFT and
+            # rescales back afterwards -- its score model was trained on
+            # peak-normalized inputs.
+            norm_factor = wav.abs().amax(dim=-1, keepdim=True).clamp_min(1e-8)
+            wav = wav / norm_factor
+
+            Y = self._spec_fwd(self._model._stft(wav)).unsqueeze(1)  # (B, 1, F, T_frames)
+            Y = pad_spec(Y)
+
+            # Forward-corrupt Y to t_star via the SDE's own marginal_prob. With
+            # x0=y=Y (see class docstring), the mean term is exactly Y, so this
+            # is "Y plus std(t_star)-scaled Gaussian noise" -- the SDE analogue
+            # of AudioLDMAttack's q_sample.
+            mean, std = sde.marginal_prob(Y, Y, t_star)
+            xt = mean + std[:, None, None, None] * torch.randn_like(Y)
+            xt_mean = xt
+
+            predictor = PredictorRegistry.get_by_name("reverse_diffusion")(sde, self._model, probability_flow=False)
+            corrector = CorrectorRegistry.get_by_name("ald")(sde, self._model, snr=0.5, n_steps=1)
+
+            # Mirrors sgmse.sampling.get_pc_sampler's pc_sampler() loop exactly,
+            # just starting from t_star instead of sde.T -- see that function
+            # for the reference this replicates. Deliberately NOT wrapped in
+            # torch.no_grad() (see class docstring: this attack must stay
+            # differentiable for training).
+            # (B, num_steps): row b is that example's own linspace(t_star[b], eps).
+            ramp = torch.linspace(1.0, 0.0, self.num_steps, device=device)
+            timesteps = eps + (t_star[:, None] - eps) * ramp[None, :]
+
+            def _pc_step(
+                xt: torch.Tensor, xt_mean: torch.Tensor, Y: torch.Tensor, vec_t: torch.Tensor, stepsize: torch.Tensor
+            ) -> tp.Tuple[torch.Tensor, torch.Tensor]:
+                xt, xt_mean = corrector.update_fn(xt, Y, vec_t)
+                xt, xt_mean = predictor.update_fn(xt, Y, vec_t, stepsize)
+                return xt, xt_mean
+
+            for i in range(self.num_steps):
+                vec_t = timesteps[:, i]
+                if i != self.num_steps - 1:
+                    stepsize = vec_t - timesteps[:, i + 1]
+                else:
+                    stepsize = timesteps[:, -1]  # from eps to 0, as in the reference
+                # Activation checkpointing: this loop is a differentiable
+                # multi-step sampler (see class docstring's "can be memory-heavy"
+                # note) -- without it, autograd holds every step's activations
+                # (score-model forward, twice per step via corrector+predictor)
+                # live simultaneously for backward, num_steps=30 by default. This
+                # trades that for one recomputed forward per step during
+                # backward instead. use_reentrant=False: the modern
+                # checkpoint API, correctly threads gradients to Y (reused every
+                # step, not just the loop-carried xt/xt_mean).
+                xt, xt_mean = torch.utils.checkpoint.checkpoint(
+                    _pc_step, xt, xt_mean, Y, vec_t, stepsize, use_reentrant=False
+                )
+
+            x_hat = self._model._istft(self._spec_back(xt_mean.squeeze(1)), orig_len)
+            x_hat = x_hat * norm_factor
+            return x_hat.unsqueeze(1).to(in_dtype)
 
 
-class DiffEraseAttack(nn.Module):
+class AudioLDMAttack(nn.Module):
     """The trained attack in this project variant: given nonzero weight in
-    `AttackConfig.weights.diff_erase` during training (see train.py), so the
+    `AttackConfig.weights.audioldm` during training (see train.py), so the
     generator is fine-tuned directly against it. SGMSEAttack plays the
     held-out role instead here (see `held_out_attacks` in evaluate.py /
     EvalConfig in config.py) -- the generalization question this setup
@@ -371,32 +552,35 @@ class DiffEraseAttack(nn.Module):
     reverse. Do not also give `sgmse` nonzero training weight unless you
     deliberately want to give up that held-out probe.
 
-    Wired to DiffErase-latent (github.com/DiffErase/Differase's "Audio
-    Pirates" project, the AudioLDM-style latent-diffusion variant):
-    forward-diffuses a mel-spectrogram of `x` up to timestep
+    HISTORY: this was called DiffEraseAttack until it was renamed, and was
+    written against DiffErase-latent (github.com/DiffErase/Differase's
+    "Audio Pirates"), whose *method* -- partial-noise then
+    diffusion-regenerate -- is what this implements. It was never their
+    model, though: that repo ships no pretrained checkpoint (its README is
+    about training one), so there are no open weights to run and the code
+    always pointed at a stock pretrained AudioLDM checkpoint instead. The
+    name was making a promise the weights couldn't keep, hence `audioldm`.
+
+    Forward-diffuses a mel-spectrogram of `x` up to timestep
     `strength * num_timesteps` (same t* convention as SGMSEAttack -- 0 = no
     corruption, 1 = full noise-then-regenerate), reverse-diffuses it back
     with the pretrained LatentDiffusion model, and vocodes the result back
-    to a waveform with the accompanying HiFiGAN. This mirrors the reference
-    `Differase/remove_differase-latent.py` script's `process_audio_batch`
-    algorithm, just working on in-memory batched tensors (so it slots into
-    train.py's/evaluate.py's per-batch loops) instead of reading/writing wav
-    files -- see the "differentiability" paragraph below for the one place
-    this implementation deliberately does NOT call through to the reference
+    to a waveform with the accompanying HiFiGAN. Works on in-memory batched
+    tensors so it slots into train.py's/evaluate.py's per-batch loops --
+    see the "differentiability" paragraph below for the one place this
+    implementation deliberately does NOT call through to the vendored
     library's own convenience methods.
 
     Model code (`audioldm_train`, MIT licensed) is vendored under
     `src/audioldm_train/` -- see that directory's VENDORED.md for provenance
-    and the one intentional local change (unrelated to gradients -- see
-    below). Only the actual *weights* (multi-GB, never belongs in git) stay
-    external: point `checkpoint` and `config` at files on disk (e.g. a
-    checkout of the Differase repo's
-    `DiffErase-latent/data/checkpoints/*.ckpt` and
-    `DiffErase-latent/audioldm_train/config/**/*.yaml`) you've trained or
-    otherwise obtained -- DiffErase-latent's own README is literally about
-    *training* one, it ships none. This attack stays disabled (constructing
-    it without a checkpoint keeps raising NotImplementedError) until you do
-    -- see AttackConfig.diff_erase / EvalAttackConfig.diff_erase in config.py.
+    and its local changes. Only the actual *weights* (multi-GB, never belong
+    in git) stay external: point `checkpoint` and `config` at a pretrained
+    AudioLDM release on disk (e.g. `audioldm-s-full` from the AudioLDM
+    authors' Zenodo record, plus the matching
+    `audioldm_train/config/**/audioldm_original.yaml` vendored here). This
+    attack stays disabled (constructing it without a checkpoint keeps
+    raising NotImplementedError) until you do -- see AttackConfig.audioldm /
+    EvalAttackConfig.audioldm in config.py.
 
     Differentiable, same "frozen but differentiable" pattern as
     BigVGAN/DAC/SGMSE (see module docstring): its own parameters are frozen
@@ -455,6 +639,10 @@ class DiffEraseAttack(nn.Module):
         self.checkpoint = checkpoint
         self.config_path = config
         self.strength_max = strength_max
+        # Replaced with a rank-shared generator by SampledReconstructionAttack;
+        # the module default keeps standalone use (tests, evaluate.py) working
+        # exactly as before. See forward() for why sharing this matters.
+        self._strength_rng: random.Random = tp.cast(random.Random, random)
         self._model: tp.Optional[nn.Module] = None
         self._vocoder: tp.Optional[nn.Module] = None
         self._stft: tp.Optional[nn.Module] = None
@@ -466,23 +654,23 @@ class DiffEraseAttack(nn.Module):
     def _load_backbone(self, checkpoint: str) -> None:
         if self.config_path is None:
             raise NotImplementedError(
-                "DiffEraseAttack needs `config` set alongside `checkpoint` "
-                "-- see EvalAttackConfig.diff_erase in src/audioseal_robust/config.py."
+                "AudioLDMAttack needs `config` set alongside `checkpoint` "
+                "-- see EvalAttackConfig.audioldm in src/audioseal_robust/config.py."
             )
 
         ckpt_path = Path(checkpoint).resolve()
         if not ckpt_path.is_file():
-            raise FileNotFoundError(f"DiffErase-latent checkpoint not found: {ckpt_path}")
+            raise FileNotFoundError(f"AudioLDM checkpoint not found: {ckpt_path}")
         # get_vocoder() hardcodes a "data/checkpoints" *relative* path (same
         # convention first_stage_config.reload_from_ckpt uses in the yaml) --
         # `checkpoint` must live at <weights_root>/data/checkpoints/<file>
         # so we can cd into <weights_root> for that lookup to resolve.
         if ckpt_path.parent.name != "checkpoints" or ckpt_path.parent.parent.name != "data":
             raise ValueError(
-                f"DiffErase-latent checkpoint {ckpt_path} must live at "
+                f"AudioLDM checkpoint {ckpt_path} must live at "
                 "<weights_root>/data/checkpoints/<file> -- that's where "
                 "get_vocoder() and the VAE's reload_from_ckpt look for the "
-                "vocoder/VAE weights next to it (see DiffErase-latent's own "
+                "vocoder/VAE weights next to it (see AudioLDM's own "
                 "data/checkpoints/ layout)."
             )
         weights_root = ckpt_path.parent.parent.parent
@@ -494,7 +682,7 @@ class DiffEraseAttack(nn.Module):
 
         config_path = Path(self.config_path)
         if not config_path.is_file():
-            raise FileNotFoundError(f"DiffErase-latent config not found: {config_path}")
+            raise FileNotFoundError(f"AudioLDM config not found: {config_path}")
         with open(config_path) as f:
             model_config = yaml.load(f, Loader=yaml.FullLoader)
 
@@ -532,7 +720,7 @@ class DiffEraseAttack(nn.Module):
         original_cwd = os.getcwd()
         original_torch_load = torch.load
         os.chdir(weights_root)
-        # DiffErase-latent's own model construction calls torch.load() in a
+        # AudioLDM's own model construction calls torch.load() in a
         # few places (e.g. get_vocoder, and AutoencoderKL's own internal
         # preview-vocoder in __init__) without map_location -- fine on the
         # GPU boxes those checkpoints were saved on, but on CPU-only/MPS
@@ -567,15 +755,26 @@ class DiffEraseAttack(nn.Module):
         [0, 1])."""
         if self._model is None:
             raise NotImplementedError(
-                "DiffEraseAttack was constructed without a checkpoint (see "
+                "AudioLDMAttack was constructed without a checkpoint (see "
                 "class docstring in src/audioseal_robust/attacks.py). Either "
-                "set attack.diff_erase.{checkpoint,config} (training) / "
-                "eval.diff_erase.{checkpoint,config} (eval), or set "
-                "attack.weights.diff_erase=0 / remove diff_erase from "
+                "set attack.audioldm.{checkpoint,config} (training) / "
+                "eval.audioldm.{checkpoint,config} (eval), or set "
+                "attack.weights.audioldm=0 / remove audioldm from "
                 "eval_attacks to skip it."
             )
         if strength is None:
-            strength = random.random() * self.strength_max
+            # self._strength_rng, not the global `random`: under DDP the global
+            # RNG is seeded per rank (distributed.seed_everything uses
+            # seed + rank), so each rank would draw a different t* and run a
+            # different number of reverse-diffusion steps. DDP synchronises at
+            # every backward, so the step costs whatever the deepest draw on
+            # any rank costs -- with 4 ranks that is E[max of 4 uniforms] =
+            # 0.8 * strength_max instead of 0.5, ~1.6x the expected work, paid
+            # on every step. It also makes peak memory a function of the
+            # unluckiest rank, and eval numbers less comparable. See
+            # SampledReconstructionAttack, which injects a rank-shared RNG for
+            # exactly the reason it already shares the branch draw.
+            strength = self._strength_rng.random() * self.strength_max
         strength = float(min(max(strength, 0.0), 1.0))
 
         device = x.device
@@ -583,10 +782,7 @@ class DiffEraseAttack(nn.Module):
         target_len = int(round(self._model_sample_rate * self._duration))
 
         wav = x.squeeze(1).clamp(-1.0, 1.0)  # (B, T)
-        if wav.shape[-1] < target_len:
-            wav = F.pad(wav, (0, target_len - wav.shape[-1]))
-        else:
-            wav = wav[..., :target_len]
+        wav = _tile_or_crop(wav, target_len)
 
         mel, *_ = self._stft.mel_spectrogram(wav)  # (B, n_mel, T_frames)
         mel_input = mel.permute(0, 2, 1).unsqueeze(1)  # (B, 1, T_frames, n_mel)
@@ -636,8 +832,8 @@ class DiffEraseAttack(nn.Module):
             for i, key in enumerate(self._model.conditioning_key)
         }
         clip_denoised = self._model.clip_denoised
-        for t in range(noise_timestep, 0, -1):
-            t_tensor = torch.full((z.shape[0],), t, device=device, dtype=torch.long)
+
+        def _ddpm_step(z: torch.Tensor, t: int) -> torch.Tensor:
             # Inlined body of LatentDiffusion.p_sample (ddpm.py), minus its
             # @torch.no_grad() decorator -- see class docstring. p_mean_variance
             # itself is undecorated (confirmed differentiable: the model's own
@@ -645,6 +841,7 @@ class DiffEraseAttack(nn.Module):
             # such decorator). noise_like(shape, device, repeat=False) (what
             # p_sample calls) is exactly torch.randn(shape, device=device) --
             # see audioldm_train/utilities/diffusion_util.py:noise_like.
+            t_tensor = torch.full((z.shape[0],), t, device=device, dtype=torch.long)
             model_mean, _, model_log_variance = self._model.p_mean_variance(
                 x=z, c=cond, t=t_tensor, clip_denoised=clip_denoised
             )
@@ -654,7 +851,17 @@ class DiffEraseAttack(nn.Module):
                 .reshape(z.shape[0], *((1,) * (len(z.shape) - 1)))
                 .contiguous()
             )
-            z = model_mean + nonzero_mask * (0.5 * model_log_variance).exp() * noise
+            return model_mean + nonzero_mask * (0.5 * model_log_variance).exp() * noise
+
+        for t in range(noise_timestep, 0, -1):
+            # Activation checkpointing -- same reasoning as SGMSEAttack.forward's
+            # _pc_step: this is a differentiable reverse-diffusion loop (up to
+            # noise_timestep <= num_timesteps*strength_max steps, each one a full
+            # UNet forward through self._model), so autograd would otherwise hold
+            # every step's activations live simultaneously for backward.
+            # preserve_rng_state=True (checkpoint's default) reruns this step's
+            # torch.randn_like(z) noise draw identically on recompute.
+            z = torch.utils.checkpoint.checkpoint(_ddpm_step, z, t, use_reentrant=False)
 
         # NOTE: first_stage_model.decode(...) directly, not
         # self._model.decode_first_stage(...) -- same reason as the encode
@@ -681,7 +888,7 @@ class MBDAttack(nn.Module):
     MultiBand Diffusion (github.com/facebookresearch/audiocraft,
     `docs/MBD.md`), an EnCodec-conditioned diffusion decoder. Per the
     mentor's plan (2026-08-12 Notion doc), this is the intended replacement/
-    complement for DiffEraseAttack's AudioLDM as "a diffusion model not
+    complement for AudioLDMAttack's latent diffusion as "a diffusion model not
     trained specifically on watermark removal, but that can incidentally
     remove them due to the neural encoding embedded into the system":
 
@@ -697,7 +904,7 @@ class MBDAttack(nn.Module):
     resampling internally (see forward below), matching the pipeline in the
     mentor's plan (upsample -> EnCodec -> MBD -> downsample -> detector).
 
-    `strength`: unlike DiffEraseAttack/SGMSEAttack, MBD has no continuous
+    `strength`: unlike AudioLDMAttack/SGMSEAttack, MBD has no continuous
     corruption-level knob -- the closest analogue is bitrate (fewer bits
     through the EnCodec bottleneck = more information thrown away = a
     stronger attack). `bandwidth` (1.5/3.0/6.0 kbps, MBD's only supported
@@ -734,7 +941,7 @@ class MBDAttack(nn.Module):
         # DictConfig (their model config), which PyTorch >=2.6's default
         # weights_only=True unpickler refuses as an untrusted global. Patch
         # the default rather than editing their source (same approach as
-        # DiffEraseAttack's torch.load patch).
+        # AudioLDMAttack's torch.load patch).
         torch.load = functools.partial(original_torch_load, weights_only=False)
         try:
             mbd = MultiBandDiffusion.get_mbd_24khz(bw=self.bandwidth)
@@ -775,15 +982,752 @@ class MBDAttack(nn.Module):
         return out[..., : x.shape[-1]].to(x.dtype)
 
 
+class HopSkipJumpAttack(nn.Module, AttackApplicationReporter):
+    """Hard-label, query-based black-box evasion attack against the
+    *detector itself*, as used by AudioMarkBench
+    (github.com/mileskuo42/AudioMarkBench) to benchmark watermark robustness
+    -- implementing Chen, Jordan & Wainwright's HopSkipJumpAttack (IEEE S&P
+    2020, arXiv:1904.02144), L2 variant.
+
+    Structurally different from every other attack in this file: BigVGAN/
+    DAC/SGMSE/AudioLDM/MBD are *resynthesis* attacks -- they transform the
+    waveform on their own and never look at the detector, so `evaluate.py`
+    calls detector(attack(x)) as two independent steps. HopSkipJumpAttack
+    instead treats the detector as a black-box oracle it repeatedly QUERIES
+    (hard-label decisions only, no gradients, no probability values) to
+    search for the nearest (in L2) waveform on which the detector's own
+    decision flips. That means this attack needs the detector at forward()
+    time, which the usual `attack(x, strength=strength)` call in
+    `evaluate.py:evaluate_attack` doesn't provide -- see `bind_detector`
+    below for how that's threaded through without changing that call site.
+
+    Algorithm (per example, batched internally only for the Monte Carlo
+    gradient-estimation queries within one example's own trajectory --
+    each example follows its own adaptive search, so trajectories
+    themselves cannot be batched across the batch dimension):
+      1. `label0` = the detector's OWN current hard decision on `x0`
+         (presence probability, pooled over time, thresholded at
+         `detection_threshold`) -- NOT a ground-truth watermarked/clean
+         label. This is what makes the same attack function correct for
+         both branches `evaluate_attack` calls it on: on watermarked audio
+         (`label0=True`) it searches for detection *evasion*; on clean
+         audio (`label0=False`) it searches for a *false* detection. Same
+         symmetric "flip the detector's own current call" framing as every
+         positive/negative pair this file's attacks already go through.
+      2. `_initialize`: find a first, usually very perturbed, "adversarial"
+         point whose decision already differs from `label0`. Prefers drawing
+         it from a bound pool of REAL audio (`bind_reference_pool`, the
+         reference implementation's strategy); falls back to uniform random
+         noise draws when no pool is bound or none of it flips the decision.
+         See `_initialize` for why the noise-only fallback is a poor
+         initializer in this domain.
+      3. `_binary_search`: bisect the segment between `x0` and that point
+         to land close to the decision boundary.
+      4. Repeat for `num_iterations`: estimate the boundary's gradient
+         direction via Monte Carlo (`_approximate_gradient` -- query the
+         decision at many random unit perturbations, average the ones that
+         stay adversarial), take a step along it sized by
+         `_geometric_progression` (halve until the step stays adversarial),
+         then `_binary_search` again to re-land on the boundary.
+      Returns `x0` unperturbed for any example where step 2 never finds a
+      flip within `init_max_trials` draws -- recorded per example via
+      `AttackApplicationReporter` (see that mixin's docstring: such examples
+      would otherwise be silently scored as watermark robustness) and
+      reported by `evaluate.py` as `attack_failure_rate`.
+
+    COST WARNING: unlike every other attack here, this is many detector
+    forward passes per waveform -- roughly
+    `init_max_trials + num_iterations * (max_num_evals + binary_search_steps
+    * (1 + max_step_halvings))` in the worst case, each a full detector
+    encoder forward. Default hyperparameters below are deliberately modest
+    (AudioMarkBench's own numbers run far higher `num_iterations`/
+    `max_num_evals`); still expect this to dominate an eval run's wall clock
+    -- drop `batch_size`/`n_eval_batches` well below the other attacks'
+    settings when enabling this one (see EvalConfig / default_eval.yaml).
+
+    NEVER wire this into TrainConfig.AttackConfig/AttackWeights (train.py):
+    every other attack stays "frozen but differentiable" (see this module's
+    top docstring) so gradients reach the generator through it. This attack
+    is a hard-label search with no gradient definition at all -- its
+    `forward` runs its whole query loop under `torch.no_grad()` (there is no
+    other option: it doesn't just skip autograd, no differentiable data path
+    to skip exists), so `x_att` would reach train_step's detector call with
+    `grad_fn=None` and silently zero out the generator's gradient. Eval-only,
+    like MBDAttack/SGMSEAttack.
+    """
+
+    # Safety cap on `_geometric_progression`'s halving loop -- the reference
+    # algorithm assumes it always eventually finds an adversarial step size
+    # and loops unboundedly; capped here so a pathological boundary (or a
+    # detector that never flips) fails soft (epsilon=0, iteration skipped)
+    # instead of hanging.
+    _MAX_STEP_HALVINGS = 60
+
+    def __init__(
+        self,
+        checkpoint: tp.Optional[str] = None,
+        detection_threshold: float = 0.5,
+        num_iterations: int = 20,
+        init_num_evals: int = 20,
+        max_num_evals: int = 100,
+        init_max_trials: int = 100,
+        binary_search_steps: int = 10,
+        gamma: float = 1.0,
+        clip_min: float = -1.0,
+        clip_max: float = 1.0,
+        init_from_reference: bool = True,
+    ):
+        super().__init__()
+        # This attack needs no external weights (it only queries this
+        # project's own detector) -- `checkpoint` is a pure enable/disable
+        # gate, same convention as MBDAttackConfig (any non-None value, e.g.
+        # "auto", turns it on) so evaluate.py's uniform per-attack config
+        # handling still applies.
+        self.enabled = checkpoint is not None
+        self.detection_threshold = detection_threshold
+        self.num_iterations = num_iterations
+        self.init_num_evals = init_num_evals
+        self.max_num_evals = max_num_evals
+        self.init_max_trials = init_max_trials
+        self.binary_search_steps = binary_search_steps
+        self.gamma = gamma
+        self.clip_min = clip_min
+        self.clip_max = clip_max
+        self.init_from_reference = init_from_reference
+        self._detector: tp.Optional[AudioSealDetector] = None
+        self._reference_pool: tp.Optional[torch.Tensor] = None
+        self._reset_application_mask()
+
+    # A reference waveform this close to `x0` (relative L2) is assumed to be
+    # `x0`'s own counterpart rather than an independent utterance, and is
+    # skipped -- see `bind_reference_pool`. At the eval's 30 dB watermark
+    # SNR a clean/watermarked pair sits at ~0.03 relative L2, while two
+    # different utterances sit near sqrt(2) (~1.41) for uncorrelated
+    # signals, so 0.2 separates the two cases by an order of magnitude in
+    # either direction and is not a value the run is sensitive to.
+    _SELF_REFERENCE_REL_L2 = 0.2
+
+    def bind_reference_pool(self, pool: tp.Optional[torch.Tensor]) -> None:
+        """Supply real audio for `_initialize` to start its search from,
+        shaped (N, 1, T) matching this attack's inputs.
+
+        HopSkipJump needs a starting point the detector already classifies
+        opposite to `x0`. The reference implementation takes that from a real
+        sample of the target class, and so does this once a pool is bound:
+        for evading detection on watermarked audio it needs audio the
+        detector calls clean, and for forcing a false positive on clean audio
+        it needs audio the detector calls watermarked -- so a useful pool
+        contains BOTH, which is what `evaluate.py:run` binds.
+
+        Entries within `_SELF_REFERENCE_REL_L2` of `x0` are skipped, because
+        a pool built from the eval batches necessarily contains `x0`'s own
+        clean/watermarked counterpart, and starting the search from the
+        attacked signal's own unwatermarked original would hand the attacker
+        information no real adversary has (and trivially "succeed").
+
+        `evaluate.py:run` calls this automatically wherever it exists,
+        duck-typed exactly like `bind_detector`, so it stays a no-op for
+        every other attack. Pass None to clear it and fall back to noise.
+        """
+        self._reference_pool = pool
+
+    def bind_detector(self, detector: AudioSealDetector) -> None:
+        """Must be called with the detector under test before `forward()`.
+        `evaluate.py:run` does this automatically for every constructed
+        attack exposing this method, right after building the detector --
+        it's the mechanism that gets the detector to this attack without
+        changing `evaluate_attack`'s `attack(x, strength=strength)` call
+        signature (see class docstring). A HopSkipJumpAttack used outside
+        that path (e.g. directly in a test) must call this itself."""
+        self._detector = detector
+
+    def _decision(self, x: torch.Tensor) -> torch.Tensor:
+        """Hard-label oracle: per-example bool, True if the detector
+        currently calls `x` watermarked. `x` may be a batch of several
+        candidate perturbations of the SAME example (the gradient-estimate
+        queries), not necessarily the outer batch `forward` received."""
+        presence, _ = self._detector.forward(x)
+        return presence[:, 1, :].mean(dim=-1) > self.detection_threshold
+
+    def _initialize(self, x0: torch.Tensor, label0: bool) -> tp.Optional[torch.Tensor]:
+        """A first point whose decision differs from `label0`, or None if the
+        budget ran out.
+
+        Tries the bound reference pool (real audio) before falling back to
+        uniform noise. The fallback is kept only as a last resort: a draw
+        from `uniform_(clip_min, clip_max)` is full-scale white noise, which
+        is far off the manifold of anything a 16 kHz speech detector was
+        trained on, so on the clean/negative branch in particular it very
+        rarely lands in a falsely-triggering region no matter how many
+        trials it gets. Raising `init_max_trials` alone therefore buys much
+        less than binding a pool does.
+        """
+        pool = self._reference_pool if self.init_from_reference else None
+        if pool is not None and pool.numel() > 0:
+            x0_norm = x0.flatten().norm().clamp_min(1e-12)
+            # Shuffled so repeated calls don't all start from the same
+            # entry, which would correlate every example's trajectory.
+            for idx in torch.randperm(pool.shape[0]).tolist():
+                candidate = pool[idx : idx + 1].to(device=x0.device, dtype=x0.dtype)
+                if candidate.shape != x0.shape:
+                    continue
+                if ((candidate - x0).flatten().norm() / x0_norm).item() < self._SELF_REFERENCE_REL_L2:
+                    continue  # x0's own counterpart -- see bind_reference_pool
+                if bool(self._decision(candidate)[0]) != label0:
+                    return candidate
+
+        for _ in range(self.init_max_trials):
+            candidate = torch.empty_like(x0).uniform_(self.clip_min, self.clip_max)
+            if bool(self._decision(candidate)[0]) != label0:
+                return candidate
+        return None
+
+    def _binary_search(self, x0: torch.Tensor, x_adv: torch.Tensor, label0: bool) -> torch.Tensor:
+        """Bisects the segment [x0, x_adv] (x_adv already adversarial) for
+        the point closest to x0 that stays adversarial -- fixed iteration
+        count rather than the reference algorithm's adaptive distance
+        threshold, simple and sufficient in this continuous waveform domain."""
+        low, high = 0.0, 1.0
+        for _ in range(self.binary_search_steps):
+            mid = (low + high) / 2.0
+            blended = x0 + mid * (x_adv - x0)
+            if bool(self._decision(blended)[0]) != label0:
+                high = mid
+            else:
+                low = mid
+        return x0 + high * (x_adv - x0)
+
+    def _select_delta(self, cur_iter: int, dist: float, d: int) -> float:
+        """Perturbation radius for this iteration's gradient-estimate
+        queries: a fixed fraction of the clip range on the very first step
+        (before `dist` means anything), then shrinking with the current
+        distance to `x0` and the signal's dimensionality `d` -- same
+        `sqrt(d) * theta * dist` scaling as the reference algorithm's L2
+        variant, `theta = gamma / d**1.5`."""
+        if cur_iter == 1:
+            return 0.1 * (self.clip_max - self.clip_min)
+        theta = self.gamma / (d**1.5)
+        return (d**0.5) * theta * dist
+
+    def _approximate_gradient(
+        self, x_adv: torch.Tensor, label0: bool, num_evals: int, delta: float
+    ) -> torch.Tensor:
+        """Monte Carlo estimate of the decision boundary's normal direction
+        at `x_adv`: query the oracle at `num_evals` random unit-norm
+        perturbations, and average the ones that stayed adversarial (each
+        weighted by how far the whole batch's vote leaned adversarial) --
+        the finite-difference gradient estimator the reference algorithm
+        derives from a smoothed version of the (otherwise non-differentiable,
+        hard-label) decision boundary."""
+        rv = torch.randn((num_evals,) + x_adv.shape[1:], device=x_adv.device, dtype=x_adv.dtype)
+        rv = rv / rv.flatten(1).norm(dim=1).clamp_min(1e-12).view(-1, 1, 1)
+        perturbed = (x_adv + delta * rv).clamp(self.clip_min, self.clip_max)
+        # Recompute the actually-applied direction post-clip (clipping can
+        # shrink it near the signal's amplitude limits).
+        rv = (perturbed - x_adv) / delta
+
+        adversarial = self._decision(perturbed) != label0
+        fval = adversarial.to(x_adv.dtype) * 2 - 1  # {-1, +1}
+        mean_fval = fval.mean()
+        if mean_fval.item() == 1.0:
+            gradf = rv.mean(dim=0)
+        elif mean_fval.item() == -1.0:
+            gradf = -rv.mean(dim=0)
+        else:
+            gradf = ((fval - mean_fval).view(-1, 1, 1) * rv).mean(dim=0)
+        gradf = gradf / gradf.flatten().norm().clamp_min(1e-12)
+        return gradf.unsqueeze(0)
+
+    def _geometric_progression(
+        self, x_adv: torch.Tensor, update: torch.Tensor, label0: bool, dist: float, cur_iter: int
+    ) -> float:
+        """Largest `epsilon` (halving from an initial `dist / sqrt(cur_iter)`
+        guess) such that stepping `x_adv` by `epsilon * update` is still
+        adversarial. 0.0 (iteration skipped, see `_attack_one`) if nothing
+        found within `_MAX_STEP_HALVINGS` halvings."""
+        epsilon = dist / (cur_iter**0.5)
+        for _ in range(self._MAX_STEP_HALVINGS):
+            candidate = (x_adv + epsilon * update).clamp(self.clip_min, self.clip_max)
+            if bool(self._decision(candidate)[0]) != label0:
+                return epsilon
+            epsilon /= 2.0
+        return 0.0
+
+    def _attack_one(self, x0: torch.Tensor) -> torch.Tensor:
+        """`x0`: one example, (1, 1, T). Returns the closest-in-L2 waveform
+        found on which the detector's decision differs from its decision on
+        `x0` itself -- or `x0` unperturbed if `_initialize` never found one
+        (see class docstring)."""
+        label0 = bool(self._decision(x0)[0])
+        x_adv = self._initialize(x0, label0)
+        if x_adv is None:
+            logger.warning(
+                "HopSkipJumpAttack: no initialization flipped the detector's "
+                "decision within %d noise trials (reference pool bound: %s) "
+                "-- returning this example unperturbed. It is recorded as an "
+                "attack failure, NOT as watermark robustness (see "
+                "AttackApplicationReporter); bind a reference pool or raise "
+                "init_max_trials if this rate is high.",
+                self.init_max_trials,
+                self._reference_pool is not None,
+            )
+            self._record_application(False)
+            return x0
+        self._record_application(True)
+
+        d = x0.numel()
+        x_adv = self._binary_search(x0, x_adv, label0)
+        dist = (x_adv - x0).flatten().norm().item()
+
+        for cur_iter in range(1, self.num_iterations + 1):
+            delta = self._select_delta(cur_iter, dist, d)
+            num_evals = int(min(self.init_num_evals * (cur_iter**0.5), self.max_num_evals))
+            grad = self._approximate_gradient(x_adv, label0, num_evals, delta)
+            epsilon = self._geometric_progression(x_adv, grad, label0, dist, cur_iter)
+            if epsilon == 0.0:
+                # No step size (down to a negligible fraction of the current
+                # distance) kept the example adversarial -- stop rather than
+                # drift with a step that immediately gets undone by the next
+                # binary search.
+                break
+            x_adv = (x_adv + epsilon * grad).clamp(self.clip_min, self.clip_max)
+            x_adv = self._binary_search(x0, x_adv, label0)
+            dist = (x_adv - x0).flatten().norm().item()
+
+        return x_adv
+
+    def forward(self, x: torch.Tensor, strength: tp.Optional[float] = None) -> torch.Tensor:
+        # strength: unused -- this attack's only "strength" axis is query
+        # budget (num_iterations/max_num_evals), fixed at construction, same
+        # reasoning as BigVGANAttack/DACAttack's unused `strength`.
+        if not self.enabled:
+            raise NotImplementedError(
+                "HopSkipJumpAttack was constructed without being enabled "
+                "(see class docstring in src/audioseal_robust/attacks.py). "
+                "Set attack.hopskipjump.checkpoint to any non-None value "
+                "(e.g. 'auto' -- it needs no real weights) or remove "
+                "hopskipjump from eval_attacks/held_out_attacks to skip it."
+            )
+        if self._detector is None:
+            raise RuntimeError(
+                "HopSkipJumpAttack has no detector bound -- call "
+                "bind_detector(detector) before forward() (evaluate.py's "
+                "run() does this automatically; see class docstring)."
+            )
+        with torch.no_grad():
+            self._reset_application_mask()
+            x_att = torch.cat([self._attack_one(x[i : i + 1]) for i in range(x.shape[0])], dim=0)
+        return x_att.to(x.dtype)
+
+
+class PGDAttack(nn.Module):
+    """Fixed-budget, epsilon-constrained white-box PGD against the detector
+    (Madry et al. 2018, arXiv:1706.06083), L-infinity variant -- the
+    white-box half of AudioMarkBench's adversarial suite, next to
+    HopSkipJumpAttack's black-box half.
+
+    Complements HopSkipJumpAttack rather than replacing it. Both attack the
+    detector directly, but they ask opposite questions, and that difference
+    decides which metrics mean anything on their output:
+
+      * HopSkipJump is *minimum-norm*: "what is the smallest perturbation
+        that flips the decision?" Its optimum therefore sits ON the decision
+        boundary by construction, so every example it returns scores at
+        presence ~= 0.5 whichever class it started from. Threshold-free
+        ranking metrics (ROC-AUC) are then meaningless on its output -- the
+        ordering is decided in the 4th decimal of a collapsed distribution --
+        and the informative number is the attack's *cost* (`attack_sisnr`,
+        query budget).
+
+      * PGD here is *fixed-budget*: the perturbation is capped at `epsilon`
+        in L-infinity and the attack pushes the detector as far as it can
+        within that cap, then stops. Examples the budget cannot flip stay
+        confidently on their original side, so the score distribution keeps
+        its spread and ROC-AUC / TPR@FPR are meaningful again. Re-run with
+        different `epsilon` to trace a robustness curve.
+
+    Symmetric in exactly the same sense as HopSkipJumpAttack: the attack
+    direction comes from the detector's OWN current decision on the input,
+    not from a ground-truth label, so one module is correct on both branches
+    `evaluate.py:evaluate_attack` calls it on -- evasion on watermarked
+    audio (drive presence down), forgery on clean audio (drive presence up).
+
+    Needs the detector at forward() time, threaded through by `bind_detector`
+    exactly like HopSkipJumpAttack -- see that class's docstring for why this
+    doesn't change `evaluate_attack`'s `attack(x, strength=strength)` call
+    site.
+
+    Cost: `num_steps` detector forward+backward passes per batch. Vastly
+    cheaper than HopSkipJump (hundreds of forwards PER EXAMPLE, since its
+    per-example trajectories cannot be batched) -- PGD steps the whole batch
+    at once, so it costs roughly `2 * num_steps` x a resynthesis attack
+    rather than dominating the run.
+
+    Eval-only, like HopSkipJumpAttack/MBDAttack: `forward` runs an inner
+    optimization loop and returns a `.detach()`-ed tensor, so there is no
+    meaningful gradient to hand back to the generator. NEVER give it a
+    nonzero weight in TrainConfig.AttackWeights -- `x_att` would reach
+    train_step's detector call with `grad_fn=None` and silently zero the
+    generator's gradient.
+    """
+
+    def __init__(
+        self,
+        epsilon: float = 0.002,
+        num_steps: int = 20,
+        step_size: tp.Optional[float] = None,
+        detection_threshold: float = 0.5,
+        random_start: bool = True,
+        clip_min: float = -1.0,
+        clip_max: float = 1.0,
+    ):
+        super().__init__()
+        self.epsilon = epsilon
+        self.num_steps = num_steps
+        # 2.5 * eps / steps is Madry et al.'s own default: large enough to
+        # cross the whole ball within the step budget, small enough that the
+        # sign-gradient path is not just two jumps between corners.
+        self.step_size = step_size if step_size is not None else 2.5 * epsilon / max(num_steps, 1)
+        self.detection_threshold = detection_threshold
+        self.random_start = random_start
+        self.clip_min = clip_min
+        self.clip_max = clip_max
+        self._detector: tp.Optional[AudioSealDetector] = None
+
+    def bind_detector(self, detector: AudioSealDetector) -> None:
+        """Must be called with the detector under test before `forward()`.
+        `evaluate.py:run` does this automatically for every constructed
+        attack exposing this method (duck-typed, same as for
+        HopSkipJumpAttack)."""
+        self._detector = detector
+
+    def _presence(self, x: torch.Tensor) -> torch.Tensor:
+        """Soft per-example presence probability, time-pooled. Unlike
+        HopSkipJumpAttack's `_decision`, this deliberately keeps the
+        continuous value instead of thresholding it -- PGD is white-box and
+        this is the differentiable objective it ascends."""
+        presence, _ = self._detector.forward(x)
+        return presence[:, 1, :].mean(dim=-1)
+
+    def forward(self, x: torch.Tensor, strength: tp.Optional[float] = None) -> torch.Tensor:
+        # strength: unused -- this attack's strength axis is `epsilon`, fixed
+        # at construction (that is what "fixed-budget" means). Same
+        # convention as BigVGANAttack/DACAttack's ignored `strength`.
+        if self._detector is None:
+            raise RuntimeError(
+                "PGDAttack has no detector bound -- call bind_detector(detector) "
+                "before forward() (evaluate.py's run() does this automatically; "
+                "see class docstring)."
+            )
+        x0 = x.detach()
+        # The detector's SEANet encoder contains an LSTM, and cuDNN refuses to
+        # run an RNN *backward* pass on a module in eval() mode ("cudnn RNN
+        # backward can only be called in training mode"). Nothing hit this
+        # before because every other attack in this file only ever runs the
+        # detector forward -- PGD is the first one that differentiates
+        # through it.
+        #
+        # Deliberately NOT fixed by flipping the detector to train(): that
+        # would change the module's behaviour in the middle of an evaluation
+        # and let any normalization layer update its running statistics from
+        # attacked audio, quietly corrupting every attack measured after this
+        # one. Dropping to the native RNN kernels instead is numerically
+        # equivalent and entirely local -- `flags` restores the previous
+        # settings on exit, and everything except `enabled` is passed through
+        # unchanged so this cannot silently alter benchmark/determinism/TF32
+        # behaviour for the duration.
+        if x0.is_cuda and torch.backends.cudnn.is_available():
+            cudnn_ctx: tp.ContextManager = torch.backends.cudnn.flags(
+                enabled=False,
+                benchmark=torch.backends.cudnn.benchmark,
+                deterministic=torch.backends.cudnn.deterministic,
+                allow_tf32=torch.backends.cudnn.allow_tf32,
+            )
+        else:
+            cudnn_ctx = contextlib.nullcontext()
+        # evaluate_attack is decorated @torch.no_grad(), so without this the
+        # autograd.grad call below would fail on a graph that was never
+        # built. Re-enabling grad locally is safe: nothing here touches a
+        # parameter (the detector's are all requires_grad=False) and the
+        # returned tensor is detached, so no graph escapes this function.
+        with cudnn_ctx, torch.enable_grad():
+            with torch.no_grad():
+                label0 = self._presence(x0) > self.detection_threshold
+            # -1 where the detector currently says "watermarked" (push
+            # presence DOWN = evasion), +1 where it says "clean" (push
+            # presence UP = forgery). Ascending `direction * presence` then
+            # does the right thing on both branches with one loop.
+            shape = (-1, *([1] * (x0.dim() - 1)))
+            direction = torch.where(label0, -1.0, 1.0).to(x0.dtype).view(shape)
+
+            if self.random_start:
+                delta = torch.empty_like(x0).uniform_(-self.epsilon, self.epsilon)
+            else:
+                delta = torch.zeros_like(x0)
+            delta = (torch.clamp(x0 + delta, self.clip_min, self.clip_max) - x0).detach()
+
+            for _ in range(self.num_steps):
+                delta.requires_grad_(True)
+                objective = (direction * self._presence(x0 + delta).view(shape)).sum()
+                (grad,) = torch.autograd.grad(objective, delta)
+                with torch.no_grad():
+                    # Sign-gradient ascent, then project back into the
+                    # L-infinity ball AND into the valid waveform range. The
+                    # range projection is re-expressed as a constraint on
+                    # delta so the two never fight: clamping the sum alone
+                    # would let delta drift outside the ball.
+                    delta = delta + self.step_size * grad.sign()
+                    delta = delta.clamp(-self.epsilon, self.epsilon)
+                    delta = torch.clamp(x0 + delta, self.clip_min, self.clip_max) - x0
+                delta = delta.detach()
+
+        return torch.clamp(x0 + delta, self.clip_min, self.clip_max).detach().to(x.dtype)
+
+
+class _SignalLevelAttack(nn.Module):
+    """Base for the fixed-budget, detector-agnostic signal corruptions --
+    AudioMarkBench's "common perturbation" family (additive noise, filtering,
+    speed change, requantization, lossy codecs).
+
+    The cheapest and most realistic robustness axis in the suite: no detector
+    queries, no gradients, no learned weights, and every one of them is
+    something audio genuinely undergoes in transit. Also the family whose
+    score distributions stay well-spread, because -- unlike the
+    boundary-seeking attacks (HopSkipJumpAttack, and any minimum-norm PGD)
+    -- nothing here aims at the decision boundary. The corruption is applied
+    at a budget fixed in advance and the score lands wherever it lands, so
+    watermarked audio that survives stays confidently detected and clean
+    audio stays confidently rejected. ROC-AUC and TPR@FPR are therefore
+    meaningful on this family, and sweeping the budget traces a real
+    robustness curve.
+
+    Subclasses implement `_corrupt`. The base guarantees the returned waveform
+    keeps the input's exact length (see `_fit_length`) and dtype, both of
+    which `evaluate.py:evaluate_attack` relies on when it pairs `x_att` with
+    `x_wm` for `attack_sisnr`.
+
+    Eval-only by construction rather than by policy: some members (codec
+    round-trips) are external, non-differentiable subprocess calls with no
+    gradient at all. Do not wire any of them into TrainConfig.AttackWeights.
+    """
+
+    # NOT named `_apply`: nn.Module._apply is a real PyTorch method (it is
+    # what `.to(device)`, `.cuda()` and `.float()` recurse through), so
+    # overriding it makes `module.to(device)` call this corruption with a
+    # dtype-conversion function as its "waveform" and blow up in
+    # build_eval_attacks.
+    def _corrupt(self, x: torch.Tensor) -> torch.Tensor:
+        raise NotImplementedError
+
+    def forward(self, x: torch.Tensor, strength: tp.Optional[float] = None) -> torch.Tensor:
+        # strength: unused. Each subclass's budget is its own explicitly
+        # named config field (snr_db, cutoff_hz, factor, bits, bitrate_kbps)
+        # rather than a shared abstract [0, 1] knob, because these budgets
+        # are not commensurable -- one "0.04" would have to mean dB in one
+        # attack and Hz in another. Sweep by overriding the field, e.g.
+        # `attack.gaussian_noise.snr_db=10`.
+        return _fit_length(self._corrupt(x.float()), x.shape[-1]).to(x.dtype)
+
+
+class GaussianNoiseAttack(_SignalLevelAttack):
+    """Additive white Gaussian noise at a fixed per-example SNR.
+
+    Parameterized by SNR rather than by a raw noise standard deviation so the
+    budget means the same thing on every utterance regardless of its level.
+    LibriSpeech segments vary by well over 10 dB, so a fixed sigma would be a
+    mild attack on loud speech and an overwhelming one on quiet speech, and
+    the resulting metric would mostly be measuring the corpus's level
+    distribution rather than the watermark's robustness.
+    """
+
+    def __init__(self, snr_db: float = 20.0):
+        super().__init__()
+        self.snr_db = snr_db
+
+    def _corrupt(self, x: torch.Tensor) -> torch.Tensor:
+        signal_power = x.pow(2).mean(dim=-1, keepdim=True)
+        noise = torch.randn_like(x)
+        noise_power = noise.pow(2).mean(dim=-1, keepdim=True).clamp_min(1e-12)
+        target_noise_power = signal_power / (10.0 ** (self.snr_db / 10.0))
+        return x + noise * (target_noise_power / noise_power).sqrt()
+
+
+class LowpassAttack(_SignalLevelAttack):
+    """Second-order Butterworth low-pass -- the classic "throw away the high
+    band" removal attack, and a close stand-in for narrowband telephony.
+
+    Relevant because AudioSeal's carrier is not confined to the frequencies
+    speech intelligibility depends on, so a cutoff that leaves the signal
+    perfectly understandable can still strip a meaningful share of it.
+    """
+
+    def __init__(self, sample_rate: int = 16_000, cutoff_hz: float = 4_000.0):
+        super().__init__()
+        self.sample_rate = sample_rate
+        self.cutoff_hz = cutoff_hz
+
+    def _corrupt(self, x: torch.Tensor) -> torch.Tensor:
+        return AF.lowpass_biquad(x, self.sample_rate, self.cutoff_hz)
+
+
+class SpeedAttack(_SignalLevelAttack):
+    """Playback-speed change (resampling-based, so pitch shifts with it).
+
+    Desynchronizes the watermark: AudioSeal's detector is convolutional and
+    so tolerates translation, but a speed change rescales the carrier's time
+    axis, which translation-invariance does not cover.
+
+    NOTE on `attack_sisnr` for this attack specifically: the output is
+    time-rescaled, so it no longer lines up sample-for-sample with `x_wm`
+    even though `_fit_length` restores the length. The SI-SNR reported for
+    `speed` is therefore a misalignment measure, not a perceptual distortion
+    measure, and is not comparable with the other attacks' SI-SNR. The
+    detection metrics are unaffected.
+    """
+
+    def __init__(self, sample_rate: int = 16_000, factor: float = 1.05):
+        super().__init__()
+        self.sample_rate = sample_rate
+        self.factor = factor
+
+    def _corrupt(self, x: torch.Tensor) -> torch.Tensor:
+        y, _ = AF.speed(x, self.sample_rate, self.factor)
+        return y
+
+
+class QuantizationAttack(_SignalLevelAttack):
+    """Uniform requantization to `bits` bits over the full-scale [-1, 1]
+    range (mid-tread), i.e. bit-depth reduction.
+
+    The cheapest attack in the file -- no filtering, no resampling, just
+    rounding -- and a useful sanity floor: a watermark that 8-bit
+    requantization removes is not surviving any real distribution channel.
+    """
+
+    def __init__(self, bits: int = 8):
+        super().__init__()
+        if bits < 2:
+            raise ValueError(f"bits must be >= 2, got {bits}")
+        self.bits = bits
+
+    def _corrupt(self, x: torch.Tensor) -> torch.Tensor:
+        step = 2.0 / (2**self.bits - 1)
+        return torch.round(x / step).mul(step).clamp(-1.0, 1.0)
+
+
+class CodecAttack(_SignalLevelAttack):
+    """Lossy-codec round-trip (MP3 or Opus) through the `ffmpeg` binary.
+
+    The most realistic attack in the whole file: essentially all audio that
+    travels anywhere is codec-compressed at least once, so this is the
+    perturbation a watermark must survive to be useful at all -- and it is
+    applied by parties with no adversarial intent whatsoever.
+
+    Uses an `ffmpeg` subprocess rather than a Python codec binding on
+    purpose. `torchaudio.io.AudioEffector` and
+    `torchaudio.functional.apply_codec` were both removed by the torchaudio
+    2.11 this project runs on, and the surviving options (torchcodec, PyAV)
+    each pin their own exact torch build -- see azureml/docker/Dockerfile,
+    which deliberately strips `torchcodec` from requirements.txt for exactly
+    that reason. The `ffmpeg` binary is already installed in that image, so
+    this attack runs there with no new dependency.
+
+    Where `ffmpeg` is absent (a bare local conda env, typically), the
+    constructor raises ModuleNotFoundError, which is in
+    `evaluate.py:_CONSTRUCTION_SKIP_EXCEPTIONS` -- so the attack is reported
+    as cleanly "skipped" for that run instead of taking the job down, the
+    same way bigvgan/dac/mbd already behave when their backends are missing.
+
+    NOTE on `attack_sisnr`: lossy encoders introduce algorithmic delay and
+    padding, so the decoded signal is time-shifted by a few ms relative to
+    the input. As with SpeedAttack, that makes the SI-SNR reported here
+    dominated by misalignment rather than by codec noise. Detection metrics
+    are unaffected.
+    """
+
+    # name -> (ffmpeg encoder, container/format to mux into)
+    _CODECS = {
+        "mp3": ("libmp3lame", "mp3"),
+        "opus": ("libopus", "ogg"),
+    }
+
+    def __init__(self, sample_rate: int = 16_000, codec: str = "mp3", bitrate_kbps: int = 64):
+        super().__init__()
+        codec = codec.lower()
+        if codec not in self._CODECS:
+            raise ValueError(f"codec must be one of {sorted(self._CODECS)}, got {codec!r}")
+        ffmpeg = shutil.which("ffmpeg")
+        if ffmpeg is None:
+            raise ModuleNotFoundError(
+                "CodecAttack needs the `ffmpeg` binary on PATH. It is present in this "
+                "project's AzureML image (see azureml/docker/Dockerfile) but usually not "
+                "in a local conda env -- install it (conda install -c conda-forge ffmpeg) "
+                "or drop codec_mp3/codec_opus from eval_attacks/held_out_attacks."
+            )
+        self.ffmpeg = ffmpeg
+        self.sample_rate = sample_rate
+        self.codec = codec
+        self.bitrate_kbps = bitrate_kbps
+
+    def _run(self, args: tp.List[str], payload: bytes) -> bytes:
+        done = subprocess.run(args, input=payload, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if done.returncode != 0:
+            raise RuntimeError(
+                f"ffmpeg failed: {done.stderr.decode('utf-8', 'replace')[:500]}"
+            )
+        return done.stdout
+
+    def _corrupt(self, x: torch.Tensor) -> torch.Tensor:
+        encoder, container = self._CODECS[self.codec]
+        target_len = x.shape[-1]
+        out = []
+        for i in range(x.shape[0]):
+            raw = x[i].reshape(-1).detach().cpu().contiguous().numpy().astype("<f4").tobytes()
+            encoded = self._run(
+                [
+                    self.ffmpeg, "-hide_banner", "-loglevel", "error",
+                    "-f", "f32le", "-ar", str(self.sample_rate), "-ac", "1", "-i", "pipe:0",
+                    "-c:a", encoder, "-b:a", f"{int(self.bitrate_kbps)}k",
+                    "-f", container, "pipe:1",
+                ],
+                raw,
+            )
+            decoded = self._run(
+                [
+                    self.ffmpeg, "-hide_banner", "-loglevel", "error",
+                    "-f", container, "-i", "pipe:0",
+                    "-f", "f32le", "-ar", str(self.sample_rate), "-ac", "1", "pipe:1",
+                ],
+                encoded,
+            )
+            # frombuffer needs a writable buffer (bytearray) to avoid a
+            # UserWarning; clone() then detaches the tensor from that
+            # transient buffer entirely.
+            wav = torch.frombuffer(bytearray(decoded), dtype=torch.float32).clone()
+            out.append(_fit_length(wav, target_len))
+        return torch.stack(out, dim=0).view_as(x).to(x.device)
+
+
 class SampledReconstructionAttack(nn.Module):
     """On every forward call, randomly samples ONE of the registered attacks
     (by name, weighted) and applies it. The chosen attack's parameters (if
     any) never receive gradients and are never touched by the optimizer, but
     the forward computation stays part of the autograd graph so gradients
     flow back through it to its input.
+
+    Pass `rng` to control where the branch draw comes from. Under DDP the
+    draw must agree across ranks (branch costs differ by orders of magnitude
+    and DDP syncs at every backward, so a disagreement makes every step cost
+    the most expensive branch any rank picked) -- see
+    distributed.attack_sampling_rng.
     """
 
-    def __init__(self, attacks: tp.Dict[str, nn.Module], weights: tp.Dict[str, float]):
+    def __init__(
+        self,
+        attacks: tp.Dict[str, nn.Module],
+        weights: tp.Dict[str, float],
+        rng: tp.Optional[random.Random] = None,
+    ):
         super().__init__()
         assert set(attacks.keys()) == set(weights.keys()), (
             f"attacks {sorted(attacks.keys())} and weights "
@@ -799,6 +1743,23 @@ class SampledReconstructionAttack(nn.Module):
 
         self._names = [n for n, w in weights.items() if w > 0]
         self._sampling_weights = [weights[n] for n in self._names]
+        # None -> the global `random` module, i.e. exactly the previous
+        # behavior. Under DDP, train.py passes an identically-seeded
+        # `random.Random` so every rank draws the SAME branch each step --
+        # see distributed.attack_sampling_rng for why that has to be shared
+        # when nothing else is.
+        self._rng: random.Random = rng if rng is not None else tp.cast(random.Random, random)
+        # Share that same generator with the branches' own strength sampling.
+        # The branch draw was already synchronised across ranks; t* was not,
+        # and for AudioLDM t* sets the number of reverse-diffusion steps, so an
+        # unsynchronised draw makes every DDP step cost the deepest trajectory
+        # any rank happened to draw (~1.6x the expected work at world_size=4)
+        # and leaves peak memory hostage to the unluckiest rank. Injected here
+        # rather than passed through every constructor so an attack added later
+        # is covered by declaring the attribute.
+        for module in self.attacks.values():
+            if hasattr(module, "_strength_rng"):
+                module._strength_rng = self._rng
 
     def train(self, mode: bool = True) -> "SampledReconstructionAttack":
         # Keep the outer module's `.training` flag consistent with the rest of
@@ -811,16 +1772,49 @@ class SampledReconstructionAttack(nn.Module):
             module.eval()
         return self
 
+    @property
+    def branch_names(self) -> tp.List[str]:
+        """The attacks that can actually be sampled (weight > 0), in a stable
+        order. Callers that need to evaluate every branch rather than a random
+        one -- e.g. train.py's periodic validation -- iterate this."""
+        return list(self._names)
+
     def forward(
-        self, x_wm: torch.Tensor, strength: tp.Optional[float] = None
+        self,
+        x_wm: torch.Tensor,
+        strength: tp.Optional[float] = None,
+        name: tp.Optional[str] = None,
     ) -> tp.Tuple[torch.Tensor, str]:
         """`strength`: passed through to whichever attack gets sampled (see
         e.g. SGMSEAttack's docstring for what it means there; ignored by
         attacks that don't use it). Leave it None during training -- each
         strength-aware attack should sample its own random t* per call in
         that case, which is what should give robustness across attack
-        strengths rather than at a single fixed one."""
-        name = random.choices(self._names, weights=self._sampling_weights, k=1)[0]
+        strengths rather than at a single fixed one.
+
+        `name` forces a specific branch instead of sampling one. Two reasons
+        it exists, both about measurement rather than training:
+
+          * A sampled branch makes a metric incomparable across the steps it
+            is logged at -- each point measures a different task. With
+            identity and audioldm in one recipe the resulting curve alternates
+            between two populations (loss ~0.8 vs ~5) and looks like
+            instability, or like a regression, depending on which branch each
+            point happened to draw.
+          * Sampling here also consumes from the shared RNG, so evaluating
+            shifts the branch sequence that training itself sees. Passing an
+            explicit name draws nothing. That matters under DDP too: the
+            shared RNG is seeded identically on every rank so all ranks walk
+            the same branch sequence, and an eval that consumed from it would
+            have to consume identically everywhere to keep them aligned.
+
+        A weight-0 attack can still be named explicitly: the name selects a
+        branch directly and bypasses the sampling weights entirely.
+        """
+        if name is None:
+            name = self._rng.choices(self._names, weights=self._sampling_weights, k=1)[0]
+        elif name not in self.attacks:
+            raise KeyError(f"unknown attack {name!r} (have: {sorted(self.attacks)})")
         attack = self.attacks[name]
         # No torch.no_grad() and no .detach() here: see module docstring.
         x_att = attack(x_wm, strength=strength)

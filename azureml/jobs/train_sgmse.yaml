@@ -1,0 +1,98 @@
+$schema: https://azuremlschemas.azureedge.net/latest/commandJob.schema.json
+
+# az ml job create -f azureml/jobs/train_sgmse.yaml \
+#     --set compute=azureml:<your-a100-cluster>
+#
+# Trains the AudioSeal generator against SGMSE and holds AudioLDM
+# + MBD out as the generalization probe -- recipes.yaml's `sgmse` train recipe
+# paired with its `after_sgmse_training` eval recipe. Run train_audioldm.yaml
+# for the opposite direction; the pair is the actual experiment.
+type: command
+
+experiment_name: audioseal-robust-diffusion-swap
+display_name: train-sgmse-100h
+description: >-
+  Generator-only robustness fine-tuning against the SGMSE attack, then eval
+  with AudioLDM and MBD held out.
+
+# Repo root: this file is two levels down. A few MB, 224 tracked files.
+code: ../..
+environment: azureml:audioseal-robust-diffusion@latest
+# STANDARD_NC24ADS_A100_V4 -- 1x A100 80GB, 24 vCPU. Single-GPU: nothing here
+# is distributed, so a100x2/a100x4 would leave GPUs idle.
+compute: azureml:a100x1
+
+inputs:
+  librispeech:
+    type: uri_folder
+    path: azureml:librispeech-asr:1
+    # download, not ro_mount. data.py:36 builds the file list with
+    #   sorted(p for ext in (".wav", ".flac") for p in root.rglob(f"*{ext}"))
+    # i.e. a full recursive walk *per extension*, and train.py constructs a
+    # WavDirDataset per split -- 6 walks of a ~1,500-directory tree. On a
+    # blobfuse mount every directory listing is a network round-trip, so that
+    # walk alone can eat minutes before step 1, and then each __getitem__ pays
+    # blob latency again. Copying 6.8 GB from blob to the node's local NVMe is
+    # fast (same region) and one-time.
+    mode: download
+  checkpoints:
+    type: custom_model
+    path: azureml:psiml-diffusion-checkpoints:1
+    # ro_mount is right here, unlike the data above: 11 large files read
+    # sequentially at startup, streamed at full throughput, and the sgmse
+    # direction never touches most of audioldm-s-full -- mounting skips
+    # transferring what it doesn't open.
+    #
+    # Read-only is enough: nothing writes into the weights tree. attacks.py
+    # chdirs into it (line 472) but only reads, and the one component that
+    # *would* have written there -- LPIPS fetching a ~500MB vgg.pth into a
+    # relative path -- never gets constructed, because attacks.py:467-468
+    # swaps the VAE's lossconfig for a no-op first.
+    mode: ro_mount
+
+outputs:
+  artifacts:
+    type: uri_folder
+    # rw_mount, not upload-on-finish: CHECKPOINT_DIR points straight in here
+    # (azureml/aml_run.sh), so a completed epoch survives a later crash or a
+    # timeout kill.
+    mode: rw_mount
+
+# Everything after the bare `--` is forwarded verbatim to train.py by
+# aml_run.sh -> run_diffusion_swap.sh.
+#
+# On the budget: config.py's defaults are epochs=100 x updates_per_epoch=1000
+# = 100k steps, and each SGMSE step is num_steps x (predictor + corrector)
+# score-model calls *with backprop*. That is far more than a day of A100. The
+# numbers below are ~600 steps -- enough to see the loss move and to get a
+# full eval out the other side. Scale up once the first run is green.
+command: >-
+  bash azureml/aml_run.sh sgmse
+  --librispeech ${{inputs.librispeech}}
+  --checkpoints ${{inputs.checkpoints}}
+  --artifacts ${{outputs.artifacts}}
+  --
+  epochs=3
+  updates_per_epoch=200
+  log_every=20
+  eval_every=100
+  data.batch_size=8
+  data.num_workers=4
+  data.segment_duration=2.0
+  attack.sgmse.num_steps=15
+
+environment_variables:
+  PYTHONUNBUFFERED: "1"
+  # tracking.backend=none above already routes metrics to stdout (and so to
+  # the AML run logs). Set it to "mlflow" and drop this once you've confirmed
+  # tracking.py:84-85's set_experiment()/start_run() pair coexists with the
+  # run AML has already started for this job.
+  AZUREML_ARTIFACTS_DEFAULT_TIMEOUT: "1200"
+
+resources:
+  instance_count: 1
+
+limits:
+  # 12h. Checkpoints are already on the output mount, so a timeout kill still
+  # leaves the trained epochs behind.
+  timeout: 43200

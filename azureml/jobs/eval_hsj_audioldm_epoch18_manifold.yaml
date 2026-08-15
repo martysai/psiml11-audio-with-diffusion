@@ -1,0 +1,82 @@
+$schema: https://azuremlschemas.azureedge.net/latest/commandJob.schema.json
+
+# python azureml/submit_manifold.py azureml/jobs/eval_hsj_audioldm_epoch18_manifold.yaml
+#
+# Use the wrapper, not `az ml job create` directly: `compute:` and
+# `_AZUREML_SINGULARITY_JOB_UAI` below carry a `${AZUREML_SUBSCRIPTION_ID}`
+# placeholder (this repo is PUBLIC) and the CLI does not expand it.
+#
+# Arm 3 of 3. The AudioLDM-trained fine-tuned generator, under HopSkipJump.
+# Identical to eval_hsj_baseline_manifold.yaml except for the generators
+# input, --generator, --label and display_name -- see that file for the full
+# rationale behind every protocol knob below. Change one here and change it in
+# all three.
+type: command
+
+experiment_name: audioseal-robust-hsj-eval
+display_name: hsj-eval-audioldm-epoch18-manifold
+description: >-
+  HopSkipJump robustness evaluation of the AudioLDM-trained fine-tuned
+  generator (generator_epoch18.pth) paired with the STOCK AudioSeal detector,
+  400 positives + 400 negatives, with per-sample detector scores written to
+  rows.csv.
+
+code: ../..
+environment: azureml:audioseal-robust-diffusion:3
+
+compute: /subscriptions/${AZUREML_SUBSCRIPTION_ID}/resourceGroups/manifold3-rg/providers/Microsoft.MachineLearningServices/virtualclusters/as-manifold3-w3-vc
+
+resources:
+  instance_type: Singularity.NC24ad_A100_v4
+  instance_count: 1
+  shm_size: 64g
+
+queue_settings:
+  job_tier: standard
+
+inputs:
+  librispeech:
+    type: uri_folder
+    path: azureml:librispeech-asr:1
+    mode: download
+  # Holds both fine-tuned generators; --generator below picks this arm's.
+  # uri_folder, not custom_model: see assets/finetuned_generators_manifold.yaml
+  # for why the model-asset registration path is closed to us here.
+  generators:
+    type: uri_folder
+    path: azureml:psiml-finetuned-generators:1
+    mode: ro_mount
+
+outputs:
+  artifacts:
+    type: uri_folder
+    mode: rw_mount
+
+command: >-
+  bash azureml/aml_run.sh eval
+  --librispeech ${{inputs.librispeech}}
+  --generators ${{inputs.generators}}
+  --artifacts ${{outputs.artifacts}}
+  --generator generator_epoch18.pth
+  --label hsj_finetuned_audioldm_epoch18
+  --
+  batch_size=8
+  n_eval_batches=50
+  segment_duration=3.0
+  eval_attacks=[identity]
+  held_out_attacks=[hopskipjump]
+  attack.hopskipjump.checkpoint=auto
+  attack.hopskipjump.num_iterations=25
+  attack.hopskipjump.init_num_evals=20
+  attack.hopskipjump.max_num_evals=100
+  attack.hopskipjump.init_max_trials=300
+  save_row_artifacts=true
+  tracking.backend=mlflow
+
+environment_variables:
+  PYTHONUNBUFFERED: "1"
+  AZUREML_ARTIFACTS_DEFAULT_TIMEOUT: "1200"
+  _AZUREML_SINGULARITY_JOB_UAI: /subscriptions/${AZUREML_SUBSCRIPTION_ID}/resourceGroups/shared-rg/providers/Microsoft.ManagedIdentity/userAssignedIdentities/as-shared-w3-id
+
+limits:
+  timeout: 21600

@@ -132,10 +132,37 @@ def checkpoint(func, inputs, params, flag):
     :param flag: if False, disable gradient checkpointing.
     """
     if flag:
-        args = tuple(inputs) + tuple(params)
-        return CheckpointFunction.apply(func, len(inputs), *args)
+        input_tensors = tuple(inputs)
+        # Hand autograd only the parameters it can actually differentiate.
+        # CheckpointFunction.backward runs torch.autograd.grad over every
+        # tensor it was given, which raises
+        #     RuntimeError: One of the differentiated Tensors does not require grad
+        # as soon as one of them has requires_grad=False. That happens whenever
+        # a checkpointed module is frozen but still differentiated through --
+        # gradients only need to reach the input, not the weights.
+        # allow_unused=True does not cover this: it is about tensors that are
+        # unreachable from the output, not tensors that never wanted a gradient.
+        # Frozen parameters are constants during recomputation, so leaving them
+        # out changes no gradient that would have been produced.
+        grad_params = tuple(p for p in params if p.requires_grad)
+        args = input_tensors + grad_params
+        return CheckpointFunction.apply(func, len(input_tensors), *args)
     else:
         return func(*inputs)
+
+
+def _autocast_state(device_type):
+    """`(enabled, dtype)` of `device_type`'s autocast, across torch versions.
+
+    torch 2.4 added the `device_type` argument to `is_autocast_enabled` /
+    `get_autocast_dtype`; older releases expose one function per device.
+    """
+    try:
+        return torch.is_autocast_enabled(device_type), torch.get_autocast_dtype(device_type)
+    except TypeError:
+        if device_type == "cuda":
+            return torch.is_autocast_enabled(), torch.get_autocast_gpu_dtype()
+        return torch.is_autocast_cpu_enabled(), torch.get_autocast_cpu_dtype()
 
 
 class CheckpointFunction(torch.autograd.Function):
@@ -145,6 +172,11 @@ class CheckpointFunction(torch.autograd.Function):
         ctx.input_tensors = list(args[:length])
         ctx.input_params = list(args[length:])
 
+        # Remember the ambient autocast state so backward can recompute under
+        # it -- see the comment in backward().
+        ctx.device_type = "cuda" if any(t.is_cuda for t in ctx.input_tensors) else "cpu"
+        ctx.autocast_enabled, ctx.autocast_dtype = _autocast_state(ctx.device_type)
+
         with torch.no_grad():
             output_tensors = ctx.run_function(*ctx.input_tensors)
         return output_tensors
@@ -152,7 +184,30 @@ class CheckpointFunction(torch.autograd.Function):
     @staticmethod
     def backward(ctx, *output_grads):
         ctx.input_tensors = [x.detach().requires_grad_(True) for x in ctx.input_tensors]
-        with torch.enable_grad():
+        # Recompute under the SAME autocast state the forward pass ran in.
+        #
+        # The autograd engine runs backward with autocast off, and this
+        # vendored checkpoint (unlike torch.utils.checkpoint, which grew
+        # _get_autocast_kwargs for exactly this) used to inherit that. Under
+        # train.py's bf16 autocast the saved activations are bf16 while the
+        # module's parameters stay fp32, so replaying e.g.
+        # BasicTransformerBlock._forward's LayerNorm outside autocast raises
+        #     RuntimeError: expected scalar type BFloat16 but found Float
+        # -- the mixed dtypes that autocast was resolving on the fly are
+        # suddenly unhandled.
+        #
+        # Forcing the recompute to fp32 instead would only move the problem:
+        # the forcing lives inside the checkpointed function, so it applies to
+        # both passes and silences that one kernel, but the next op then
+        # diverges (bf16 under autocast in forward, fp32 without it in the
+        # replay) and the missing autocast is still missing. Restoring the
+        # state is the fix; matching dtypes op-by-op is not.
+        autocast_ctx = torch.autocast(
+            device_type=ctx.device_type,
+            dtype=ctx.autocast_dtype,
+            enabled=ctx.autocast_enabled,
+        )
+        with torch.enable_grad(), autocast_ctx:
             # Fixes a bug where the first op in run_function modifies the
             # Tensor storage in place, which is not allowed for detach()'d
             # Tensors.

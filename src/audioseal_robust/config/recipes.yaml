@@ -10,40 +10,111 @@
 # for why holding one out matters). Which attack plays which role is a
 # per-experiment choice, not something to hardcode into default.yaml /
 # default_eval.yaml -- these recipes are that choice, named, so switching
-# direction is `recipe=sgmse` vs. `recipe=diff_erase` instead of re-typing
+# direction is `recipe=sgmse` vs. `recipe=audioldm` instead of re-typing
 # every attack.weights.*/eval_attacks/held_out_attacks field by hand.
 # Checkpoint/config *paths* stay out of here on purpose (machine-specific,
 # multi-GB, never belong in git) -- pass those separately on the CLI, e.g.:
-#   python -m audioseal_robust.train recipe=diff_erase data.train_dir=... \
-#       attack.diff_erase.checkpoint=... attack.diff_erase.config=...
+#   python -m audioseal_robust.train recipe=audioldm data.train_dir=... \
+#       attack.audioldm.checkpoint=... attack.audioldm.config=...
 
 train:
-  # Train against DiffErase (AudioLDM latent-diffusion resynthesis); SGMSE
+  # Train against AudioLDM (latent-diffusion resynthesis); SGMSE
   # stays at its config/default.yaml weight (0.0), so evaluate.py's
-  # after_diff_erase_training recipe below can hold it out as the probe.
-  diff_erase:
+  # after_audioldm_training recipe below can hold it out as the probe.
+  audioldm:
     attack:
       weights:
         identity: 0.0
-        diff_erase: 1.0
+        audioldm: 1.0
   # Train against SGMSE (OU-VE SDE speech enhancement) instead -- the
-  # opposite direction, DiffErase held out. This is the original design's
-  # direction (see attacks.py's SGMSEAttack/DiffEraseAttack docstrings).
+  # opposite direction, AudioLDM held out. This is the original design's
+  # direction (see attacks.py's SGMSEAttack/AudioLDMAttack docstrings).
   sgmse:
     attack:
       weights:
         identity: 0.0
         sgmse: 1.0
+  # Same direction as `sgmse` above, but half the steps are identity
+  # (unattacked) instead of forcing the full SGMSE attack every single step.
+  # Two motivations: (1) the generator gets some easy/unattacked steps to
+  # anchor bit accuracy on, rather than only ever seeing the hardest case;
+  # (2) SGMSEAttack's Langevin corrector has occasional gradient
+  # instability (huge grad_norm_x_wm/x_att spikes, see its
+  # AnnealedLangevinDynamics.update_fn), which this halves the exposure to.
+  # A separate recipe rather than editing `sgmse` above -- same recipe name
+  # silently changing what it trains against would be its own source of
+  # confusion (old runs/notes referencing `recipe=sgmse` meant sgmse-only).
+  sgmse_mixed:
+    attack:
+      weights:
+        identity: 0.5
+        sgmse: 0.5
+  # The AudioLDM counterpart of `sgmse_mixed` above, and for a sharper reason
+  # than that one: at `recipe=audioldm` (audioldm 1.0, identity 0.0) the
+  # generator never sees an unattacked step, and AudioLDM destroys the
+  # watermark outright rather than merely degrading it. Measured on the 4x
+  # A100 manifold run train-audioldm-manifold-0814-121056: bit_loss sat at
+  # 0.698 against ln(2)=0.6931 -- chance, i.e. zero recoverable bits -- flat
+  # across 530 steps, with presence_prob ~0.08 and no trend in the loss
+  # (slope t=-0.04 against a per-step sd of 1.10). Evaluation on the smoke run
+  # shows why: audioldm's attack_sisnr is -50 dB, so `x_att` is essentially
+  # uncorrelated with `x_wm` at the sample level -- the HiFi-GAN vocoder
+  # resynthesises phase from scratch. A loss pinned at chance carries no
+  # gradient signal to learn from, so the identity half is what gives the
+  # generator something to anchor bit accuracy on.
+  #
+  # Orthogonal knob, deliberately not baked in here: attack strength.
+  # `attack.audioldm.strength_max` (default 0.08 ~ 80 diffusion steps) caps
+  # the randomly sampled t*; lowering it to e.g. 0.02 both weakens the attack
+  # and cuts step time, since that reverse loop dominates it. Pass it on the
+  # CLI to combine the two axes, e.g.
+  #   recipe=audioldm_mixed attack.audioldm.strength_max=0.02
+  audioldm_mixed:
+    attack:
+      weights:
+        identity: 0.5
+        audioldm: 0.5
+
+  # Same identity/attacked split as sgmse_mixed above, but the attacked half
+  # is now split between BOTH diffusion attacks instead of sgmse alone --
+  # trains against sgmse and audioldm together so robustness doesn't have to
+  # generalize zero-shot from one to the other (sgmse_mixed-trained
+  # checkpoints measured much worse on held-out audioldm eval than on
+  # sgmse itself). identity stays at the same 0.5 anchor as sgmse_mixed, for
+  # the same reason (easy steps to anchor bit accuracy, less exposure to
+  # either attack's own gradient instability) -- not lowered further just
+  # because a second attack was added.
+  # Pairs well with data.segment_duration=10.24 at train time (see
+  # run_train_10h_audioldm.sh), though no longer out of necessity: on this
+  # branch AudioLDMAttack tiles rather than zero-pads a short input to its
+  # 10.24s window, so a 2s segment is repeated instead of being surrounded by
+  # ~80% silence. Matching segment_duration to the window is still the
+  # cheapest option -- the attack then sees real, non-repeating audio and
+  # skips the tile entirely. WavDirDataset likewise crops longer files and
+  # tiles shorter ones (data.py); neither stage zero-pads any more.
+  sgmse_audioldm_mixed:
+    attack:
+      weights:
+        identity: 0.5
+        sgmse: 0.25
+        audioldm: 0.25
 
 eval:
-  # Pair with `recipe=diff_erase` at train time: reports DiffErase alongside
+  # Pair with `recipe=audioldm` at train time: reports AudioLDM alongside
   # the always-available identity/bigvgan/dac attacks, holds SGMSE (and MBD)
   # out as the generalization probe.
-  after_diff_erase_training:
-    eval_attacks: [identity, bigvgan, dac, diff_erase]
+  after_audioldm_training:
+    eval_attacks: [identity, bigvgan, dac, audioldm]
     held_out_attacks: [sgmse, mbd]
   # Pair with `recipe=sgmse` at train time: the reverse -- SGMSE reported,
-  # DiffErase (and MBD) held out.
+  # AudioLDM (and MBD) held out.
   after_sgmse_training:
     eval_attacks: [identity, bigvgan, dac, sgmse]
-    held_out_attacks: [diff_erase, mbd]
+    held_out_attacks: [audioldm, mbd]
+  # Pair with `recipe=sgmse_audioldm_mixed` at train time: both diffusion
+  # attacks were trained against, so both get reported here instead of
+  # either being held out -- only MBD (never trainable, no weight entry at
+  # all) remains a genuine generalization probe for this recipe.
+  after_sgmse_audioldm_training:
+    eval_attacks: [identity, bigvgan, dac, sgmse, audioldm]
+    held_out_attacks: [mbd]

@@ -1,0 +1,42 @@
+$schema: https://azuremlschemas.azureedge.net/latest/data.schema.json
+
+# az ml data create -f azureml/assets/finetuned_generators_manifold.yaml \
+#   --resource-group manifold3-rg --workspace-name as-manifold3-w3-ws
+#
+# Same two .pth files as assets/finetuned_generators.yaml, registered as a
+# uri_folder DATA asset instead of a custom_model. That difference is forced,
+# not stylistic -- see assets/diffusion_checkpoints_manifold.yaml for the full
+# explanation. Summary: registering a MODEL asset makes the workspace MSI
+# authenticate against the backing storage account, and the manifold3
+# workspace MSI has no role on the credential-less psiml_assets_playground
+# datastore. Data assets are registered by reference and skip that validation.
+#
+# The bytes live in the playground blobstore under psiml-assets/generators/,
+# uploaded with:
+#   az storage blob upload-batch --account-name asplaygroundw3data \
+#     --destination <container> --destination-path psiml-assets/generators \
+#     --source checkpoints/finetuned_generators --pattern '*.pth' \
+#     --auth-mode login
+#
+#   generator_epoch3.pth   robustness fine-tuning against the SGMSE attack
+#   generator_epoch18.pth  robustness fine-tuning against the AudioLDM attack
+#
+# Both are train.py's format, torch.save({"model": ..., "xp.cfg": ...}), same
+# architecture (73 tensors, 14,675,873 params), but they do NOT share a
+# state_dict key convention: epoch3 uses the flat ".conv.weight" naming and
+# epoch18 the Moshi SEANet ".inner_conv." level.
+# evaluate.py:load_generator_under_test converts either direction by
+# inspecting the actual keys, so no renaming is needed here.
+type: uri_folder
+name: psiml-finetuned-generators
+version: "1"
+description: >-
+  Fine-tuned AudioSeal generators from the diffusion-swap experiment:
+  generator_epoch3.pth (SGMSE-trained) and generator_epoch18.pth
+  (AudioLDM-trained). Paired with the STOCK AudioSeal detector at eval time --
+  train.py saves only the generator, so no fine-tuned detector exists.
+path: azureml://datastores/psiml_assets_playground/paths/psiml-assets/generators
+tags:
+  produced_by: src/audioseal_robust/train.py
+  detector: stock audioseal_detector_16bits
+  registered_as: uri_folder-instead-of-custom_model

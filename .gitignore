@@ -150,6 +150,7 @@ activemq-data/
 # Environments
 .env
 .envrc
+.env.local
 .venv
 env/
 venv/
@@ -222,3 +223,15 @@ mlflow.db
 mlruns/
 wandb/
 checkpoints/
+
+# run_train_10h.sh / run_hopskipjump_eval.sh: local dataset subsets built
+# under the repo (symlink farms / downloaded subsets), not source.
+data/
+logs/
+eval_outputs/
+
+# azureml/submit_manifold.py: the subscription-substituted copy of a
+# *_manifold.yaml. Written beside the original (the `code:` path is relative
+# to it) and deleted after submit, but never commit one -- it carries the
+# subscription id the placeholder exists to keep out of this public repo.
+azureml/jobs/.*.resolved.yaml
