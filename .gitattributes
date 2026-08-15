@@ -1,0 +1,4 @@
+# Shell scripts must stay LF even when checked out on Windows (core.autocrlf=true).
+# With CRLF, bash reads `set -euo pipefail` as `pipefail\r` and dies with
+# "set: pipefail: invalid option name" before the script does anything.
+*.sh text eol=lf
