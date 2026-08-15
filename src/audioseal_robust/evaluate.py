@@ -139,14 +139,35 @@ def load_generator_under_test(checkpoint: str, nbits: int, device: torch.device)
         # Same conversion AudioSeal.load_generator/load_detector apply
         # internally (see loader.py) before their own load_state_dict call --
         # train.py's checkpoints (torch.save({"model": generator.state_dict()...}))
-        # use the pre-torchscripting-update flat conv naming
-        # (".conv.weight"/".conv.bias"), while this Python (>=3.10) build
-        # of AudioSealWM's Moshi-based SEANet wraps those in an extra
-        # "inner_conv" level. Skipping this raised "Missing/Unexpected
-        # key(s)" for every conv layer on a real fine-tuned checkpoint --
-        # confirmed by hand -- since only the model-card loading path
-        # applied it before now.
-        state_dict = convert_state_dict_for_scriptable_model(state["model"])
+        # can use either the pre-torchscripting-update flat conv naming
+        # (".conv.weight"/".conv.bias", saved by a Python <3.10 process) or
+        # this Python (>=3.10) build's Moshi-based SEANet naming (wrapped in
+        # an extra "inner_conv" level, see builder.py's Python-version
+        # SEANet selection) -- whichever Python trained the checkpoint.
+        # convert_state_dict_for_scriptable_model only ever converts
+        # flat->inner_conv (and only running on Python >=3.10), so it can't
+        # fix the reverse case (an inner_conv checkpoint loaded by a
+        # Python <3.10 build, which only has flat convs) -- confirmed by
+        # hand: raised "Missing/Unexpected key(s)" for every conv layer with
+        # a checkpoint saved on a newer Python than the eval process. Decide
+        # the direction from the actual model/checkpoint keys instead of
+        # inferring it from sys.version_info, so this works regardless of
+        # which Python trained vs. which Python is evaluating.
+        raw_state_dict = state["model"]
+        model_has_inner_conv = any(
+            ".inner_conv." in k for k in generator.state_dict().keys()
+        )
+        checkpoint_has_inner_conv = any(
+            ".inner_conv." in k for k in raw_state_dict.keys()
+        )
+        if model_has_inner_conv and not checkpoint_has_inner_conv:
+            state_dict = convert_state_dict_for_scriptable_model(raw_state_dict)
+        elif checkpoint_has_inner_conv and not model_has_inner_conv:
+            state_dict = {
+                k.replace(".inner_conv.", "."): v for k, v in raw_state_dict.items()
+            }
+        else:
+            state_dict = raw_state_dict
         audioseal_load_state_dict(generator, state_dict)
         return generator
     logger.info("loading generator checkpoint/card %r", checkpoint)
