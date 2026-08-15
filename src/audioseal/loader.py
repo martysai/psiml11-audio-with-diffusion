@@ -204,6 +204,49 @@ def convert_state_dict_for_scriptable_model(state_dict: Dict[str, Any]) -> Dict[
     return new_state_dict
 
 
+def flatten_scriptable_state_dict(state_dict: Dict[str, Any]) -> Dict[str, Any]:
+    """Inverse of :func:`convert_state_dict_for_scriptable_model`.
+
+    Rewrites the Moshi SEANet conv naming (an extra ``inner_conv`` level, which
+    is what a Python >=3.10 process writes) back to the flat Audiocraft naming
+    (``....conv.conv.weight``). Flat is the naming upstream ships its own
+    checkpoints in, precisely because it is the one both builds can consume:
+    Python <3.10 uses it as-is, and Python >=3.10 up-converts it via
+    ``convert_state_dict_for_scriptable_model``. Storing the ``inner_conv``
+    naming instead is the one direction upstream cannot repair, so publishable
+    checkpoints should always be flattened first (see
+    ``audioseal_robust.export_checkpoint``).
+    """
+    return {k.replace(".inner_conv.", "."): v for k, v in state_dict.items()}
+
+
+def align_state_dict_to_model(
+    model: torch.nn.Module, state_dict: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Reconcile a checkpoint's conv naming with the one `model` was built with.
+
+    Which naming a SEANet uses is decided by the *running* interpreter, not by
+    the checkpoint: builder.py picks Moshi's SEANet (``inner_conv``-wrapped) on
+    Python >=3.10 and Audiocraft's (flat) below that. So a checkpoint can arrive
+    in either naming regardless of which build is loading it, and the mismatch
+    is a hard failure -- every conv layer shows up as a missing + unexpected key.
+
+    ``convert_state_dict_for_scriptable_model`` only ever converts flat ->
+    ``inner_conv`` (and only on Python >=3.10), so it cannot fix an
+    ``inner_conv`` checkpoint being loaded by a Python <3.10 build. Deciding
+    from the model's own keys rather than from ``sys.version_info`` covers both
+    directions, and is a no-op when the two already agree.
+    """
+    model_has_inner_conv = any(".inner_conv." in k for k in model.state_dict())
+    ckpt_has_inner_conv = any(".inner_conv." in k for k in state_dict)
+
+    if model_has_inner_conv and not ckpt_has_inner_conv:
+        return convert_state_dict_for_scriptable_model(state_dict)
+    if ckpt_has_inner_conv and not model_has_inner_conv:
+        return flatten_scriptable_state_dict(state_dict)
+    return state_dict
+
+
 def load_state_dict(model: torch.nn.Module, state_dict: Dict[str, Any]) -> None:
     """Load model state dict. Remmove weight_norm if found"""
     no_conv_state_dict = {}
@@ -370,7 +413,7 @@ class AudioSeal:
 
         model = create_generator(config, device=device, dtype=dtype)
 
-        checkpoint = convert_state_dict_for_scriptable_model(checkpoint)
+        checkpoint = align_state_dict_to_model(model, checkpoint)
         load_state_dict(model, state_dict=checkpoint)
 
         return model
@@ -390,7 +433,7 @@ class AudioSeal:
 
         model = create_detector(config, device=device, dtype=dtype)
 
-        checkpoint = convert_state_dict_for_scriptable_model(checkpoint)
+        checkpoint = align_state_dict_to_model(model, checkpoint)
         load_state_dict(model, state_dict=checkpoint)
 
         return model
