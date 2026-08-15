@@ -297,7 +297,12 @@ Seminar in Machine Learning, a machine learning summer school in Serbia. Thanks
 to the organisers and mentors for the compute and for the guidance on the
 experiment design.
 
-## Citation
+## References
+
+This project is not itself a paper — it builds on three. If you use it, cite the
+work it depends on. All entries below are taken from each project's own README.
+
+**AudioSeal** — the watermarking model these checkpoints fine-tune:
 
 ```bibtex
 @article{sanroman2024proactive,
@@ -306,5 +311,34 @@ experiment design.
              D{\'e}fossez, Alexandre and Furon, Teddy and Tran, Tuan},
   journal = {ICML},
   year    = {2024}
+}
+```
+
+**SGMSE** — the score-based speech enhancement model used as an attack:
+
+```bibtex
+@article{richter2023speech,
+  title   = {Speech Enhancement and Dereverberation with Diffusion-based
+             Generative Models},
+  author  = {Richter, Julius and Welker, Simon and Lemercier, Jean-Marie and
+             Lay, Bunlong and Gerkmann, Timo},
+  journal = {IEEE/ACM Transactions on Audio, Speech, and Language Processing},
+  volume  = {31},
+  pages   = {2351--2364},
+  year    = {2023},
+  doi     = {10.1109/TASLP.2023.3285241}
+}
+```
+
+**AudioLDM** — the latent diffusion model used as an attack:
+
+```bibtex
+@article{liu2023audioldm,
+  title   = {{AudioLDM}: Text-to-Audio Generation with Latent Diffusion Models},
+  author  = {Liu, Haohe and Chen, Zehua and Yuan, Yi and Mei, Xinhao and
+             Liu, Xubo and Mandic, Danilo and Wang, Wenwu and Plumbley, Mark D.},
+  journal = {Proceedings of the International Conference on Machine Learning},
+  pages   = {21450--21474},
+  year    = {2023}
 }
 ```
