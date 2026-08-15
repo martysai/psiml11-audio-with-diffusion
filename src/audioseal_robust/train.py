@@ -55,6 +55,7 @@ import itertools
 import logging
 import os
 import typing as tp
+from datetime import datetime
 
 import torch
 import torch.nn as nn
@@ -82,6 +83,7 @@ from .distributed import (
     barrier,
     cleanup_distributed,
     configure_logging,
+    gather_objects,
     init_distributed,
     seed_everything,
     unwrap_module,
@@ -198,6 +200,10 @@ def build_generator(cfg: TrainConfig, device: torch.device) -> AudioSealWM:
     left fully trainable -- this fine-tunes it further, it does not train
     from scratch."""
     generator = AudioSeal.load_generator(cfg.generator.checkpoint, nbits=cfg.nbits, device=device)
+    if cfg.generator.resume_from:
+        state = torch.load(cfg.generator.resume_from, map_location=device, weights_only=False)
+        generator.load_state_dict(state["model"])
+        logger.info("resumed generator weights from %s", cfg.generator.resume_from)
     generator.train()
     return generator
 
@@ -297,6 +303,80 @@ def _grad_norm(module: nn.Module) -> float:
     return total_sq**0.5
 
 
+_BYTES_PER_GIB = float(1024**3)
+
+
+class CudaMemoryProbe:
+    """Per-step CUDA allocator instrumentation, split around the backward pass.
+
+    This exists to answer "is the activation checkpointing in attacks.py
+    actually buying anything?", which the usual dashboards cannot: wandb's
+    "GPU Memory Allocated" system panels (and `nvidia-smi`) read NVML, i.e.
+    the memory the *process* holds from the driver, which is PyTorch's
+    caching allocator pool. That pool only ever grows to the run's
+    high-water mark and then sits flat, so it looks identical whether
+    checkpointing is on or off, and flat there is NOT evidence that
+    checkpointing isn't happening. The numbers that actually move are the
+    allocator's own:
+
+      mem/activations_gib -- memory still live at the end of the forward
+        pass that wasn't live before it, i.e. what autograd is holding for
+        backward. This is precisely what checkpointing trades away, so it's
+        the most direct signal: it should drop sharply once a checkpointed
+        sampler loop (attacks.py's `_pc_step` / `_ddpm_step`) is in the
+        graph, and scale with num_steps if checkpointing were off.
+      mem/forward_peak_gib, mem/backward_peak_gib -- peak allocation within
+        each half of the step. Uncheckpointed, the peak sits in the forward;
+        checkpointed, the forward peak drops and the backward peak rises,
+        since each segment's activations are recomputed there.
+      mem/reserved_gib -- the allocator pool: the flat number the system
+        panels show. Logged alongside so the gap against the allocated
+        figures above is visible rather than mysterious.
+
+    Every method only reads/resets allocator counters -- no device
+    synchronisation, so this does not perturb the step time it sits next to.
+    Off CUDA, or with `tracking.log_memory=false`, all methods are no-ops
+    and no keys are emitted at all.
+    """
+
+    def __init__(self, device: torch.device, enabled: bool = True) -> None:
+        self._enabled = enabled and device.type == "cuda"
+        self._device = device
+        self._allocated_before = 0
+        self._metrics: tp.Dict[str, float] = {}
+
+    def start(self) -> None:
+        if not self._enabled:
+            return
+        # Peak counters are cumulative until explicitly reset, so without
+        # this every step after the first would just re-report the run's
+        # high-water mark -- a flat line, i.e. exactly the artifact this
+        # probe exists to avoid.
+        torch.cuda.reset_peak_memory_stats(self._device)
+        self._allocated_before = torch.cuda.memory_allocated(self._device)
+
+    def mark_forward_end(self) -> None:
+        if not self._enabled:
+            return
+        allocated = torch.cuda.memory_allocated(self._device)
+        self._metrics["mem/forward_peak_gib"] = (
+            torch.cuda.max_memory_allocated(self._device) / _BYTES_PER_GIB
+        )
+        self._metrics["mem/activations_gib"] = (allocated - self._allocated_before) / _BYTES_PER_GIB
+        torch.cuda.reset_peak_memory_stats(self._device)  # so the backward peak is measured on its own
+
+    def mark_backward_end(self) -> None:
+        if not self._enabled:
+            return
+        self._metrics["mem/backward_peak_gib"] = (
+            torch.cuda.max_memory_allocated(self._device) / _BYTES_PER_GIB
+        )
+        self._metrics["mem/reserved_gib"] = torch.cuda.memory_reserved(self._device) / _BYTES_PER_GIB
+
+    def metrics(self) -> tp.Dict[str, float]:
+        return dict(self._metrics)
+
+
 def _clip_grad_norm_per_sample(grad: torch.Tensor, max_norm: float) -> torch.Tensor:
     """Clip each batch item's L2 norm without changing its direction."""
     if max_norm <= 0:
@@ -345,6 +425,9 @@ def train_step(
     x = batch.to(device)  # clean audio, (B, 1, T), 16kHz
     message = random_message(cfg.nbits, x.size(0), device=x.device)
 
+    memory = CudaMemoryProbe(device, enabled=cfg.tracking.log_memory)
+    memory.start()
+
     # 1-4 under bf16 autocast (see _autocast's docstring): forward through
     # the generator, attack, and detector, plus loss computation. Backward
     # (below) stays outside -- autocast only needs to cover the forward pass,
@@ -387,13 +470,15 @@ def train_step(
         p = presence[:, 1, :].mean(dim=-1)  # presence prob per example, pooled over time
 
         # 4. losses
-        det_loss, presence_loss, bit_loss = detection_loss_components(p, m_hat, message)
+        det_loss, presence_loss, bit_loss = detection_loss_components(p, m_hat, message, bit_weight=cfg.lambda_bit)
         perc_loss = perceptual_loss_fn(x, x_wm)  # pre-attack, per spec
         total_loss = cfg.lambda_det * det_loss + cfg.lambda_perc * perc_loss
 
     # 5. backprop through detector + attack (frozen but differentiable) into G_theta
+    memory.mark_forward_end()  # before zero_grad/backward frees or adds anything
     optimizer.zero_grad(set_to_none=True)
     total_loss.backward()
+    memory.mark_backward_end()
     grad_norm_generator = _grad_norm(unwrap_generator(embedder))
     grad_norm_attack = _grad_norm(attack)  # expected: always 0.0, see _grad_norm's docstring
     if cfg.optim.max_norm is not None:
@@ -415,6 +500,7 @@ def train_step(
         ),
         "grad_norm_x_att": activation_grad_norms.get("x_att", 0.0),
         "attack": attack_name,
+        **memory.metrics(),  # empty off CUDA / with tracking.log_memory=false
     }
 
 
@@ -427,11 +513,18 @@ def eval_step(
     batch: torch.Tensor,
     cfg: TrainConfig,
     device: torch.device,
+    attack_name: tp.Optional[str] = None,
 ) -> tp.Dict[str, tp.Union[float, str]]:
-    """Same forward computation as train_step (same loss formula, same
-    sampled-attack call), just no backward/optimizer step -- for periodic
-    train-vs-eval loss comparison during training (see TrainConfig.eval_every
-    and DataConfig.valid_dir).
+    """Same forward computation as train_step (same loss formula), just no
+    backward/optimizer step -- for periodic train-vs-eval comparison during
+    training (see TrainConfig.eval_every and DataConfig.valid_dir).
+
+    `attack_name` pins the attack branch. The caller passes one explicitly and
+    sweeps every branch, because a randomly sampled branch makes these numbers
+    incomparable between eval points: each would measure a different task, and
+    the resulting curve alternates between the branches' very different loss
+    scales -- which reads as instability or regression rather than the
+    branch-switching it actually is. See SampledReconstructionAttack.forward.
 
     Takes the RAW generator, not the DDP wrapper, on purpose: there is no
     backward here, so there is nothing for DDP to synchronize, and running a
@@ -446,10 +539,10 @@ def eval_step(
         message = random_message(cfg.nbits, x.size(0), device=x.device)
         with _autocast(device):
             x_wm = embed_watermark(generator, x, message, cfg.watermark_snr_db_min, cfg.watermark_snr_db_max)
-            x_att, attack_name = attack(x_wm)
+            x_att, sampled_name = attack(x_wm, name=attack_name)
             presence, m_hat = detector.forward(x_att)
             p = presence[:, 1, :].mean(dim=-1)
-            det_loss, presence_loss, bit_loss = detection_loss_components(p, m_hat, message)
+            det_loss, presence_loss, bit_loss = detection_loss_components(p, m_hat, message, bit_weight=cfg.lambda_bit)
             perc_loss = perceptual_loss_fn(x, x_wm)
             total_loss = cfg.lambda_det * det_loss + cfg.lambda_perc * perc_loss
     finally:
@@ -462,7 +555,7 @@ def eval_step(
         "bit_loss": bit_loss.item(),
         "perceptual_loss": perc_loss.item(),
         "presence_prob": p.mean().item(),
-        "attack": attack_name,
+        "attack": sampled_name,
     }
 
 
@@ -630,8 +723,19 @@ def train(cfg: TrainConfig) -> None:
         # adding reshuffling noise to it.
         valid_iter = itertools.cycle(valid_dataloader)  # valid set is usually far smaller than epochs*updates
 
+    # Each run gets its own timestamped subfolder under cfg.checkpoint_dir so
+    # that consecutive runs never overwrite each other's generator_epochN.pth
+    # files (previously all runs shared the same flat directory).
+    #
+    # The name is taken from rank 0 and shared, not computed per rank:
+    # datetime.now() called independently on each rank gives ranks that
+    # started a second apart different directory names, so a multi-GPU run
+    # would disagree about where its checkpoints live.
+    run_checkpoint_dir = gather_objects(
+        os.path.join(cfg.checkpoint_dir, datetime.now().strftime("%Y%m%d_%H%M%S")), env
+    )[0]
     if env.is_main:
-        os.makedirs(cfg.checkpoint_dir, exist_ok=True)
+        os.makedirs(run_checkpoint_dir, exist_ok=True)
     barrier(env)  # no rank may reach the first torch.save before the dir exists
 
     batch_iterator = EpochBatchIterator(dataloader, sampler, cfg.updates_per_epoch, env.world_size)
@@ -675,17 +779,36 @@ def train(cfg: TrainConfig) -> None:
                 progress.update(1)
                 progress.set_postfix(loss=f"{metrics['loss']:.4f}", attack=metrics["attack"])
                 if valid_iter is not None and step % cfg.eval_every == 0:
-                    eval_metrics = eval_step(
-                        unwrap_generator(embedder), detector, attack, perceptual_loss_fn,
-                        next(valid_iter), cfg, device,
-                    )
-                    eval_scalar_metrics = all_reduce_mean(
-                        {k: v for k, v in eval_metrics.items() if isinstance(v, (int, float))}, env, device
-                    )
-                    eval_scalar_metrics = {f"eval/{k}": v for k, v in eval_scalar_metrics.items()}
+                    # Every branch, on the SAME batch, keyed by branch name.
+                    # One batch for all of them so a difference between
+                    # branches is attributable to the branch and not to the
+                    # data; explicit names so each series is comparable across
+                    # eval points (see eval_step's docstring).
+                    #
+                    # branch_names is the same list in the same order on every
+                    # rank (it is derived from the configured attack weights),
+                    # so the per-branch all_reduce_mean below is a collective
+                    # every rank enters the same number of times, in the same
+                    # order -- otherwise ranks would deadlock against each
+                    # other until the NCCL timeout.
+                    eval_batch = next(valid_iter)
+                    eval_by_branch = {
+                        name: eval_step(
+                            unwrap_generator(embedder), detector, attack, perceptual_loss_fn,
+                            eval_batch, cfg, device, attack_name=name,
+                        )
+                        for name in attack.branch_names
+                    }
+                    eval_scalar_metrics = {}
+                    for name, eval_metrics in eval_by_branch.items():
+                        reduced = all_reduce_mean(
+                            {k: v for k, v in eval_metrics.items() if isinstance(v, (int, float))},
+                            env, device,
+                        )
+                        eval_scalar_metrics.update({f"eval/{name}/{k}": v for k, v in reduced.items()})
                     tracker.log(eval_scalar_metrics, step=step)
                     if env.is_main and step % cfg.log_every == 0:
-                        logger.info("epoch=%d step=%d eval=%s", epoch, step, eval_metrics)
+                        logger.info("epoch=%d step=%d eval=%s", epoch, step, eval_by_branch)
                 if env.is_main and cfg.tracking.log_audio_every and step % cfg.tracking.log_audio_every == 0:
                     with torch.no_grad():
                         sample_x = batch[:1].to(device)
@@ -708,7 +831,7 @@ def train(cfg: TrainConfig) -> None:
                 # WatermarkEmbedder state_dict has every key prefixed
                 # `module.generator.`, which evaluate.py's
                 # load_generator_under_test could not load.
-                ckpt_path = f"{cfg.checkpoint_dir}/generator_epoch{epoch}.pth"
+                ckpt_path = f"{run_checkpoint_dir}/generator_epoch{epoch}.pth"
                 torch.save({"model": unwrap_generator(embedder).state_dict(), "xp.cfg": cfg}, ckpt_path)
                 logger.info("saved checkpoint to %s", ckpt_path)
             barrier(env)  # keep ranks in lockstep across the epoch boundary
