@@ -34,6 +34,7 @@ little more care to get there -- see that class's own docstring for why).
 """
 
 import functools
+import logging
 import os
 import random
 import typing as tp
@@ -43,6 +44,58 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint
+
+from audioseal.models import AudioSealDetector
+
+logger = logging.getLogger(__name__)
+
+
+class AttackApplicationReporter:
+    """Mixin for attacks that can silently fail to perturb some examples.
+
+    Most attacks here are resynthesis pipelines: they always transform every
+    example they are handed, so "the attack ran" and "the attack was applied"
+    are the same statement. Query-based search attacks break that equivalence
+    -- HopSkipJumpAttack returns an example *unperturbed* whenever its search
+    never found an adversarial starting point within the query budget (see
+    `HopSkipJumpAttack._initialize`).
+
+    That failure mode is dangerous precisely because it is invisible in the
+    metrics: an unperturbed watermarked example still detects, so it lands in
+    `evaluate_attack`'s positive scores as a detection, i.e. it is scored as
+    *robustness of the watermark* when it is really *weakness of the attack*.
+    A run whose search budget was too small is therefore indistinguishable
+    from a genuinely robust model -- both report a high TPR@FPR.
+
+    This mixin makes that distinction observable. An attack records one
+    bool per example as it produces it, and `evaluate.py:evaluate_attack`
+    duck-types `pop_application_mask()` (exactly like `bind_detector`) to
+    drain it after each forward and fold it into the reported metrics. Any
+    attack not implementing this is treated as "applied to everything",
+    so nothing changes for the resynthesis attacks.
+    """
+
+    def _reset_application_mask(self) -> None:
+        self._application_flags: tp.List[bool] = []
+
+    def _record_application(self, applied: bool) -> None:
+        # Tolerate a forward() that never called _reset_application_mask
+        # (e.g. a subclass overriding forward without going through it).
+        if not hasattr(self, "_application_flags"):
+            self._application_flags = []
+        self._application_flags.append(applied)
+
+    def pop_application_mask(self) -> tp.Optional[torch.Tensor]:
+        """Per-example bools for the LAST forward call: True where the attack
+        actually perturbed the example, False where it gave up and passed it
+        through. Drains the buffer, so each forward's mask is consumed
+        exactly once and a missed read can never be mistaken for a later
+        call's result. None if nothing was recorded."""
+        flags = getattr(self, "_application_flags", None)
+        if not flags:
+            return None
+        self._application_flags = []
+        return torch.tensor(flags, dtype=torch.bool)
 
 
 def _tile_or_crop(wav: torch.Tensor, target_len: int) -> torch.Tensor:
@@ -897,6 +950,344 @@ class MBDAttack(nn.Module):
         with torch.no_grad():
             out = self._mbd.regenerate(x, sample_rate=self.sample_rate)
         return out[..., : x.shape[-1]].to(x.dtype)
+
+
+class HopSkipJumpAttack(nn.Module, AttackApplicationReporter):
+    """Hard-label, query-based black-box evasion attack against the
+    *detector itself*, as used by AudioMarkBench
+    (github.com/mileskuo42/AudioMarkBench) to benchmark watermark robustness
+    -- implementing Chen, Jordan & Wainwright's HopSkipJumpAttack (IEEE S&P
+    2020, arXiv:1904.02144), L2 variant.
+
+    Structurally different from every other attack in this file: BigVGAN/
+    DAC/SGMSE/AudioLDM/MBD are *resynthesis* attacks -- they transform the
+    waveform on their own and never look at the detector, so `evaluate.py`
+    calls detector(attack(x)) as two independent steps. HopSkipJumpAttack
+    instead treats the detector as a black-box oracle it repeatedly QUERIES
+    (hard-label decisions only, no gradients, no probability values) to
+    search for the nearest (in L2) waveform on which the detector's own
+    decision flips. That means this attack needs the detector at forward()
+    time, which the usual `attack(x, strength=strength)` call in
+    `evaluate.py:evaluate_attack` doesn't provide -- see `bind_detector`
+    below for how that's threaded through without changing that call site.
+
+    Algorithm (per example, batched internally only for the Monte Carlo
+    gradient-estimation queries within one example's own trajectory --
+    each example follows its own adaptive search, so trajectories
+    themselves cannot be batched across the batch dimension):
+      1. `label0` = the detector's OWN current hard decision on `x0`
+         (presence probability, pooled over time, thresholded at
+         `detection_threshold`) -- NOT a ground-truth watermarked/clean
+         label. This is what makes the same attack function correct for
+         both branches `evaluate_attack` calls it on: on watermarked audio
+         (`label0=True`) it searches for detection *evasion*; on clean
+         audio (`label0=False`) it searches for a *false* detection. Same
+         symmetric "flip the detector's own current call" framing as every
+         positive/negative pair this file's attacks already go through.
+      2. `_initialize`: find a first, usually very perturbed, "adversarial"
+         point whose decision already differs from `label0`. Prefers drawing
+         it from a bound pool of REAL audio (`bind_reference_pool`, the
+         reference implementation's strategy); falls back to uniform random
+         noise draws when no pool is bound or none of it flips the decision.
+         See `_initialize` for why the noise-only fallback is a poor
+         initializer in this domain.
+      3. `_binary_search`: bisect the segment between `x0` and that point
+         to land close to the decision boundary.
+      4. Repeat for `num_iterations`: estimate the boundary's gradient
+         direction via Monte Carlo (`_approximate_gradient` -- query the
+         decision at many random unit perturbations, average the ones that
+         stay adversarial), take a step along it sized by
+         `_geometric_progression` (halve until the step stays adversarial),
+         then `_binary_search` again to re-land on the boundary.
+      Returns `x0` unperturbed for any example where step 2 never finds a
+      flip within `init_max_trials` draws -- recorded per example via
+      `AttackApplicationReporter` (see that mixin's docstring: such examples
+      would otherwise be silently scored as watermark robustness) and
+      reported by `evaluate.py` as `attack_failure_rate`.
+
+    COST WARNING: unlike every other attack here, this is many detector
+    forward passes per waveform -- roughly
+    `init_max_trials + num_iterations * (max_num_evals + binary_search_steps
+    * (1 + max_step_halvings))` in the worst case, each a full detector
+    encoder forward. Default hyperparameters below are deliberately modest
+    (AudioMarkBench's own numbers run far higher `num_iterations`/
+    `max_num_evals`); still expect this to dominate an eval run's wall clock
+    -- drop `batch_size`/`n_eval_batches` well below the other attacks'
+    settings when enabling this one (see EvalConfig / default_eval.yaml).
+
+    NEVER wire this into TrainConfig.AttackConfig/AttackWeights (train.py):
+    every other attack stays "frozen but differentiable" (see this module's
+    top docstring) so gradients reach the generator through it. This attack
+    is a hard-label search with no gradient definition at all -- its
+    `forward` runs its whole query loop under `torch.no_grad()` (there is no
+    other option: it doesn't just skip autograd, no differentiable data path
+    to skip exists), so `x_att` would reach train_step's detector call with
+    `grad_fn=None` and silently zero out the generator's gradient. Eval-only,
+    like MBDAttack/SGMSEAttack.
+    """
+
+    # Safety cap on `_geometric_progression`'s halving loop -- the reference
+    # algorithm assumes it always eventually finds an adversarial step size
+    # and loops unboundedly; capped here so a pathological boundary (or a
+    # detector that never flips) fails soft (epsilon=0, iteration skipped)
+    # instead of hanging.
+    _MAX_STEP_HALVINGS = 60
+
+    def __init__(
+        self,
+        checkpoint: tp.Optional[str] = None,
+        detection_threshold: float = 0.5,
+        num_iterations: int = 20,
+        init_num_evals: int = 20,
+        max_num_evals: int = 100,
+        init_max_trials: int = 100,
+        binary_search_steps: int = 10,
+        gamma: float = 1.0,
+        clip_min: float = -1.0,
+        clip_max: float = 1.0,
+        init_from_reference: bool = True,
+    ):
+        super().__init__()
+        # This attack needs no external weights (it only queries this
+        # project's own detector) -- `checkpoint` is a pure enable/disable
+        # gate, same convention as MBDAttackConfig (any non-None value, e.g.
+        # "auto", turns it on) so evaluate.py's uniform per-attack config
+        # handling still applies.
+        self.enabled = checkpoint is not None
+        self.detection_threshold = detection_threshold
+        self.num_iterations = num_iterations
+        self.init_num_evals = init_num_evals
+        self.max_num_evals = max_num_evals
+        self.init_max_trials = init_max_trials
+        self.binary_search_steps = binary_search_steps
+        self.gamma = gamma
+        self.clip_min = clip_min
+        self.clip_max = clip_max
+        self.init_from_reference = init_from_reference
+        self._detector: tp.Optional[AudioSealDetector] = None
+        self._reference_pool: tp.Optional[torch.Tensor] = None
+        self._reset_application_mask()
+
+    # A reference waveform this close to `x0` (relative L2) is assumed to be
+    # `x0`'s own counterpart rather than an independent utterance, and is
+    # skipped -- see `bind_reference_pool`. At the eval's 30 dB watermark
+    # SNR a clean/watermarked pair sits at ~0.03 relative L2, while two
+    # different utterances sit near sqrt(2) (~1.41) for uncorrelated
+    # signals, so 0.2 separates the two cases by an order of magnitude in
+    # either direction and is not a value the run is sensitive to.
+    _SELF_REFERENCE_REL_L2 = 0.2
+
+    def bind_reference_pool(self, pool: tp.Optional[torch.Tensor]) -> None:
+        """Supply real audio for `_initialize` to start its search from,
+        shaped (N, 1, T) matching this attack's inputs.
+
+        HopSkipJump needs a starting point the detector already classifies
+        opposite to `x0`. The reference implementation takes that from a real
+        sample of the target class, and so does this once a pool is bound:
+        for evading detection on watermarked audio it needs audio the
+        detector calls clean, and for forcing a false positive on clean audio
+        it needs audio the detector calls watermarked -- so a useful pool
+        contains BOTH, which is what `evaluate.py:run` binds.
+
+        Entries within `_SELF_REFERENCE_REL_L2` of `x0` are skipped, because
+        a pool built from the eval batches necessarily contains `x0`'s own
+        clean/watermarked counterpart, and starting the search from the
+        attacked signal's own unwatermarked original would hand the attacker
+        information no real adversary has (and trivially "succeed").
+
+        `evaluate.py:run` calls this automatically wherever it exists,
+        duck-typed exactly like `bind_detector`, so it stays a no-op for
+        every other attack. Pass None to clear it and fall back to noise.
+        """
+        self._reference_pool = pool
+
+    def bind_detector(self, detector: AudioSealDetector) -> None:
+        """Must be called with the detector under test before `forward()`.
+        `evaluate.py:run` does this automatically for every constructed
+        attack exposing this method, right after building the detector --
+        it's the mechanism that gets the detector to this attack without
+        changing `evaluate_attack`'s `attack(x, strength=strength)` call
+        signature (see class docstring). A HopSkipJumpAttack used outside
+        that path (e.g. directly in a test) must call this itself."""
+        self._detector = detector
+
+    def _decision(self, x: torch.Tensor) -> torch.Tensor:
+        """Hard-label oracle: per-example bool, True if the detector
+        currently calls `x` watermarked. `x` may be a batch of several
+        candidate perturbations of the SAME example (the gradient-estimate
+        queries), not necessarily the outer batch `forward` received."""
+        presence, _ = self._detector.forward(x)
+        return presence[:, 1, :].mean(dim=-1) > self.detection_threshold
+
+    def _initialize(self, x0: torch.Tensor, label0: bool) -> tp.Optional[torch.Tensor]:
+        """A first point whose decision differs from `label0`, or None if the
+        budget ran out.
+
+        Tries the bound reference pool (real audio) before falling back to
+        uniform noise. The fallback is kept only as a last resort: a draw
+        from `uniform_(clip_min, clip_max)` is full-scale white noise, which
+        is far off the manifold of anything a 16 kHz speech detector was
+        trained on, so on the clean/negative branch in particular it very
+        rarely lands in a falsely-triggering region no matter how many
+        trials it gets. Raising `init_max_trials` alone therefore buys much
+        less than binding a pool does.
+        """
+        pool = self._reference_pool if self.init_from_reference else None
+        if pool is not None and pool.numel() > 0:
+            x0_norm = x0.flatten().norm().clamp_min(1e-12)
+            # Shuffled so repeated calls don't all start from the same
+            # entry, which would correlate every example's trajectory.
+            for idx in torch.randperm(pool.shape[0]).tolist():
+                candidate = pool[idx : idx + 1].to(device=x0.device, dtype=x0.dtype)
+                if candidate.shape != x0.shape:
+                    continue
+                if ((candidate - x0).flatten().norm() / x0_norm).item() < self._SELF_REFERENCE_REL_L2:
+                    continue  # x0's own counterpart -- see bind_reference_pool
+                if bool(self._decision(candidate)[0]) != label0:
+                    return candidate
+
+        for _ in range(self.init_max_trials):
+            candidate = torch.empty_like(x0).uniform_(self.clip_min, self.clip_max)
+            if bool(self._decision(candidate)[0]) != label0:
+                return candidate
+        return None
+
+    def _binary_search(self, x0: torch.Tensor, x_adv: torch.Tensor, label0: bool) -> torch.Tensor:
+        """Bisects the segment [x0, x_adv] (x_adv already adversarial) for
+        the point closest to x0 that stays adversarial -- fixed iteration
+        count rather than the reference algorithm's adaptive distance
+        threshold, simple and sufficient in this continuous waveform domain."""
+        low, high = 0.0, 1.0
+        for _ in range(self.binary_search_steps):
+            mid = (low + high) / 2.0
+            blended = x0 + mid * (x_adv - x0)
+            if bool(self._decision(blended)[0]) != label0:
+                high = mid
+            else:
+                low = mid
+        return x0 + high * (x_adv - x0)
+
+    def _select_delta(self, cur_iter: int, dist: float, d: int) -> float:
+        """Perturbation radius for this iteration's gradient-estimate
+        queries: a fixed fraction of the clip range on the very first step
+        (before `dist` means anything), then shrinking with the current
+        distance to `x0` and the signal's dimensionality `d` -- same
+        `sqrt(d) * theta * dist` scaling as the reference algorithm's L2
+        variant, `theta = gamma / d**1.5`."""
+        if cur_iter == 1:
+            return 0.1 * (self.clip_max - self.clip_min)
+        theta = self.gamma / (d**1.5)
+        return (d**0.5) * theta * dist
+
+    def _approximate_gradient(
+        self, x_adv: torch.Tensor, label0: bool, num_evals: int, delta: float
+    ) -> torch.Tensor:
+        """Monte Carlo estimate of the decision boundary's normal direction
+        at `x_adv`: query the oracle at `num_evals` random unit-norm
+        perturbations, and average the ones that stayed adversarial (each
+        weighted by how far the whole batch's vote leaned adversarial) --
+        the finite-difference gradient estimator the reference algorithm
+        derives from a smoothed version of the (otherwise non-differentiable,
+        hard-label) decision boundary."""
+        rv = torch.randn((num_evals,) + x_adv.shape[1:], device=x_adv.device, dtype=x_adv.dtype)
+        rv = rv / rv.flatten(1).norm(dim=1).clamp_min(1e-12).view(-1, 1, 1)
+        perturbed = (x_adv + delta * rv).clamp(self.clip_min, self.clip_max)
+        # Recompute the actually-applied direction post-clip (clipping can
+        # shrink it near the signal's amplitude limits).
+        rv = (perturbed - x_adv) / delta
+
+        adversarial = self._decision(perturbed) != label0
+        fval = adversarial.to(x_adv.dtype) * 2 - 1  # {-1, +1}
+        mean_fval = fval.mean()
+        if mean_fval.item() == 1.0:
+            gradf = rv.mean(dim=0)
+        elif mean_fval.item() == -1.0:
+            gradf = -rv.mean(dim=0)
+        else:
+            gradf = ((fval - mean_fval).view(-1, 1, 1) * rv).mean(dim=0)
+        gradf = gradf / gradf.flatten().norm().clamp_min(1e-12)
+        return gradf.unsqueeze(0)
+
+    def _geometric_progression(
+        self, x_adv: torch.Tensor, update: torch.Tensor, label0: bool, dist: float, cur_iter: int
+    ) -> float:
+        """Largest `epsilon` (halving from an initial `dist / sqrt(cur_iter)`
+        guess) such that stepping `x_adv` by `epsilon * update` is still
+        adversarial. 0.0 (iteration skipped, see `_attack_one`) if nothing
+        found within `_MAX_STEP_HALVINGS` halvings."""
+        epsilon = dist / (cur_iter**0.5)
+        for _ in range(self._MAX_STEP_HALVINGS):
+            candidate = (x_adv + epsilon * update).clamp(self.clip_min, self.clip_max)
+            if bool(self._decision(candidate)[0]) != label0:
+                return epsilon
+            epsilon /= 2.0
+        return 0.0
+
+    def _attack_one(self, x0: torch.Tensor) -> torch.Tensor:
+        """`x0`: one example, (1, 1, T). Returns the closest-in-L2 waveform
+        found on which the detector's decision differs from its decision on
+        `x0` itself -- or `x0` unperturbed if `_initialize` never found one
+        (see class docstring)."""
+        label0 = bool(self._decision(x0)[0])
+        x_adv = self._initialize(x0, label0)
+        if x_adv is None:
+            logger.warning(
+                "HopSkipJumpAttack: no initialization flipped the detector's "
+                "decision within %d noise trials (reference pool bound: %s) "
+                "-- returning this example unperturbed. It is recorded as an "
+                "attack failure, NOT as watermark robustness (see "
+                "AttackApplicationReporter); bind a reference pool or raise "
+                "init_max_trials if this rate is high.",
+                self.init_max_trials,
+                self._reference_pool is not None,
+            )
+            self._record_application(False)
+            return x0
+        self._record_application(True)
+
+        d = x0.numel()
+        x_adv = self._binary_search(x0, x_adv, label0)
+        dist = (x_adv - x0).flatten().norm().item()
+
+        for cur_iter in range(1, self.num_iterations + 1):
+            delta = self._select_delta(cur_iter, dist, d)
+            num_evals = int(min(self.init_num_evals * (cur_iter**0.5), self.max_num_evals))
+            grad = self._approximate_gradient(x_adv, label0, num_evals, delta)
+            epsilon = self._geometric_progression(x_adv, grad, label0, dist, cur_iter)
+            if epsilon == 0.0:
+                # No step size (down to a negligible fraction of the current
+                # distance) kept the example adversarial -- stop rather than
+                # drift with a step that immediately gets undone by the next
+                # binary search.
+                break
+            x_adv = (x_adv + epsilon * grad).clamp(self.clip_min, self.clip_max)
+            x_adv = self._binary_search(x0, x_adv, label0)
+            dist = (x_adv - x0).flatten().norm().item()
+
+        return x_adv
+
+    def forward(self, x: torch.Tensor, strength: tp.Optional[float] = None) -> torch.Tensor:
+        # strength: unused -- this attack's only "strength" axis is query
+        # budget (num_iterations/max_num_evals), fixed at construction, same
+        # reasoning as BigVGANAttack/DACAttack's unused `strength`.
+        if not self.enabled:
+            raise NotImplementedError(
+                "HopSkipJumpAttack was constructed without being enabled "
+                "(see class docstring in src/audioseal_robust/attacks.py). "
+                "Set attack.hopskipjump.checkpoint to any non-None value "
+                "(e.g. 'auto' -- it needs no real weights) or remove "
+                "hopskipjump from eval_attacks/held_out_attacks to skip it."
+            )
+        if self._detector is None:
+            raise RuntimeError(
+                "HopSkipJumpAttack has no detector bound -- call "
+                "bind_detector(detector) before forward() (evaluate.py's "
+                "run() does this automatically; see class docstring)."
+            )
+        with torch.no_grad():
+            self._reset_application_mask()
+            x_att = torch.cat([self._attack_one(x[i : i + 1]) for i in range(x.shape[0])], dim=0)
+        return x_att.to(x.dtype)
 
 
 class SampledReconstructionAttack(nn.Module):

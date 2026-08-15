@@ -31,6 +31,7 @@ to this script.
 """
 
 import csv
+import json
 import logging
 import time
 import typing as tp
@@ -43,10 +44,19 @@ from omegaconf import OmegaConf
 from tqdm import tqdm
 
 from audioseal import AudioSeal
+from audioseal.loader import convert_state_dict_for_scriptable_model
 from audioseal.loader import load_state_dict as audioseal_load_state_dict
 from audioseal.models import AudioSealDetector, AudioSealWM
 
-from .attacks import AudioLDMAttack, BigVGANAttack, DACAttack, IdentityAttack, MBDAttack, SGMSEAttack
+from .attacks import (
+    AudioLDMAttack,
+    BigVGANAttack,
+    DACAttack,
+    HopSkipJumpAttack,
+    IdentityAttack,
+    MBDAttack,
+    SGMSEAttack,
+)
 from .config import EvalConfig, load_eval_config
 from .data import build_dataloader
 from .distributed import (
@@ -61,9 +71,19 @@ from .distributed import (
     seed_everything,
     shard_size,
 )
-from .metrics import bit_accuracy, confusion_counts, f1_score, pesq_score, sisnr_score, tpr_at_fpr, visqol_score
+from .metrics import (
+    bit_accuracy,
+    confusion_counts,
+    f1_score,
+    fpr_support,
+    pesq_score,
+    sisnr_score,
+    tpr_at_fpr,
+    visqol_score,
+)
+from sklearn.metrics import roc_auc_score, roc_curve
 from .model_init import build_untrained_generator
-from .plotting import plot_confusion_matrices, plot_robustness_curve
+from .plotting import plot_confusion_matrices, plot_robustness_curve, plot_roc_curves
 from .train import embed_watermark, random_message
 from .tracking import NullTracker, build_tracker
 
@@ -76,6 +96,7 @@ _ATTACK_CLASSES: tp.Dict[str, tp.Type[nn.Module]] = {
     "sgmse": SGMSEAttack,
     "audioldm": AudioLDMAttack,
     "mbd": MBDAttack,
+    "hopskipjump": HopSkipJumpAttack,
 }
 
 # Attacks with a meaningful `strength` (t*) axis: these are the ones that get
@@ -132,13 +153,51 @@ def load_generator_under_test(checkpoint: str, nbits: int, device: torch.device)
         logger.info("loading fine-tuned generator from %s", path)
         state = torch.load(path, map_location=device, weights_only=False)
         generator = build_untrained_generator(nbits=nbits, device=device)
-        audioseal_load_state_dict(generator, state["model"])
+        # Same conversion AudioSeal.load_generator/load_detector apply
+        # internally (see loader.py) before their own load_state_dict call --
+        # train.py's checkpoints (torch.save({"model": generator.state_dict()...}))
+        # can use either the pre-torchscripting-update flat conv naming
+        # (".conv.weight"/".conv.bias", saved by a Python <3.10 process) or
+        # this Python (>=3.10) build's Moshi-based SEANet naming (wrapped in
+        # an extra "inner_conv" level, see builder.py's Python-version
+        # SEANet selection) -- whichever Python trained the checkpoint.
+        # convert_state_dict_for_scriptable_model only ever converts
+        # flat->inner_conv (and only running on Python >=3.10), so it can't
+        # fix the reverse case (an inner_conv checkpoint loaded by a
+        # Python <3.10 build, which only has flat convs) -- confirmed by
+        # hand: raised "Missing/Unexpected key(s)" for every conv layer with
+        # a checkpoint saved on a newer Python than the eval process. Decide
+        # the direction from the actual model/checkpoint keys instead of
+        # inferring it from sys.version_info, so this works regardless of
+        # which Python trained vs. which Python is evaluating.
+        raw_state_dict = state["model"]
+        model_has_inner_conv = any(
+            ".inner_conv." in k for k in generator.state_dict().keys()
+        )
+        checkpoint_has_inner_conv = any(
+            ".inner_conv." in k for k in raw_state_dict.keys()
+        )
+        if model_has_inner_conv and not checkpoint_has_inner_conv:
+            state_dict = convert_state_dict_for_scriptable_model(raw_state_dict)
+        elif checkpoint_has_inner_conv and not model_has_inner_conv:
+            state_dict = {
+                k.replace(".inner_conv.", "."): v for k, v in raw_state_dict.items()
+            }
+        else:
+            state_dict = raw_state_dict
+        audioseal_load_state_dict(generator, state_dict)
         return generator
     logger.info("loading generator checkpoint/card %r", checkpoint)
     return AudioSeal.load_generator(checkpoint, nbits=nbits, device=device)
 
 
 _CONSTRUCTION_SKIP_EXCEPTIONS = (NotImplementedError, FileNotFoundError, ModuleNotFoundError)
+
+# Eval batches drawn on for the query-based attacks' reference pool (see
+# run()). Two batches of each branch is enough variety for _initialize to
+# find an opposite-class start almost immediately, while keeping its linear
+# scan short -- every extra entry is a detector query per attacked example.
+_REFERENCE_POOL_BATCHES = 2
 
 PreparedEvalBatch = tp.Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
 
@@ -226,14 +285,30 @@ def prepare_eval_batches(
         # produce unscaled, an operating point training never sees.
         x_wm = embed_watermark(generator, x, message, cfg.watermark_snr_db, cfg.watermark_snr_db)
         prepared.append((x.cpu(), x_wm.cpu(), message.cpu()))
-    # Only an *asked-for* batch that never arrived is an error: the dataloader
-    # itself came up empty (dataset too small for this batch_size, or sharded
-    # past `drop_last`), which no amount of collective-friendliness fixes.
-    if not prepared and local_n_batches > 0:
+    # Compare against this rank's LOCAL expected batch count
+    # (local_n_batches), not the global cfg.n_eval_batches -- under DDP each
+    # rank only materializes its own shard (see shard_size above), so
+    # comparing against the global total would make every multi-GPU run
+    # raise here even when nothing is wrong. Still a strict "<", not just
+    # "== 0": a dataloader with drop_last=True silently yields fewer batches
+    # than asked for when the dataset is too small, and every downstream
+    # number (including n_negatives, which sets the achievable FPR
+    # resolution) would then be computed over a smaller sample than the
+    # label claims -- a "full_1h" run quietly becoming an 8-minute one. A
+    # rank whose shard is legitimately empty (local_n_batches == 0, see the
+    # docstring above) still passes this check (0 < 0 is False), so it can
+    # enter the collectives with nothing rather than raising.
+    if len(prepared) < local_n_batches:
+        dataset = getattr(dataloader, "dataset", None)
+        n_files = len(dataset) if dataset is not None else "unknown"
         raise RuntimeError(
-            f"Evaluation dataloader produced no batches (rank {env.rank}, "
-            f"wanted {local_n_batches}). Under DDP each rank's shard must be "
-            "reachable: lower batch_size, or use fewer GPUs for this dataset."
+            f"Evaluation dataloader produced only {len(prepared)} batches, but "
+            f"local_n_batches={local_n_batches} was expected on rank {env.rank} "
+            f"(cfg.n_eval_batches={cfg.n_eval_batches} globally, "
+            f"eval_dir={cfg.eval_dir!r} holds {n_files} usable files; "
+            f"batch_size={cfg.batch_size} with drop_last=True needs at least "
+            f"{local_n_batches * cfg.batch_size} on this rank). Lower "
+            f"n_eval_batches, use fewer GPUs, or point eval_dir at a larger set."
         )
     return prepared
 
@@ -295,7 +370,7 @@ def evaluate_attack(
     progress_desc: str = "attack",
     env: DistEnv = DistEnv(),
     row_artifacts_name: tp.Optional[str] = None,
-) -> tp.Dict[str, float]:
+) -> tp.Dict[str, tp.Any]:
     """Robustness metrics for one attack (optionally at one fixed t*
     strength): bit accuracy and TPR@FPR, where the "negative" (unwatermarked)
     examples are ALSO run through the same attack, so the false-positive
@@ -316,6 +391,15 @@ def evaluate_attack(
     run for minutes per batch, so without it a long run is indistinguishable
     from a hung one.
 
+    Beyond the headline metrics, the returned dict always carries
+    `fpr_support` (whether the negative sample size can resolve
+    `cfg.fpr_target` at all -- see metrics.fpr_support), and for attacks
+    implementing AttackApplicationReporter also `attack_failure_rate`,
+    `n_attack_failures` and, when any example failed, `tpr_at_fpr_attacked`
+    (the headline metric restricted to examples the attack really
+    perturbed). Both exist to stop a weak attack from reading as a robust
+    model; see those keys' inline comments below.
+
     `row_artifacts_name` (e.g. the attack's name): when set AND
     `cfg.save_row_artifacts` is True, writes every example's (x, x_wm,
     x_att_pos) plus its own per-example metrics under
@@ -331,6 +415,14 @@ def evaluate_attack(
     negative_scores = []
     bit_accs = []
     attack_sisnr_values = []
+    # Per-example "did the attack actually perturb this?" flags, kept
+    # separately per branch so the applied-only metrics below stay paired
+    # with the right score pool. Empty for every attack that doesn't
+    # implement AttackApplicationReporter (i.e. all resynthesis attacks),
+    # which is treated as "applied to everything" -- see that mixin.
+    applied_pos: tp.List[torch.Tensor] = []
+    applied_neg: tp.List[torch.Tensor] = []
+    pop_application_mask = getattr(attack, "pop_application_mask", None)
 
     # `n_batches` is a global total; take this rank's share of it. The list
     # itself is already this rank's shard (see prepare_eval_batches), so this
@@ -388,7 +480,15 @@ def evaluate_attack(
             message = message_cpu.to(device)
 
             x_att_pos = attack(x_wm, strength=strength)
+            if pop_application_mask is not None:
+                mask = pop_application_mask()
+                if mask is not None:
+                    applied_pos.append(mask)
             x_att_neg = attack(x, strength=strength)
+            if pop_application_mask is not None:
+                mask = pop_application_mask()
+                if mask is not None:
+                    applied_neg.append(mask)
 
             presence_pos, m_hat = detector.forward(x_att_pos)
             presence_neg, _ = detector.forward(x_att_neg)
@@ -458,14 +558,88 @@ def evaluate_attack(
             f"(requested {n_batches} batch(es) over {env.world_size} rank(s))"
         )
 
+    # ROC/AUC over the SAME pooled (post-all_gather) scores as everything
+    # else below -- computing it from per-rank-local scores instead would
+    # give each rank its own curve, the same wrong-operating-point problem
+    # the comment above describes for TPR@FPR.
+    try:
+        y_pos = torch.ones_like(positive_cat)
+        y_neg = torch.zeros_like(negative_cat)
+        y = torch.cat([y_pos, y_neg]).cpu().numpy()
+        scores = torch.cat([positive_cat, negative_cat]).cpu().numpy()
+        fpr, tpr, thresholds = roc_curve(y, scores)
+        roc_auc = float(roc_auc_score(y, scores))
+    except Exception:
+        # If sklearn isn't available or computation fails, skip ROC
+        fpr, tpr, thresholds, roc_auc = None, None, None, None
+
     confusion = confusion_counts(positive_cat, negative_cat, cfg.fpr_target)
-    return {
+    metrics = {
         "bit_accuracy": sum(bit_accs) / len(bit_accs),
         "tpr_at_fpr": tpr_at_fpr(positive_cat, negative_cat, cfg.fpr_target),
         "confusion": confusion,
         "f1": f1_score(confusion),
         "attack_sisnr": sum(attack_sisnr_values) / len(attack_sisnr_values),
+        "roc_auc": roc_auc,
+        "roc_curve": {"fpr": fpr.tolist() if fpr is not None else None, "tpr": tpr.tolist() if tpr is not None else None},
     }
+
+    # Is the negative sample size big enough for `fpr_target` to mean
+    # anything? Reported unconditionally (not just on failure) so the number
+    # travels with the run rather than having to be recomputed from
+    # batch_size * n_eval_batches by whoever reads the log later.
+    support = fpr_support(negative_cat.numel(), cfg.fpr_target)
+    metrics["fpr_support"] = support
+    if not support["supported"]:
+        logger.warning(
+            "%s: tpr_at_fpr=%.3f was measured at fpr_target=%g from only %d negatives, "
+            "which can only resolve FPR down to %.3f -- the threshold degenerated to "
+            "'just above the highest negative score' and this number is a high-variance "
+            "lower bound, NOT a %g operating point. Raise batch_size * n_eval_batches to "
+            ">= %d negatives before quoting it.",
+            progress_desc,
+            metrics["tpr_at_fpr"],
+            cfg.fpr_target,
+            support["n_negatives"],
+            support["fpr_resolution"],
+            cfg.fpr_target,
+            support["min_negatives_for_target"],
+        )
+
+    # Did the attack actually run on everything it was handed? An attack that
+    # passed examples through unperturbed inflates tpr_at_fpr, because an
+    # unattacked watermarked example still detects and is scored as
+    # robustness -- see AttackApplicationReporter.
+    if applied_pos or applied_neg:
+        mask_pos = torch.cat(applied_pos) if applied_pos else torch.ones_like(positive_cat, dtype=torch.bool)
+        mask_neg = torch.cat(applied_neg) if applied_neg else torch.ones_like(negative_cat, dtype=torch.bool)
+        n_total = mask_pos.numel() + mask_neg.numel()
+        n_failed = int((~mask_pos).sum().item() + (~mask_neg).sum().item())
+        metrics["attack_failure_rate"] = n_failed / n_total if n_total else 0.0
+        metrics["n_attack_failures"] = n_failed
+
+        # The same headline metric restricted to examples the attack really
+        # perturbed: "how robust is the watermark WHEN attacked", as opposed
+        # to tpr_at_fpr's "how robust is it against this attack as
+        # configured, failures included". Both are legitimate; reporting only
+        # the first hides a weak search budget behind a good-looking score.
+        if n_failed and mask_pos.any() and mask_neg.any():
+            metrics["tpr_at_fpr_attacked"] = tpr_at_fpr(
+                positive_cat[mask_pos], negative_cat[mask_neg], cfg.fpr_target
+            )
+            logger.warning(
+                "%s: attack failed to perturb %d/%d examples (%.1f%%); tpr_at_fpr=%.3f "
+                "over all examples vs. %.3f over perturbed-only. The gap is attack "
+                "weakness, not model robustness.",
+                progress_desc,
+                n_failed,
+                n_total,
+                100.0 * metrics["attack_failure_rate"],
+                metrics["tpr_at_fpr"],
+                metrics["tpr_at_fpr_attacked"],
+            )
+
+    return metrics
 
 
 @torch.no_grad()
@@ -568,6 +742,17 @@ def run(cfg: EvalConfig) -> tp.Dict[str, tp.Any]:
 
     held_out = set(cfg.held_out_attacks)
 
+    # Query-based attacks (currently just HopSkipJumpAttack) need the
+    # detector under test at forward() time, unlike every resynthesis
+    # attack -- see HopSkipJumpAttack's class docstring for why. Duck-typed
+    # via bind_detector rather than threading the detector through every
+    # attack's constructor/forward signature, so this stays a no-op for
+    # every other attack.
+    for attack in attacks.values():
+        bind_detector = getattr(attack, "bind_detector", None)
+        if bind_detector is not None:
+            bind_detector(detector)
+
     # Eval is pure forward passes -- no DDP wrapper needed, no gradients to
     # sync. The parallelism is purely data sharding via the sampler.
     dataloader, _sampler = build_dataloader(
@@ -580,6 +765,26 @@ def run(cfg: EvalConfig) -> tp.Dict[str, tp.Any]:
         env=env,
     )
     eval_batches = prepare_eval_batches(generator, dataloader, cfg, device, env)
+
+    # Real-audio starting points for query-based search attacks, same
+    # duck-typed opt-in as bind_detector above. Deliberately built AFTER
+    # prepare_eval_batches (it needs the watermarked signals) and from both
+    # branches: an evasion search on watermarked audio needs references the
+    # detector calls clean, a false-positive search on clean audio needs
+    # references it calls watermarked, and one pool serves both. Capped
+    # because _initialize scans it linearly with a detector query per entry,
+    # so an unbounded pool would add cost to every single example.
+    reference_pool = torch.cat(
+        [
+            torch.cat([x for x, _, _ in eval_batches[:_REFERENCE_POOL_BATCHES]]),
+            torch.cat([x_wm for _, x_wm, _ in eval_batches[:_REFERENCE_POOL_BATCHES]]),
+        ]
+    )
+    for attack in attacks.values():
+        bind_reference_pool = getattr(attack, "bind_reference_pool", None)
+        if bind_reference_pool is not None:
+            bind_reference_pool(reference_pool)
+            logger.info("bound a %d-waveform reference pool for query-based init", reference_pool.shape[0])
 
     # Only rank 0 talks to the tracker: 4 ranks logging the same all-reduced
     # numbers to the same run would quadruple every point.
@@ -600,7 +805,7 @@ def run(cfg: EvalConfig) -> tp.Dict[str, tp.Any]:
         else NullTracker()
     )
 
-    results: tp.Dict[str, tp.Any] = {"label": cfg.label, "world_size": env.world_size}
+    results: tp.Dict[str, tp.Any] = {"label": cfg.label, "device": str(device), "world_size": env.world_size}
     if device.type == "cuda":
         props = torch.cuda.get_device_properties(device)
         results["gpu"] = {"name": props.name, "total_gb": props.total_memory / 1e9}
@@ -685,8 +890,15 @@ def run(cfg: EvalConfig) -> tp.Dict[str, tp.Any]:
                 robustness["seconds"] = time.perf_counter() - attack_started
                 robustness.update(_peak_memory_metrics(device, env))
                 results["attacks"][name] = {"tag": tag, **robustness}
-                loggable = {k: v for k, v in robustness.items() if k != "confusion"}
+                # Flatten the dict-valued entries: mlflow's log_metric only
+                # takes scalars, so passing `confusion`/`fpr_support` through
+                # as nested dicts would break that backend (wandb tolerates
+                # them, which is exactly how it would slip through untested).
+                loggable = {k: v for k, v in robustness.items() if k not in ("confusion", "fpr_support")}
                 loggable.update({f"confusion_{k}": v for k, v in robustness["confusion"].items()})
+                loggable.update(
+                    {f"fpr_support_{k}": float(v) for k, v in robustness["fpr_support"].items()}
+                )
                 tracker.log({f"{name}/{k}": v for k, v in loggable.items()}, step=0)
                 logger.info("%s (%s): %s", name, tag, robustness)
             except NotImplementedError as e:
@@ -740,7 +952,17 @@ def run(cfg: EvalConfig) -> tp.Dict[str, tp.Any]:
                 results["robustness_curve_plot"] = str(curve_path)
                 tracker.log_figure(curve_path)
                 logger.info("robustness curve plot: %s", curve_path)
+            roc_path = plot_roc_curves(results, out_dir / f"{cfg.label}_roc.png")
+            if roc_path is not None:
+                results["roc_plot"] = str(roc_path)
+                tracker.log_figure(roc_path)
+                logger.info("roc plot: %s", roc_path)
         results["total_seconds"] = time.perf_counter() - run_started
+        # Persist BEFORE main()'s summary printer runs: that printer has
+        # crashed on a missing key before (KeyError 'pesq' under
+        # compute_pesq=false), which used to throw away a whole run's
+        # numbers even though every metric had already been computed.
+        _write_result_files(cfg, results)
     finally:
         tracker.finish()
         cleanup_distributed(env)
@@ -820,6 +1042,117 @@ def _print_timing_and_projection(cfg: EvalConfig, results: tp.Dict[str, tp.Any])
     )
 
 
+def _write_result_files(cfg: EvalConfig, results: tp.Dict[str, tp.Any]) -> None:
+    """Dump `results` to disk next to the PNGs: a flat per-attack CSV, a
+    flat per-curve-point CSV, and the full nested JSON.
+
+    The harness only ever emitted plots and a stdout table, so every number
+    behind a run lived in a log that has to be re-parsed by hand (and in a
+    tracking backend that may be offline/none). Each CSV row carries its own
+    run-level context (label, device, sample sizes, perceptual metrics) so
+    runs can simply be concatenated for cross-run comparison without a join.
+
+    The caveat fields travel WITH the numbers on purpose: `fpr_supported`
+    and `attack_failure_rate` are exactly what distinguishes a real result
+    from one where the negative sample was too thin to resolve the target
+    FPR, or where the attack never actually perturbed anything.
+    """
+    out_dir = Path(cfg.output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    perceptual = results.get("perceptual") or {}
+
+    # n_positives == n_negatives: evaluate_attack scores each batch twice,
+    # once on the watermarked copy and once on the clean one.
+    n_headline = cfg.batch_size * cfg.n_eval_batches
+    n_curve = cfg.batch_size * cfg.n_curve_batches
+
+    run_ctx = {
+        "label": results.get("label"),
+        "device": str(results.get("device", "")),
+        "eval_dir": str(cfg.eval_dir),
+        "segment_duration": cfg.segment_duration,
+        "batch_size": cfg.batch_size,
+        "perceptual_sisnr": perceptual.get("sisnr"),
+        "perceptual_pesq": perceptual.get("pesq"),
+    }
+
+    metrics_path = out_dir / f"{cfg.label}_metrics.csv"
+    metrics_cols = list(run_ctx) + [
+        "attack", "tag", "skipped", "n_eval_batches", "n_positives", "n_negatives",
+        "fpr_target", "fpr_resolution", "min_negatives_for_target", "fpr_supported",
+        "bit_accuracy", "tpr_at_fpr", "tpr_at_fpr_attacked", "f1", "attack_sisnr",
+        "tp", "fn", "fp", "tn",
+        "attack_failure_rate", "n_attack_failures",
+        "roc_auc",
+        "seconds", "peak_reserved_gb",
+    ]
+    scalar_keys = (
+        "bit_accuracy", "tpr_at_fpr", "tpr_at_fpr_attacked", "f1", "attack_sisnr",
+        "roc_auc",
+        "attack_failure_rate", "n_attack_failures", "seconds", "peak_reserved_gb",
+    )
+    with metrics_path.open("w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=metrics_cols, extrasaction="ignore")
+        writer.writeheader()
+        for name, r in results.get("attacks", {}).items():
+            confusion = r.get("confusion") or {}
+            support = r.get("fpr_support") or {}
+            row = {
+                **run_ctx,
+                "attack": name,
+                "tag": r.get("tag", ""),
+                "skipped": r.get("skipped", ""),
+                "n_eval_batches": cfg.n_eval_batches,
+                "n_positives": n_headline,
+                "n_negatives": support.get("n_negatives", n_headline),
+                "fpr_target": cfg.fpr_target,
+                "fpr_resolution": support.get("fpr_resolution"),
+                "min_negatives_for_target": support.get("min_negatives_for_target"),
+                "fpr_supported": support.get("supported"),
+                **{k: confusion.get(k) for k in ("tp", "fn", "fp", "tn")},
+                **{k: r.get(k) for k in scalar_keys},
+            }
+            writer.writerow(row)
+
+    curve_rows = []
+    for name, r in results.get("attacks", {}).items():
+        for point in r.get("robustness_curve") or []:
+            flat = {k: v for k, v in point.items() if not isinstance(v, dict)}
+            curve_rows.append({
+                **run_ctx,
+                "attack": name,
+                "n_curve_batches": cfg.n_curve_batches,
+                "n_positives": n_curve,
+                "n_negatives": n_curve,
+                **flat,
+            })
+    curve_path = out_dir / f"{cfg.label}_curve.csv"
+    if curve_rows:
+        curve_cols = list(run_ctx) + [
+            "attack", "n_curve_batches", "n_positives", "n_negatives",
+            "t_star", "bit_accuracy", "tpr_at_fpr", "tpr_at_fpr_attacked", "f1",
+            "attack_sisnr", "attack_failure_rate", "n_attack_failures",
+        ]
+        with curve_path.open("w", newline="", encoding="utf-8") as fh:
+            writer = csv.DictWriter(fh, fieldnames=curve_cols, extrasaction="ignore")
+            writer.writeheader()
+            writer.writerows(curve_rows)
+
+    json_path = out_dir / f"{cfg.label}_results.json"
+    with json_path.open("w", encoding="utf-8") as fh:
+        # default=str: results carries a few non-JSON-native values (Paths,
+        # numpy/torch scalars) that are only ever read back as text.
+        json.dump(results, fh, indent=2, sort_keys=True, default=str)
+
+    results["metrics_csv"] = str(metrics_path)
+    if curve_rows:
+        results["curve_csv"] = str(curve_path)
+    results["results_json"] = str(json_path)
+    logger.info(
+        "wrote %s, %s%s", metrics_path, json_path, f", {curve_path}" if curve_rows else ""
+    )
+
+
 def _print_results_table(results: tp.Dict[str, tp.Any]) -> None:
     """Human-readable stand-in for dumping `results` (a deeply nested dict,
     including a whole robustness_curve list per attack) straight to stdout --
@@ -831,8 +1164,18 @@ def _print_results_table(results: tp.Dict[str, tp.Any]) -> None:
 
     perceptual = results.get("perceptual")
     if perceptual:
+        # Each metric is optional: evaluate_perceptual only emits the ones
+        # its compute_* flags enabled, and pesq additionally drops out when
+        # its backing package is missing or every batch raised. Formatting
+        # them unconditionally used to KeyError here and take down the whole
+        # summary *after* the expensive attack passes had already run.
         print("\nPerceptual (watermarked vs. clean, no attack):")
-        print(f"  SI-SNR: {perceptual['sisnr']:.2f} dB    PESQ: {perceptual['pesq']:.2f}")
+        available = [
+            f"{name.upper()}: {perceptual[key]:.2f}{unit}"
+            for key, name, unit in (("sisnr", "si-snr", " dB"), ("pesq", "pesq", ""), ("visqol", "visqol", ""))
+            if key in perceptual
+        ]
+        print("  " + "    ".join(available) if available else "  (none computed)")
 
     print("\nAttacks:")
     col = "  {:<12}{:<10}{:>9}{:>10}{:>8}{:>9}{:>9}"
@@ -862,6 +1205,27 @@ def _print_results_table(results: tp.Dict[str, tp.Any]) -> None:
             print(mcol.format("watermarked", c["tp"], c["fn"]))
             print(mcol.format("clean", c["fp"], c["tn"]))
 
+        # Caveats that invalidate the tpr@fpr printed above if ignored --
+        # printed inline rather than left in the log, since this table is
+        # what actually gets screenshotted into a report.
+        failures = r.get("n_attack_failures")
+        if failures:
+            print(
+                f"    !! attack did not perturb {failures} example(s) "
+                f"({r['attack_failure_rate']:.1%}) -- those count as detections above, "
+                f"inflating tpr@fpr"
+            )
+            if "tpr_at_fpr_attacked" in r:
+                print(f"       tpr@fpr over perturbed-only: {r['tpr_at_fpr_attacked']:.3f}")
+
+        support = r.get("fpr_support")
+        if support and not support["supported"]:
+            print(
+                f"    !! only {support['n_negatives']} negatives -- cannot resolve "
+                f"fpr below {support['fpr_resolution']:.3f}; tpr@fpr above is a "
+                f"high-variance lower bound (need >= {support['min_negatives_for_target']})"
+            )
+
         curve = r.get("robustness_curve")
         if curve:
             print(f"    robustness curve ({_fmt_duration(r.get('curve_seconds', 0))}, {len(curve)} points):")
@@ -890,6 +1254,13 @@ def main() -> None:
 
     _print_results_table(results)
     _print_timing_and_projection(cfg, results)
+    for key, caption in (
+        ("metrics_csv", "metrics csv"),
+        ("curve_csv", "curve csv"),
+        ("results_json", "results json"),
+    ):
+        if key in results:
+            print(f"{caption}: {results[key]}")
     if "confusion_matrix_plot" in results:
         print(f"confusion matrix plot: {results['confusion_matrix_plot']}")
     if "robustness_curve_plot" in results:
