@@ -98,6 +98,54 @@ class AttackApplicationReporter:
         return torch.tensor(flags, dtype=torch.bool)
 
 
+def _tile_or_crop(wav: torch.Tensor, target_len: int) -> torch.Tensor:
+    """Fit `wav` (B, T) to exactly `target_len` samples, tiling if it is short.
+
+    AudioLDM's backbone consumes a fixed 10.24s window (`duration` in
+    audioldm_original.yaml), so anything shorter has to be extended somehow.
+
+    Tiling rather than zero-padding, because zero-padding this model is
+    catastrophic rather than merely wasteful. Its mel goes through
+    log(clamp(m, min=1e-5)), so digital silence becomes a constant -11.51
+    plateau while speech sits near 0. At the 2.0s segments used for training
+    that leaves 80.5% of the spectrogram pinned at the floor and a mel whose
+    mean is ~-9.0, against ~+1.0 for natural audio -- far outside anything the
+    pretrained VAE and UNet ever saw. Nor does it stay confined to the padded
+    region: with use_spatial_transformer the UNet's attention spans all 256
+    latent frames, so the silence mixes into the real-content region, and
+    cropping the output afterwards cannot undo it.
+
+    Measured, from a 4x A100 smoke evaluation: AudioLDM scored
+    attack_sisnr = -50 dB -- the "attacked" audio essentially uncorrelated
+    with its input -- while MBD, also a diffusion resynthesis but run at the
+    audio's native length with no padding, scored -8.8 dB. A 41 dB gap between
+    two comparable methods, from the padding alone.
+
+    Relationship to the eval-side fix in this branch: building a
+    fixed-duration eval set of files that are genuinely >= 10.24s is strictly
+    better where it applies, since the model then sees real contiguous audio
+    and nothing is synthesised at all. This covers the cases that cannot
+    reach: the TRAINING path (train_step feeds whatever
+    data.segment_duration produces, and shortening it is the point -- longer
+    segments make detection easier for free, because the detector
+    time-averages both presence and the message bits, see
+    audioseal/models.py:decode_message), and any evaluation run against a
+    dataset that has not been pre-curated, such as the AzureML mounts where
+    `test-clean-fixed` does not exist.
+
+    Tiling's own cost is repeated content and a seam at each wrap, which is
+    far smaller than an 80% silence plateau. Gradients flow back through every
+    tile onto the same input samples, which is simply the true Jacobian of
+    tile-then-crop.
+    """
+    length = wav.shape[-1]
+    if length == 0:
+        raise ValueError("cannot fit an empty waveform to a target length")
+    if length < target_len:
+        wav = wav.repeat(1, target_len // length + 1)
+    return wav[..., :target_len]
+
+
 class IdentityAttack(nn.Module):
     """No-op attack: returns the input unchanged. Always available, has no
     parameters, and is trivially differentiable (gradient is the identity)."""
@@ -265,6 +313,9 @@ class SGMSEAttack(nn.Module):
         self.sample_rate = sample_rate
         self.checkpoint = checkpoint
         self.num_steps = num_steps
+        # Replaced with a rank-shared generator by SampledReconstructionAttack;
+        # the module default keeps standalone use working exactly as before.
+        self._strength_rng: random.Random = tp.cast(random.Random, random)
         self._model: tp.Optional[nn.Module] = None
         # Overwritten from the checkpoint's own data module in _load_backbone;
         # these are SpecsDataModule's defaults.
@@ -379,7 +430,18 @@ class SGMSEAttack(nn.Module):
             eps = self._model.t_eps
 
             if strength is None:
-                strengths = torch.rand(batch_size, device=device)
+                # Drawn from the rank-shared RNG rather than torch's global
+                # generator, which distributed.seed_everything seeds per rank.
+                # Unlike AudioLDM the step count here is fixed (num_steps), so
+                # this is about comparability rather than cost: identical t*
+                # across ranks means every rank corrupts to the same depth, so
+                # the loss each contributes to the allreduce is measuring the
+                # same difficulty. The per-example spread within the batch is
+                # preserved -- each rank still sees different audio.
+                strengths = torch.tensor(
+                    [self._strength_rng.random() for _ in range(batch_size)],
+                    device=device,
+                )
             else:
                 strengths = torch.full(
                     (batch_size,), float(min(max(strength, 0.0), 1.0)), device=device
@@ -547,6 +609,10 @@ class AudioLDMAttack(nn.Module):
         self.checkpoint = checkpoint
         self.config_path = config
         self.strength_max = strength_max
+        # Replaced with a rank-shared generator by SampledReconstructionAttack;
+        # the module default keeps standalone use (tests, evaluate.py) working
+        # exactly as before. See forward() for why sharing this matters.
+        self._strength_rng: random.Random = tp.cast(random.Random, random)
         self._model: tp.Optional[nn.Module] = None
         self._vocoder: tp.Optional[nn.Module] = None
         self._stft: tp.Optional[nn.Module] = None
@@ -667,7 +733,18 @@ class AudioLDMAttack(nn.Module):
                 "eval_attacks to skip it."
             )
         if strength is None:
-            strength = random.random() * self.strength_max
+            # self._strength_rng, not the global `random`: under DDP the global
+            # RNG is seeded per rank (distributed.seed_everything uses
+            # seed + rank), so each rank would draw a different t* and run a
+            # different number of reverse-diffusion steps. DDP synchronises at
+            # every backward, so the step costs whatever the deepest draw on
+            # any rank costs -- with 4 ranks that is E[max of 4 uniforms] =
+            # 0.8 * strength_max instead of 0.5, ~1.6x the expected work, paid
+            # on every step. It also makes peak memory a function of the
+            # unluckiest rank, and eval numbers less comparable. See
+            # SampledReconstructionAttack, which injects a rank-shared RNG for
+            # exactly the reason it already shares the branch draw.
+            strength = self._strength_rng.random() * self.strength_max
         strength = float(min(max(strength, 0.0), 1.0))
 
         device = x.device
@@ -675,10 +752,7 @@ class AudioLDMAttack(nn.Module):
         target_len = int(round(self._model_sample_rate * self._duration))
 
         wav = x.squeeze(1).clamp(-1.0, 1.0)  # (B, T)
-        if wav.shape[-1] < target_len:
-            wav = F.pad(wav, (0, target_len - wav.shape[-1]))
-        else:
-            wav = wav[..., :target_len]
+        wav = _tile_or_crop(wav, target_len)
 
         mel, *_ = self._stft.mel_spectrogram(wav)  # (B, n_mel, T_frames)
         mel_input = mel.permute(0, 2, 1).unsqueeze(1)  # (B, 1, T_frames, n_mel)
@@ -1222,9 +1296,20 @@ class SampledReconstructionAttack(nn.Module):
     any) never receive gradients and are never touched by the optimizer, but
     the forward computation stays part of the autograd graph so gradients
     flow back through it to its input.
+
+    Pass `rng` to control where the branch draw comes from. Under DDP the
+    draw must agree across ranks (branch costs differ by orders of magnitude
+    and DDP syncs at every backward, so a disagreement makes every step cost
+    the most expensive branch any rank picked) -- see
+    distributed.attack_sampling_rng.
     """
 
-    def __init__(self, attacks: tp.Dict[str, nn.Module], weights: tp.Dict[str, float]):
+    def __init__(
+        self,
+        attacks: tp.Dict[str, nn.Module],
+        weights: tp.Dict[str, float],
+        rng: tp.Optional[random.Random] = None,
+    ):
         super().__init__()
         assert set(attacks.keys()) == set(weights.keys()), (
             f"attacks {sorted(attacks.keys())} and weights "
@@ -1240,6 +1325,23 @@ class SampledReconstructionAttack(nn.Module):
 
         self._names = [n for n, w in weights.items() if w > 0]
         self._sampling_weights = [weights[n] for n in self._names]
+        # None -> the global `random` module, i.e. exactly the previous
+        # behavior. Under DDP, train.py passes an identically-seeded
+        # `random.Random` so every rank draws the SAME branch each step --
+        # see distributed.attack_sampling_rng for why that has to be shared
+        # when nothing else is.
+        self._rng: random.Random = rng if rng is not None else tp.cast(random.Random, random)
+        # Share that same generator with the branches' own strength sampling.
+        # The branch draw was already synchronised across ranks; t* was not,
+        # and for AudioLDM t* sets the number of reverse-diffusion steps, so an
+        # unsynchronised draw makes every DDP step cost the deepest trajectory
+        # any rank happened to draw (~1.6x the expected work at world_size=4)
+        # and leaves peak memory hostage to the unluckiest rank. Injected here
+        # rather than passed through every constructor so an attack added later
+        # is covered by declaring the attribute.
+        for module in self.attacks.values():
+            if hasattr(module, "_strength_rng"):
+                module._strength_rng = self._rng
 
     def train(self, mode: bool = True) -> "SampledReconstructionAttack":
         # Keep the outer module's `.training` flag consistent with the rest of
@@ -1283,13 +1385,16 @@ class SampledReconstructionAttack(nn.Module):
             point happened to draw.
           * Sampling here also consumes from the shared RNG, so evaluating
             shifts the branch sequence that training itself sees. Passing an
-            explicit name draws nothing.
+            explicit name draws nothing. That matters under DDP too: the
+            shared RNG is seeded identically on every rank so all ranks walk
+            the same branch sequence, and an eval that consumed from it would
+            have to consume identically everywhere to keep them aligned.
 
         A weight-0 attack can still be named explicitly: the name selects a
         branch directly and bypasses the sampling weights entirely.
         """
         if name is None:
-            name = random.choices(self._names, weights=self._sampling_weights, k=1)[0]
+            name = self._rng.choices(self._names, weights=self._sampling_weights, k=1)[0]
         elif name not in self.attacks:
             raise KeyError(f"unknown attack {name!r} (have: {sorted(self.attacks)})")
         attack = self.attacks[name]

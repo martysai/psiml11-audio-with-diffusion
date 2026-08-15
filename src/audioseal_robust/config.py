@@ -224,6 +224,40 @@ class OptimConfig:
     weight_decay: float = 0.0
     max_norm: tp.Optional[float] = 3.0
     max_x_wm_grad_norm: tp.Optional[float] = 1000.0
+    # Rescale the generator's gradient to exactly `max_norm` every step,
+    # instead of only shrinking it when it exceeds `max_norm`.
+    #
+    # This exists because plain clipping silently reweights a mixed-attack
+    # recipe. The branches produce gradients of wildly different scale: on the
+    # 4x A100 run <redacted-run> (recipe=audioldm_mixed, so
+    # ~50/50 identity vs audioldm), the median parameter-gradient norm was
+    #     identity 1.69   -- under max_norm=3.0, so 26/30 steps passed through
+    #                        untouched
+    #     audioldm 42.94  -- over it on 33/33 steps, scaled down 14.3x
+    # because backprop through the diffusion chain amplifies the gradient ~252x
+    # between x_att and x_wm (identity, a no-op, amplifies 1.0x). Clipping
+    # therefore let identity steps through at full strength while shrinking
+    # every audioldm step, leaving the optimizer on a ~93% identity diet -- a
+    # task the pretrained checkpoint has already solved. Measured effect: over
+    # 1550 steps the audioldm branch did not move at all (presence_prob
+    # 0.0646 -> 0.0648, bit_loss 0.6977 -> 0.6912, both statistically
+    # indistinguishable from flat), while identity drifted slightly.
+    #
+    # Adam does not rescue this. It is scale-invariant to a *uniform* rescale,
+    # but its moment estimates are shared across steps, so a branch that is
+    # consistently scaled down 14x relative to the other contributes
+    # proportionally less to the running direction.
+    #
+    # Normalizing makes every step contribute an update of comparable size
+    # regardless of which branch produced it. It discards gradient magnitude as
+    # a signal -- but clipping already discarded it for 100% of audioldm steps,
+    # so this trades an accidental, branch-dependent reweighting for a
+    # deliberate, uniform one. Off by default: it changes the update rule for
+    # every recipe, and single-attack runs do not have the imbalance it fixes.
+    normalize_grad: bool = False
+    # Below this gradient norm, normalization is skipped rather than amplifying
+    # what is essentially numerical noise up to `max_norm`.
+    normalize_grad_floor: float = 1e-6
 
 
 @dataclass
@@ -237,8 +271,13 @@ class DataConfig:
     # training-set fit again under a different name.
     valid_dir: tp.Optional[str] = None
     segment_duration: float = 1.0  # seconds
+    # PER GPU under torchrun (standard DDP convention): with
+    # --nproc_per_node=4 this is 16 examples on each of 4 GPUs, i.e. an
+    # effective batch of 64. The learning rate is NOT rescaled automatically
+    # -- see docs/MULTI_GPU.md for why that is left as a deliberate choice
+    # rather than a silent one.
     batch_size: int = 16
-    num_workers: int = 4
+    num_workers: int = 4  # per rank: a 4-GPU run spawns 4 x this many loader processes
 
 
 @dataclass
@@ -379,7 +418,14 @@ class EvalConfig:
 
     eval_dir: str = "???"  # held-out wavs, never trained on
     segment_duration: float = 3.0
+    # PER GPU under torchrun (standard DDP convention), so a 4-GPU run
+    # processes 4 x batch_size examples at a time.
     batch_size: int = 8
+    # GLOBAL batch count, split across ranks (see distributed.shard_size) --
+    # deliberately NOT per GPU, unlike batch_size: this one controls how much
+    # audio a reported number is measured on, so scaling it with the GPU
+    # count would silently make 4-GPU results incomparable to the 1-GPU
+    # baselines already recorded.
     n_eval_batches: int = 20
     # Fixed watermark SNR (dB) for eval -- a single number, not a range like
     # TrainConfig.watermark_snr_db_{min,max}, since eval wants one
@@ -408,6 +454,9 @@ class EvalConfig:
     # torchaudio.load + resample per item) while the GPU is busy on the
     # current one; at 0 that work is serialized with the forward passes on the
     # main thread, which shows up as a CPU stall between every batch.
+    # PER RANK: a 4-GPU run spawns 4 x num_workers loader processes, so this
+    # is the knob to turn down first if the box runs out of CPU or shared
+    # memory.
     num_workers: int = 4
 
     # Where the confusion-matrix and robustness-curve PNGs (see plotting.py)
