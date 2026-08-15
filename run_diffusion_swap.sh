@@ -106,9 +106,16 @@ PYTHONPATH=src "${launcher[@]}" -m audioseal_robust.train \
   "${shared_args[@]}" \
   "$@"
 
-last_ckpt=$(ls -t "$CHECKPOINT_DIR"/generator_epoch*.pth 2>/dev/null | head -1)
+# train.py writes checkpoints into a per-run timestamped subdirectory of
+# checkpoint_dir (so consecutive runs cannot overwrite each other's
+# generator_epochN.pth), so a flat glob of $CHECKPOINT_DIR finds nothing and
+# the run exits here having trained for hours and evaluated nothing. `find`
+# rather than a `*/` glob so this still works for checkpoints written directly
+# into $CHECKPOINT_DIR by an older train.py.
+last_ckpt=$(find "$CHECKPOINT_DIR" -name 'generator_epoch*.pth' -printf '%T@ %p\n' 2>/dev/null \
+  | sort -rn | head -1 | cut -d' ' -f2-)
 if [ -z "$last_ckpt" ]; then
-  echo "No checkpoint found in $CHECKPOINT_DIR after training -- something went wrong" >&2
+  echo "No checkpoint found under $CHECKPOINT_DIR after training -- something went wrong" >&2
   exit 1
 fi
 
