@@ -410,18 +410,25 @@ def eval_step(
     batch: torch.Tensor,
     cfg: TrainConfig,
     device: torch.device,
+    attack_name: tp.Optional[str] = None,
 ) -> tp.Dict[str, tp.Union[float, str]]:
-    """Same forward computation as train_step (same loss formula, same
-    sampled-attack call), just no backward/optimizer step -- for periodic
-    train-vs-eval loss comparison during training (see TrainConfig.eval_every
-    and DataConfig.valid_dir)."""
+    """Same forward computation as train_step (same loss formula), just no
+    backward/optimizer step -- for periodic train-vs-eval comparison during
+    training (see TrainConfig.eval_every and DataConfig.valid_dir).
+
+    `attack_name` pins the attack branch. The caller passes one explicitly and
+    sweeps every branch, because a randomly sampled branch makes these numbers
+    incomparable between eval points: each would measure a different task, and
+    the resulting curve alternates between the branches' very different loss
+    scales -- which reads as instability or regression rather than the
+    branch-switching it actually is. See SampledReconstructionAttack.forward."""
     generator.eval()
     try:
         x = batch.to(device)
         message = random_message(cfg.nbits, x.size(0), device=x.device)
         with _autocast(device):
             x_wm = embed_watermark(generator, x, message, cfg.watermark_snr_db_min, cfg.watermark_snr_db_max)
-            x_att, attack_name = attack(x_wm)
+            x_att, sampled_name = attack(x_wm, name=attack_name)
             presence, m_hat = detector.forward(x_att)
             p = presence[:, 1, :].mean(dim=-1)
             det_loss, presence_loss, bit_loss = detection_loss_components(p, m_hat, message, bit_weight=cfg.lambda_bit)
@@ -437,7 +444,7 @@ def eval_step(
         "bit_loss": bit_loss.item(),
         "perceptual_loss": perc_loss.item(),
         "presence_prob": p.mean().item(),
-        "attack": attack_name,
+        "attack": sampled_name,
     }
 
 
@@ -528,15 +535,28 @@ def train(cfg: TrainConfig) -> None:
                 progress.update(1)
                 progress.set_postfix(loss=f"{metrics['loss']:.4f}", attack=metrics["attack"])
                 if valid_iter is not None and step % cfg.eval_every == 0:
-                    eval_metrics = eval_step(
-                        generator, detector, attack, perceptual_loss_fn, next(valid_iter), cfg, device
-                    )
+                    # Every branch, on the SAME batch, keyed by branch name.
+                    # One batch for all of them so a difference between
+                    # branches is attributable to the branch and not to the
+                    # data; explicit names so each series is comparable across
+                    # eval points (see eval_step's docstring).
+                    eval_batch = next(valid_iter)
+                    eval_by_branch = {
+                        name: eval_step(
+                            generator, detector, attack, perceptual_loss_fn,
+                            eval_batch, cfg, device, attack_name=name,
+                        )
+                        for name in attack.branch_names
+                    }
                     eval_scalar_metrics = {
-                        f"eval/{k}": v for k, v in eval_metrics.items() if isinstance(v, (int, float))
+                        f"eval/{name}/{k}": v
+                        for name, eval_metrics in eval_by_branch.items()
+                        for k, v in eval_metrics.items()
+                        if isinstance(v, (int, float))
                     }
                     tracker.log(eval_scalar_metrics, step=step)
                     if step % cfg.log_every == 0:
-                        logger.info("epoch=%d step=%d eval=%s", epoch, step, eval_metrics)
+                        logger.info("epoch=%d step=%d eval=%s", epoch, step, eval_by_branch)
                 if cfg.tracking.log_audio_every and step % cfg.tracking.log_audio_every == 0:
                     with torch.no_grad():
                         sample_x = batch[:1].to(device)
