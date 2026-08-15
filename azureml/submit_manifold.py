@@ -28,6 +28,7 @@ staged through a temp dir without silently changing which tree gets uploaded.
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -80,7 +81,14 @@ def main() -> None:
     print(f"resolved {PLACEHOLDER} -> subscription ...{subscription[-6:]}", file=sys.stderr)
 
     target = [] if any(a in passthrough for a in ("--resource-group", "-g")) else DEFAULT_TARGET
-    cmd = ["az", "ml", "job", "create", "-f", str(resolved), *target, *passthrough]
+    # shutil.which, not a bare "az": on Windows the CLI is az.cmd, and
+    # CreateProcess does no PATHEXT resolution, so subprocess would raise
+    # FileNotFoundError for a perfectly installed CLI. Same reason as
+    # aml_submit.py:_az().
+    az = shutil.which("az") or shutil.which("az.cmd")
+    if not az:
+        die("`az` is not on PATH; install the Azure CLI and `az extension add -n ml`.")
+    cmd = [az, "ml", "job", "create", "-f", str(resolved), *target, *passthrough]
 
     try:
         if dry_run:
