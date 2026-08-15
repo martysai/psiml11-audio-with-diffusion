@@ -4,14 +4,18 @@
 #
 # This file covers the identity and sgmse attacks. The two held-out
 # diffusion attacks each need their own extra file on top of this one:
-#   requirements-diff-erase.txt  -- diff_erase (AudioLDM)
+#   requirements-audioldm.txt    -- audioldm (AudioLDM latent diffusion)
 #   requirements-mbd.txt         -- mbd (MultiBand Diffusion)
 
 torchaudio>=2.1.0
 soundfile               # data.py's WavDirDataset: avoids torchaudio.load's torchcodec/FFmpeg
                         # requirement (recent torchaudio routes .load() through torchcodec
                         # unconditionally, which needs a system FFmpeg install)
-mlflow>=2.0.0          # default experiment tracking backend (local, no account needed)
+mlflow>=2.0.0          # default experiment tracking backend (local, no account needed).
+                        # Left open on purpose for local use. Inside AzureML it is capped
+                        # to <=3.13.0 (azureml/docker/Dockerfile constraints) because the
+                        # azureml-mlflow plugin -- which supplies the azureml:// URI scheme
+                        # that AML injects -- supports no higher.
 wandb                  # optional alternative backend: set tracking.backend=wandb
 torchmetrics            # evaluate.py: SI-SNR, PESQ (see metrics.py)
 pesq                    # backing library for torchmetrics' PESQ wrapper
@@ -39,7 +43,15 @@ librosa               # sgmse/util/other.py, data_module.py
 scipy                 # sgmse/sampling, sdes.py
 pytorch_lightning     # sgmse/model.py: ScoreModel is a LightningModule
 
-# DiffEraseAttack (the diff_erase held-out attack) needs src/audioldm_train/
+# NCSNpp backbone (sgmse/backbones/ncsnpp.py) JIT-compiles a CUDA extension
+# (upfirdn2d) via torch.utils.cpp_extension.load the moment
+# torch.cuda.is_available() is true -- unconditionally, not just the first
+# time it's needed -- and that raises "Ninja is required to load C++
+# extensions" without this installed. Only the CPU fallback path
+# (upfirdn2d_native) skips it, which is not the path device=cuda takes.
+ninja
+
+# AudioLDMAttack (the audioldm attack) needs src/audioldm_train/
 # (vendored, see that directory's VENDORED.md) -- its dependencies are listed
 # separately in requirements-diff-erase.txt, since they're a much heavier,
 # diffusion-model-specific stack that the rest of this project doesn't need.

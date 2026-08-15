@@ -11,7 +11,7 @@ just printed/logged as numbers:
     (TP/FN/FP/TN, see metrics.confusion_counts) per attack, with its F1 in
     the title.
   - `plot_robustness_curve`: detection (TPR@FPR) vs. attack strength t*, one
-    line per strength-aware attack (sgmse, diff_erase).
+    line per strength-aware attack (sgmse, audioldm).
 
 Both import matplotlib lazily so evaluate.py stays importable without it if
 you only need the numeric results. Return None (and log nothing) if there's
@@ -67,7 +67,7 @@ def plot_robustness_curve(results: tp.Dict[str, tp.Any], out_path: Path) -> tp.O
         name: r["robustness_curve"] for name, r in results.get("attacks", {}).items() if r.get("robustness_curve")
     }
     if not curves:
-        logger.info("no attack produced a robustness curve yet (sgmse/diff_erase still stubs?), nothing to plot")
+        logger.info("no attack produced a robustness curve yet (sgmse/audioldm still stubs?), nothing to plot")
         return None
 
     import matplotlib.pyplot as plt
@@ -82,6 +82,47 @@ def plot_robustness_curve(results: tp.Dict[str, tp.Any], out_path: Path) -> tp.O
     ax.set_ylabel("TPR@FPR")
     ax.set_ylim(-0.05, 1.05)
     ax.set_title(f"Detection vs. attack strength -- {results.get('label')}")
+    ax.legend()
+    fig.tight_layout()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path)
+    plt.close(fig)
+    return out_path
+
+
+def plot_roc_curves(results: tp.Dict[str, tp.Any], out_path: Path) -> tp.Optional[Path]:
+    """Plot ROC curves (TPR vs FPR) for attacks that produced score pools.
+
+    Expects each attack to have `roc_curve` with `fpr` and `tpr` lists and
+    optionally `roc_auc` scalar in its metrics.
+    """
+    curves = {}
+    for name, r in results.get("attacks", {}).items():
+        rc = r.get("roc_curve")
+        if rc and rc.get("fpr") and rc.get("tpr"):
+            curves[name] = {"fpr": rc["fpr"], "tpr": rc["tpr"], "auc": r.get("roc_auc")}
+
+    if not curves:
+        logger.info("no ROC data available to plot yet, nothing to plot")
+        return None
+
+    import matplotlib.pyplot as plt
+
+    fig, ax = plt.subplots(figsize=(6, 6))
+    for name, rc in curves.items():
+        fpr = rc["fpr"]
+        tpr = rc["tpr"]
+        label = name
+        if rc.get("auc") is not None:
+            label = f"{name} (AUC={rc['auc']:.3f})"
+        ax.plot(fpr, tpr, label=label)
+
+    ax.plot([0, 1], [0, 1], linestyle="--", color="gray")
+    ax.set_xlabel("FPR")
+    ax.set_ylabel("TPR")
+    ax.set_xlim(-0.01, 1.01)
+    ax.set_ylim(-0.01, 1.01)
+    ax.set_title(f"ROC curves -- {results.get('label')}")
     ax.legend()
     fig.tight_layout()
     out_path.parent.mkdir(parents=True, exist_ok=True)

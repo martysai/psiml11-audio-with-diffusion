@@ -7,12 +7,12 @@
 # After fine-tuning with a train-time recipe (see config/recipes.yaml), pair
 # it with the matching eval recipe so the report/held-out labeling matches
 # which attack was actually trained against:
-#   python -m audioseal_robust.evaluate recipe=after_diff_erase_training eval_dir=... label=finetuned_diff_erase \
+#   python -m audioseal_robust.evaluate recipe=after_audioldm_training eval_dir=... label=finetuned_audioldm \
 #       generator_checkpoint=./checkpoints/audioseal_robust/generator_epochN.pth \
-#       attack.diff_erase.checkpoint=... attack.diff_erase.config=... attack.sgmse.checkpoint=...
+#       attack.audioldm.checkpoint=... attack.audioldm.config=... attack.sgmse.checkpoint=...
 #   python -m audioseal_robust.evaluate recipe=after_sgmse_training eval_dir=... label=finetuned_sgmse \
 #       generator_checkpoint=./checkpoints/audioseal_robust/generator_epochN.pth \
-#       attack.sgmse.checkpoint=... attack.diff_erase.checkpoint=... attack.diff_erase.config=...
+#       attack.sgmse.checkpoint=... attack.audioldm.checkpoint=... attack.audioldm.config=...
 
 sample_rate: 16000
 nbits: 16
@@ -41,25 +41,34 @@ n_curve_batches: 6
 # forward passes on the main thread (a CPU stall between every batch).
 num_workers: 4
 output_dir: ./eval_outputs
+save_row_artifacts: false
 
 # See EvalConfig.t_star_grid in config.py for how these were calibrated
 # (mentor's curriculum table: t*=0.3..40 out of T=1000, NOT [0,1] fractions
 # of full strength -- the old [0.0 .. 1.0] grid went ~25x past their "hard
 # regime" and just destroys the audio).
 fpr_target: 0.01
+# NOTE: an FPR of f can only be resolved with at least 1/f negative
+# examples (batch_size * n_eval_batches of them, since every eval batch
+# contributes one negative per example). Below that the threshold search
+# degenerates to "just above the highest negative score" and the reported
+# tpr_at_fpr is a high-variance lower bound -- so fpr_target=0.01 needs
+# >= 100 negatives to be meaningful at all, and ~1000 to be stable.
+# evaluate.py reports this as fpr_support and warns when it isn't met;
+# it does NOT silently relax the target.
 t_star_grid: [0.0, 0.0003, 0.002, 0.006, 0.015, 0.04, 0.08]
-# The one t* the headline number is measured at for sgmse/diff_erase (the
+# The one t* the headline number is measured at for sgmse/audioldm (the
 # other attacks ignore strength). 0.04 = t*=40 = the mentor table's "hard
 # regime". NOT optional: leaving it unset makes each attack draw its own
-# random t* per forward call, which is both ~12x slower on diff_erase and
+# random t* per forward call, which is both ~12x slower on audioldm and
 # gives positives/negatives different strengths. See
 # EvalConfig.headline_strength in config.py.
 headline_strength: 0.04
 
 # Fallback used only when no `recipe=...` is given (see recipes.yaml's
-# after_diff_erase_training/after_sgmse_training, which override both of
+# after_audioldm_training/after_sgmse_training, which override both of
 # these together to match whichever attack was actually trained against).
-eval_attacks: [identity, bigvgan, dac, diff_erase]
+eval_attacks: [identity, bigvgan, dac, audioldm]
 held_out_attacks: [sgmse, mbd]
 
 compute_pesq: true
@@ -75,8 +84,8 @@ stock_baseline: false
 
 # Per-attack checkpoints -- None/null keeps that attack a stub (see
 # attacks.py). Override on the CLI, e.g.:
-#   attack.diff_erase.checkpoint=/path/to/Differase/DiffErase-latent/data/checkpoints/foo.ckpt \
-#   attack.diff_erase.config=/path/to/Differase/DiffErase-latent/audioldm_train/config/2023_08_23_reproduce_audioldm/audioldm_original.yaml
+#   attack.audioldm.checkpoint=/path/to/audioldm_root/data/checkpoints/audioldm-s-full \
+#   attack.audioldm.config=src/audioldm_train/config/2023_08_23_reproduce_audioldm/audioldm_original.yaml
 attack:
   bigvgan:
     checkpoint: null
@@ -93,7 +102,7 @@ attack:
     # sgmse number quoted from this default; bump it back up if it doesn't.
     checkpoint: null
     num_steps: 10
-  diff_erase:
+  audioldm:
     checkpoint: null
     config: null
     strength_max: 0.08
@@ -102,6 +111,87 @@ attack:
   mbd:
     checkpoint: null
     bandwidth: 3.0
+  # AudioMarkBench's HopSkipJumpAttack (hard-label black-box evasion against
+  # the detector itself, not a resynthesis attack) -- see
+  # HopSkipJumpAttackConfig in config.py and attacks.py:HopSkipJumpAttack.
+  # Needs no local weights either (checkpoint is just the same enable gate
+  # as mbd's above), but costs hundreds of detector forward passes PER
+  # WAVEFORM, far more than every other attack here -- off by default.
+  # Enable with attack.hopskipjump.checkpoint=auto and add "hopskipjump" to
+  # eval_attacks/held_out_attacks, e.g.:
+  #   python -m audioseal_robust.evaluate eval_dir=... label=baseline \
+  #       eval_attacks=[identity] held_out_attacks=[hopskipjump] \
+  #       attack.hopskipjump.checkpoint=auto batch_size=2 n_eval_batches=4
+  hopskipjump:
+    checkpoint: null
+    num_iterations: 20
+    init_num_evals: 20
+    max_num_evals: 100
+    # Initialize the search from real opposite-class audio rather than
+    # uniform noise (see HopSkipJumpAttackConfig.init_from_reference).
+    # Examples the search still can't initialize on are reported as
+    # attack_failure_rate + tpr_at_fpr_attacked instead of counting as
+    # watermark robustness.
+    init_from_reference: true
+
+  # ---------------------------------------------------------------------
+  # Fixed-budget attacks (AudioMarkBench's white-box adversarial + "common
+  # perturbation" families). None of these needs a `checkpoint` enable gate:
+  # they load no external weights, and none is expensive enough to have to
+  # be opted into. Just name them in eval_attacks/held_out_attacks, e.g.:
+  #   python -m audioseal_robust.evaluate eval_dir=... label=baseline \
+  #       eval_attacks=[identity,gaussian_noise,lowpass,quantization] \
+  #       held_out_attacks=[pgd,speed,codec_mp3]
+  #
+  # WHY THIS GROUP EXISTS ALONGSIDE hopskipjump: HSJ is a *minimum-norm*
+  # attack -- it searches for the smallest perturbation that flips the
+  # decision, so by construction its output lands ON the decision boundary
+  # and every example scores at presence ~= 0.5 whichever class it started
+  # from. Measured over 800 held-out examples: 99.4% of scores within +-0.01
+  # of 0.5, class means 0.4998 vs 0.5009. ROC-AUC on that is decided in the
+  # 4th decimal and is not interpretable; only the attack's COST
+  # (attack_sisnr, query budget) is. The attacks below instead cap the
+  # perturbation in advance and let the score land where it lands, so the
+  # distribution keeps its spread and ROC-AUC / TPR@FPR mean something.
+  # Sweep each attack's own budget field for a robustness curve (they are
+  # not commensurable, so they deliberately do NOT share the t_star_grid).
+  # ---------------------------------------------------------------------
+  pgd:
+    # L-infinity budget on the [-1, 1] waveform. Sweep e.g.
+    # 0.0005 / 0.001 / 0.002 / 0.005 / 0.01.
+    epsilon: 0.002
+    num_steps: 20
+    step_size: null  # null -> 2.5 * epsilon / num_steps (Madry et al.)
+  gaussian_noise:
+    # dB SNR of the added noise; lower = stronger. Sweep 40/30/20/10/5.
+    snr_db: 20.0
+  lowpass:
+    sample_rate: 16000
+    # Hz. 4000 discards the whole upper half of the 16 kHz band while
+    # leaving speech intelligible. Sweep 8000/6000/4000/3000/2000.
+    cutoff_hz: 4000.0
+  speed:
+    sample_rate: 16000
+    # Playback rate multiplier. NOTE: attack_sisnr is a misalignment
+    # measure for this attack and is not comparable with the others'
+    # (see attacks.py:SpeedAttack). Sweep 0.9/0.95/1.05/1.1.
+    factor: 1.05
+  quantization:
+    # Bits per sample over full-scale. Sweep 12/10/8/6/4.
+    bits: 8
+  # MP3/Opus round-trip via the `ffmpeg` binary. Present in this project's
+  # AzureML image (azureml/docker/Dockerfile) but usually NOT in a local
+  # conda env -- where it is missing the attack is reported as "skipped"
+  # rather than failing the run. Same attack_sisnr caveat as speed (codec
+  # delay shifts the signal).
+  codec_mp3:
+    sample_rate: 16000
+    codec: mp3
+    bitrate_kbps: 64
+  codec_opus:
+    sample_rate: 16000
+    codec: opus
+    bitrate_kbps: 32
 
 tracking:
   backend: wandb

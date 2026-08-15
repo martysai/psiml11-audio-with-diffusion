@@ -42,6 +42,19 @@ the collapse and actually converge too.
 Usage:
     python -m audioseal_robust.sanity_check
     python -m audioseal_robust.sanity_check --device cuda --steps 500 --pretrained
+
+    # same check across all 4 GPUs -- this is the one to run first on new
+    # hardware, since the steps/sec it prints is the number that decides
+    # whether the DDP switch actually bought anything:
+    torchrun --standalone --nproc_per_node=4 -m audioseal_robust.sanity_check --pretrained
+
+Under torchrun this reports BOTH the per-rank steps/sec and the effective
+throughput (examples/sec across the world). Per-rank steps/sec is expected to
+drop slightly versus a single GPU -- that difference is the gradient
+allreduce, and on a model this small over NVLink it should be small. If
+per-rank steps/sec falls by ~4x, the ranks are not actually running in
+parallel (usually every process landing on cuda:0, which `--device cuda`
+without LOCAL_RANK pinning used to cause -- see device.resolve_device).
 """
 
 import argparse
@@ -51,10 +64,20 @@ import time
 import torch
 
 from .attacks import IdentityAttack, SampledReconstructionAttack
-from .device import resolve_device
+from .distributed import (
+    DistEnv,
+    all_reduce_mean,
+    attack_sampling_rng,
+    cleanup_distributed,
+    configure_logging,
+    init_distributed,
+    seed_everything,
+    wrap_ddp,
+)
 from .losses import PsychoacousticMelLoss, detection_loss
 from .model_init import build_untrained_detector, build_untrained_generator
-from .tracking import build_tracker
+from .tracking import NullTracker, build_tracker
+from .train import WatermarkEmbedder
 
 logger = logging.getLogger(__name__)
 
@@ -86,10 +109,10 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
-    logging.basicConfig(level=logging.INFO)
+    configure_logging()
     args = parse_args()
 
-    device = resolve_device(args.device)
+    env, device = init_distributed(args.device)
     logger.info("resolved device: %s", device)
 
     if args.pretrained:
@@ -106,13 +129,25 @@ def main() -> None:
     for p in detector.parameters():
         p.requires_grad_(False)
 
-    attack = SampledReconstructionAttack({"identity": IdentityAttack()}, {"identity": 1.0}).to(device)
+    attack = SampledReconstructionAttack(
+        {"identity": IdentityAttack()}, {"identity": 1.0}, rng=attack_sampling_rng(0)
+    ).to(device)
     perceptual_loss_fn = PsychoacousticMelLoss(sample_rate=16_000).to(device)
     optimizer = torch.optim.Adam(generator.parameters(), lr=args.lr, betas=(0.5, 0.9))
+    # Same wiring as train.py: DDP has to wrap something whose forward() is
+    # the call this loop makes, and get_watermark isn't it. Measuring
+    # throughput without this would measure 4 independent single-GPU runs and
+    # miss the allreduce entirely -- i.e. exactly the cost we want to see.
+    embedder = wrap_ddp(WatermarkEmbedder(generator), env, device)
 
-    tracker = build_tracker(args.tracking_backend, args.tracking_project, config=vars(args))
+    tracker = build_tracker(args.tracking_backend, args.tracking_project, config=vars(args)) \
+        if env.is_main else NullTracker()
 
-    torch.manual_seed(0)
+    # Deliberately NOT rank-dependent here (unlike train.py's seed_everything):
+    # this test overfits one fixed batch, and the whole point is that every
+    # rank drives the same batch so the averaged gradient is the same
+    # direction and the loss curve stays interpretable.
+    seed_everything(0, DistEnv())
     n_samples = int(args.seconds * 16_000)
     x = torch.randn(args.batch_size, 1, n_samples, device=device)
     message = torch.randint(0, 2, (args.batch_size, args.nbits), device=device)
@@ -123,7 +158,7 @@ def main() -> None:
     t0 = time.time()
 
     for step in range(args.steps):
-        watermark = generator.get_watermark(x, message=message)
+        watermark = embedder(x, message)
         x_wm = x + watermark
         x_att, _ = attack(x_wm)
         presence, m_hat = detector.forward(x_att)
@@ -137,21 +172,23 @@ def main() -> None:
         total_loss.backward()
         optimizer.step()
 
-        loss_value = total_loss.item()
-        losses.append(loss_value)
-        tracker.log(
+        step_metrics = all_reduce_mean(
             {
-                "loss": loss_value,
+                "loss": total_loss.item(),
                 "detection_loss": det_loss.item(),
                 "perceptual_loss": perc_loss.item(),
                 "presence_prob": p.mean().item(),
             },
-            step=step,
+            env,
+            device,
         )
-        if step % 20 == 0:
+        losses.append(step_metrics["loss"])
+        tracker.log(step_metrics, step=step)
+        if env.is_main and step % 20 == 0:
             logger.info(
                 "step=%d loss=%.4f det=%.4f perc=%.4f presence_prob=%.3f",
-                step, loss_value, det_loss.item(), perc_loss.item(), p.mean().item(),
+                step, step_metrics["loss"], step_metrics["detection_loss"],
+                step_metrics["perceptual_loss"], step_metrics["presence_prob"],
             )
 
     if device.type == "cuda":
@@ -166,14 +203,23 @@ def main() -> None:
 
     passed = end_loss < start_loss * args.pass_threshold
 
-    print("\n=== Sanity check summary ===")
-    print(f"device:              {device}")
-    print(f"steps:                {args.steps}  batch_size: {args.batch_size}  segment: {args.seconds}s")
-    print(f"start loss (first {k} steps avg): {start_loss:.4f}")
-    print(f"end loss   (last {k} steps avg):  {end_loss:.4f}")
-    print(f"wall time:            {elapsed:.1f}s  ({steps_per_sec:.2f} steps/sec)")
-    print(f"result:               {'PASS' if passed else 'FAIL'} (need end_loss < {args.pass_threshold} * start_loss)")
+    if env.is_main:
+        print("\n=== Sanity check summary ===")
+        print(f"device:              {device}")
+        print(f"steps:                {args.steps}  batch_size: {args.batch_size}  segment: {args.seconds}s")
+        if env.is_distributed:
+            print(f"world size:           {env.world_size} (effective batch {args.batch_size * env.world_size})")
+        print(f"start loss (first {k} steps avg): {start_loss:.4f}")
+        print(f"end loss   (last {k} steps avg):  {end_loss:.4f}")
+        print(f"wall time:            {elapsed:.1f}s  ({steps_per_sec:.2f} steps/sec)")
+        if env.is_distributed:
+            print(
+                f"throughput:           {steps_per_sec * args.batch_size * env.world_size:.1f} examples/sec "
+                f"across {env.world_size} GPUs"
+            )
+        print(f"result:               {'PASS' if passed else 'FAIL'} (need end_loss < {args.pass_threshold} * start_loss)")
 
+    cleanup_distributed(env)
     raise SystemExit(0 if passed else 1)
 
 

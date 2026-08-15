@@ -1,0 +1,44 @@
+$schema: https://azuremlschemas.azureedge.net/latest/data.schema.json
+
+# az ml data create -f azureml/assets/librispeech_train_fixed.yaml \
+#   --path <local>/extracted \
+#   --resource-group gpu-resource-group --workspace-name as-managed-cluster-w3-ws
+#
+# Fixed-duration training audio: every file is EXACTLY 10.24s, which is
+# AudioLDMAttack's native window (`duration` in audioldm_original.yaml).
+#
+# Why that matters, and why this asset exists separately from librispeech-asr:
+# the attack consumes a fixed 10.24s window, so anything shorter has to be
+# extended. Zero-padding it is catastrophic -- the mel goes through
+# log(clamp(m, min=1e-5)), so silence becomes a constant -11.51 plateau, and at
+# the 2.0s segments training used that pinned 80.5% of the spectrogram at the
+# floor, far outside the pretrained VAE/UNet's distribution. Measured
+# consequence: AudioLDM scored attack_sisnr = -50 dB against -8.8 dB for MBD,
+# an unpadded diffusion resynthesis -- i.e. it was replacing the audio with
+# noise rather than attacking the watermark.
+#
+# With this asset and data.segment_duration=10.24, data.py's random crop is a
+# no-op (n == segment_samples), the attack's tile/pad branch is never reached,
+# and the model sees real contiguous speech end to end.
+#
+# Verified on the 22,978 files before upload: sample rate 16000 throughout,
+# min = p50 = p90 = max = 10.2400s, 0 files below 10.24s, 65.36 hours total.
+# The threshold is 10.24s and NOT 10.0s on purpose: a 10.1s file is "longer
+# than 10 seconds" but still short of the window, and data.py would loop it.
+type: uri_folder
+name: librispeech-train-fixed-10s
+version: "1"
+description: >-
+  LibriSpeech train-clean-100 filtered and cropped to exactly 10.24s per
+  utterance (22,978 files, 65.36 h, 16 kHz .flac), so AudioLDMAttack's
+  10.24s window is filled with real audio and never zero-padded. Flat
+  layout under train-clean-100-fixed/; read by data.py:WavDirDataset via
+  rglob, which does not care about nesting.
+tags:
+  derived_from: librispeech-asr:1
+  segment_duration: "10.24"
+  sample_rate: "16000"
+  files: "22978"
+  hours: "65.36"
+  splits: train-clean-100-fixed
+path: azureml://datastores/workspaceblobstore/paths/psiml-assets/librispeech-train-fixed-10s

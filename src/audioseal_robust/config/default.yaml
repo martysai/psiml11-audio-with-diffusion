@@ -5,8 +5,8 @@
 # To train against a specific diffusion attack, pick a named recipe (see
 # config/recipes.yaml -- sets attack.weights.* for you) and supply that
 # attack's checkpoint(s):
-#   python -m audioseal_robust.train recipe=diff_erase data.train_dir=/path/to/wavs \
-#       attack.diff_erase.checkpoint=/path/to/checkpoint.ckpt attack.diff_erase.config=/path/to/config.yaml
+#   python -m audioseal_robust.train recipe=audioldm data.train_dir=/path/to/wavs \
+#       attack.audioldm.checkpoint=/path/to/checkpoint.ckpt attack.audioldm.config=/path/to/config.yaml
 #   python -m audioseal_robust.train recipe=sgmse data.train_dir=/path/to/wavs \
 #       attack.sgmse.checkpoint=/path/to/checkpoint.ckpt
 
@@ -23,6 +23,7 @@ recipe: null
 
 lambda_det: 1.0
 lambda_perc: 1.0
+lambda_bit: 1.0
 
 # Per-example watermark SNR (dB), sampled uniformly per training step -- see
 # TrainConfig.watermark_snr_db_{min,max} in config.py for how this range was
@@ -42,7 +43,7 @@ attack:
     bigvgan: 0.0
     dac: 0.0
     sgmse: 0.0
-    diff_erase: 0.0
+    audioldm: 0.0
   bigvgan:
     checkpoint: null
   dac:
@@ -50,7 +51,7 @@ attack:
   sgmse:
     checkpoint: null
     num_steps: 30
-  diff_erase:
+  audioldm:
     checkpoint: null
     config: null
     strength_max: 0.08
@@ -68,6 +69,7 @@ optim:
   betas: [0.5, 0.9]
   weight_decay: 0.0
   max_norm: 3.0
+  max_x_wm_grad_norm: 1000.0
 
 data:
   train_dir: ???
@@ -83,3 +85,4 @@ tracking:
   mlflow_tracking_uri: null
   wandb_mode: online
   log_audio_every: 0
+  log_memory: true
