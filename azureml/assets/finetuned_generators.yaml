@@ -1,0 +1,41 @@
+$schema: https://azuremlschemas.azureedge.net/latest/model.schema.json
+
+# az ml model create -f azureml/assets/finetuned_generators.yaml
+#
+# The two fine-tuned AudioSeal *generators* produced by train.py, as opposed to
+# assets/diffusion_checkpoints.yaml's frozen *attack* backbones. ~112 MB total,
+# so unlike that 10.9 GB asset this one uploads straight from a local path --
+# no AzCopy staging step needed.
+#
+#   generator_epoch3.pth   robustness fine-tuning against the SGMSE attack
+#   generator_epoch18.pth  robustness fine-tuning against the AudioLDM attack
+#
+# Both are train.py's own format, torch.save({"model": ..., "xp.cfg": ...}),
+# and both are the SAME architecture (73 tensors, 14,675,873 params). They do
+# NOT share a state_dict key convention: epoch3 was saved by a Python <3.10
+# process and uses the flat ".conv.weight" naming, epoch18 by a Python >=3.10
+# process and uses Moshi-based SEANet's extra ".inner_conv." level.
+# evaluate.py:load_generator_under_test detects and converts either direction,
+# so no renaming is needed here -- see its comment for why inferring the
+# direction from sys.version_info instead would be wrong.
+#
+# Mounted read-only by the eval jobs; nothing writes here.
+type: custom_model
+name: psiml-finetuned-generators
+version: "1"
+description: >-
+  Fine-tuned AudioSeal generators from the diffusion-swap experiment:
+  generator_epoch3.pth (SGMSE-trained) and generator_epoch18.pth
+  (AudioLDM-trained). Paired with the STOCK AudioSeal detector at eval time --
+  train.py saves only the generator, so no fine-tuned detector exists.
+# Relative to this file. checkpoints/ is gitignored (and, with no .amlignore
+# in the repo, AzureML's snapshot falls back to .gitignore), so staging the
+# .pth files there keeps 112 MB out of every job's code snapshot while still
+# letting `az ml model create` upload them from a path inside the repo.
+# Stage them first:
+#   mkdir -p checkpoints/finetuned_generators
+#   cp <wherever>/generator_epoch{3,18}.pth checkpoints/finetuned_generators/
+path: ../../checkpoints/finetuned_generators
+tags:
+  produced_by: src/audioseal_robust/train.py
+  detector: stock audioseal_detector_16bits

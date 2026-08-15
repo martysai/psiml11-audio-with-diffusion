@@ -91,6 +91,31 @@ def check_audioldm(ckpt: Path) -> None:
     print(f"audioldm OK: {ckpt}  (weights_root={ckpt.parent.parent.parent})")
 
 
+def check_generator(ckpt: Path) -> None:
+    """The .pth under test in an eval-only job.
+
+    Checked by *loading* it rather than just stat-ing the path: these
+    checkpoints come in two mutually incompatible state_dict key conventions
+    (flat ".conv.weight" vs. Moshi SEANet's extra ".inner_conv." level,
+    depending on which Python saved them), and
+    evaluate.py:load_generator_under_test picks the conversion direction from
+    the keys. A convention it can't reconcile raises there -- which is after
+    the image pull and the dataset walk. Ten seconds here instead.
+    """
+    if not ckpt.is_file():
+        fail(f"generator checkpoint not found: {ckpt} (parent has {_children(ckpt.parent)})")
+
+    import torch
+
+    from audioseal_robust.evaluate import load_generator_under_test
+
+    try:
+        load_generator_under_test(str(ckpt), nbits=16, device=torch.device("cpu"))
+    except Exception as exc:
+        fail(f"generator checkpoint {ckpt} did not load: {type(exc).__name__}: {exc}")
+    print(f"generator OK: {ckpt}")
+
+
 def _children(p: Path) -> list[str]:
     try:
         return sorted(c.name for c in p.iterdir())[:20]
@@ -100,17 +125,42 @@ def _children(p: Path) -> list[str]:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--direction", required=True, choices=("audioldm", "sgmse"))
+    # "eval" is not a training direction: it evaluates an already-trained
+    # generator, so it needs neither diffusion backbone (the HopSkipJump and
+    # identity attacks carry no weights) nor the train/valid splits.
+    ap.add_argument("--direction", required=True, choices=("audioldm", "sgmse", "eval"))
     ap.add_argument("--data-root", required=True, type=Path)
-    ap.add_argument("--sgmse-checkpoint", required=True, type=Path)
-    ap.add_argument("--audioldm-checkpoint", required=True, type=Path)
-    ap.add_argument("--audioldm-config", required=True, type=Path)
+    ap.add_argument("--sgmse-checkpoint", type=Path)
+    ap.add_argument("--audioldm-checkpoint", type=Path)
+    ap.add_argument("--audioldm-config", type=Path)
+    ap.add_argument(
+        "--generator",
+        type=Path,
+        help="fine-tuned generator .pth under test (direction=eval); omit for the stock baseline",
+    )
     args = ap.parse_args()
 
     check_cuda()
 
+    if args.direction == "eval":
+        # Only the held-out split is read, so a missing train-clean-100 must
+        # not fail a job that never opens it.
+        check_audio_split(args.data_root, "test-clean")
+        if args.generator is not None:
+            check_generator(args.generator)
+        print("preflight passed")
+        return
+
     for split in ("train-clean-100", "dev-clean", "test-clean"):
         check_audio_split(args.data_root, split)
+
+    for name, value in (
+        ("--sgmse-checkpoint", args.sgmse_checkpoint),
+        ("--audioldm-checkpoint", args.audioldm_checkpoint),
+        ("--audioldm-config", args.audioldm_config),
+    ):
+        if value is None:
+            fail(f"{name} is required for direction={args.direction}")
 
     if not args.audioldm_config.is_file():
         fail(f"AudioLDM config not found: {args.audioldm_config}")
