@@ -1252,16 +1252,46 @@ class SampledReconstructionAttack(nn.Module):
             module.eval()
         return self
 
+    @property
+    def branch_names(self) -> tp.List[str]:
+        """The attacks that can actually be sampled (weight > 0), in a stable
+        order. Callers that need to evaluate every branch rather than a random
+        one -- e.g. train.py's periodic validation -- iterate this."""
+        return list(self._names)
+
     def forward(
-        self, x_wm: torch.Tensor, strength: tp.Optional[float] = None
+        self,
+        x_wm: torch.Tensor,
+        strength: tp.Optional[float] = None,
+        name: tp.Optional[str] = None,
     ) -> tp.Tuple[torch.Tensor, str]:
         """`strength`: passed through to whichever attack gets sampled (see
         e.g. SGMSEAttack's docstring for what it means there; ignored by
         attacks that don't use it). Leave it None during training -- each
         strength-aware attack should sample its own random t* per call in
         that case, which is what should give robustness across attack
-        strengths rather than at a single fixed one."""
-        name = random.choices(self._names, weights=self._sampling_weights, k=1)[0]
+        strengths rather than at a single fixed one.
+
+        `name` forces a specific branch instead of sampling one. Two reasons
+        it exists, both about measurement rather than training:
+
+          * A sampled branch makes a metric incomparable across the steps it
+            is logged at -- each point measures a different task. With
+            identity and audioldm in one recipe the resulting curve alternates
+            between two populations (loss ~0.8 vs ~5) and looks like
+            instability, or like a regression, depending on which branch each
+            point happened to draw.
+          * Sampling here also consumes from the shared RNG, so evaluating
+            shifts the branch sequence that training itself sees. Passing an
+            explicit name draws nothing.
+
+        A weight-0 attack can still be named explicitly: the name selects a
+        branch directly and bypasses the sampling weights entirely.
+        """
+        if name is None:
+            name = random.choices(self._names, weights=self._sampling_weights, k=1)[0]
+        elif name not in self.attacks:
+            raise KeyError(f"unknown attack {name!r} (have: {sorted(self.attacks)})")
         attack = self.attacks[name]
         # No torch.no_grad() and no .detach() here: see module docstring.
         x_att = attack(x_wm, strength=strength)

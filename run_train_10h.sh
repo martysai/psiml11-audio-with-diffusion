@@ -36,6 +36,14 @@ if [ ! -f "$SGMSE_CHECKPOINT" ]; then
   exit 1
 fi
 
+# default.yaml's batch_size=16 OOMs on a 40GB A100 here: SGMSEAttack.forward
+# (attacks.py) unrolls num_steps=30 reverse-diffusion steps deliberately NOT
+# under torch.no_grad (the attack must stay differentiable for training), so
+# autograd retains all 30 steps' activations at once -- memory scales with
+# num_steps * batch_size, not just weights. Lower this via env var if it
+# still OOMs, or raise it if profiling shows headroom.
+BATCH_SIZE="${BATCH_SIZE:-8}"
+
 # Validation: dev-clean (never in train-clean-100, so eval_step measures
 # something meaningful instead of re-scoring the training set under a
 # different name). 60min target -- see the reasoning this was picked with:
@@ -120,14 +128,22 @@ build_subset "$VALID_SOURCE_DIR" "$VALID_SUBSET_DIR" "$VALID_TARGET_MINUTES"
 # mask or compete with what detection_loss alone is doing. Not a permanent
 # default -- re-enable (drop this override) once detection-side training is
 # actually working, since perceptual quality still matters for the real run.
+# lambda_bit=2.0: presence_loss is the "easy" half of detection_loss (the
+# generator can win it just by embedding *something* detectable, without
+# correctly encoding bits) -- that's why comic-snowball-9's presence_loss
+# dropped fast while bit_loss never moved. Weighting bit_loss 2x pushes
+# optimization toward the actually-hard sub-problem instead of letting it
+# settle for the cheap presence-only win. See TrainConfig.lambda_bit.
 set +e
 PYTHONUNBUFFERED=1 PYTHONPATH=src python3 -m audioseal_robust.train \
   recipe=sgmse_mixed \
   attack.sgmse.checkpoint="$SGMSE_CHECKPOINT" \
   data.train_dir="$TRAIN_SUBSET_DIR" \
   data.valid_dir="$VALID_SUBSET_DIR" \
+  data.batch_size="$BATCH_SIZE" \
   eval_every=100 \
   lambda_perc=0.0 \
+  lambda_bit=2.0 \
   device=auto \
   2>&1 | tee "$LOG"
 STATUS=${PIPESTATUS[0]}

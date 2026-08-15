@@ -11,11 +11,26 @@ if [ -f .env.local ]; then . ./.env.local; fi
 # Everything below is env-var overridable (same convention as
 # run_hopskipjump_eval.sh), defaulting to the training server's /data layout
 # and falling back to this repo's own data/ dir when that mount isn't there.
+# EVAL_DIR: test-clean-fixed, NOT plain test-clean -- see the "10.24s gap"
+# analysis this was built for (build_fixed_duration_eval_set.py). AudioLDM's
+# own expected input is duration=10.24s (audioldm_original.yaml); feeding it
+# our usual 3s segments means AudioLDMAttack zero-pads 7.24s of artificial
+# silence onto every example (70% of what it actually processes) before
+# running the VAE/UNet/vocoder pipeline -- a structurally different input
+# than anything the pretrained checkpoint saw in training, made worse by the
+# UNet's global self-attention (use_spatial_transformer: true) mixing that
+# padding into the real-content region instead of leaving it isolated.
+# test-clean-fixed holds only the ~586 test-clean files that are already
+# >=10.24s, each cropped to exactly that length (deterministic, from the
+# start) -- so AudioLDMAttack never pads at all. Build it on whichever
+# machine runs this script: `python3 build_fixed_duration_eval_set.py
+# /data/datasets/LibriSpeech/test-clean 10.24` (adjust the source path to
+# this server's layout).
 if [ -z "${EVAL_DIR:-}" ]; then
-  if [ -d /data/datasets/LibriSpeech/test-clean ]; then
-    EVAL_DIR=/data/datasets/LibriSpeech/test-clean
+  if [ -d /data/datasets/LibriSpeech/test-clean-fixed ]; then
+    EVAL_DIR=/data/datasets/LibriSpeech/test-clean-fixed
   else
-    EVAL_DIR=data/LibriSpeech/test-clean
+    EVAL_DIR=data/LibriSpeech/test-clean-fixed
   fi
 fi
 if [ ! -d "$EVAL_DIR" ]; then
@@ -31,8 +46,10 @@ fi
 
 DEVICE="${DEVICE:-cuda}"
 LABEL="${LABEL:-full_1h_audioldm}"
-N_EVAL_BATCHES="${N_EVAL_BATCHES:-150}"
+SEGMENT_DURATION="${SEGMENT_DURATION:-10.24}"
+N_EVAL_BATCHES="${N_EVAL_BATCHES:-70}"
 N_CURVE_BATCHES="${N_CURVE_BATCHES:-20}"
+SAVE_ROW_ARTIFACTS="${SAVE_ROW_ARTIFACTS:-true}"
 TRACKING_BACKEND="${TRACKING_BACKEND:-wandb}"
 # wandb_mode=online needs a logged-in account; offline still records the run
 # locally (syncable later with `wandb sync`) and never blocks on a login
@@ -79,8 +96,11 @@ echo "python=${PYTHON_CMD[*]}"
 set +e
 # audioldm only -- no identity/bigvgan/dac/sgmse, no mbd (default
 # held_out_attacks is [sgmse, mbd], override to isolate audioldm).
-# batch_size=8 (default) * n_eval_batches=150 * segment_duration=3.0s (default)
-# = 3600s = 1h of audio for the headline number.
+# batch_size=8 (default) * n_eval_batches=70 * segment_duration=10.24s
+# = 5734s (~1.59h) of audio for the headline number -- n_eval_batches capped
+# at 70 (not the old 150) because test-clean-fixed only has 586 examples;
+# 586/batch_size(8) = 73 full batches available, 70 leaves a little slack
+# rather than exactly maxing it out.
 #
 # NOTE on the label: the attack *method* here is partial-noise +
 # diffusion-regenerate (as described in the DiffErase paper) -- attack.audioldm.checkpoint
@@ -100,14 +120,22 @@ set +e
 # scale with n_eval_batches (see EvalConfig.n_curve_batches), so this only
 # adds a couple minutes total, but roughly 3x's the sample count backing
 # each t_star_grid point -- worth it for a number going in front of mentors.
+#
+# save_row_artifacts=true: writes every example's (x, x_wm, x_att) as .wav
+# plus per-example metrics (bit_accuracy, presence_pos/neg, attack_sisnr) to
+# CSV under output_dir/full_1h_audioldm_audioldm_rows/ -- see evaluate.py's
+# _save_row_artifacts. Lets you actually listen to/inspect individual
+# examples instead of only seeing aggregate numbers.
 PYTHONUNBUFFERED=1 MPLBACKEND=Agg PYTHONPATH=src "${PYTHON_CMD[@]}" -m audioseal_robust.evaluate \
   eval_dir="$EVAL_DIR" \
   label="$LABEL" \
+  segment_duration="$SEGMENT_DURATION" \
   n_eval_batches="$N_EVAL_BATCHES" \
   n_curve_batches="$N_CURVE_BATCHES" \
   device="$DEVICE" \
   eval_attacks=[] \
   held_out_attacks=[audioldm] \
+  save_row_artifacts="$SAVE_ROW_ARTIFACTS" \
   attack.audioldm.checkpoint="$AUDIOLDM_CKPT" \
   attack.audioldm.config=src/audioldm_train/config/2023_08_23_reproduce_audioldm/audioldm_original.yaml \
   tracking.backend="$TRACKING_BACKEND" \
