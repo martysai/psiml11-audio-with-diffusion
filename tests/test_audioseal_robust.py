@@ -43,6 +43,7 @@ from audioseal_robust.attacks import (
     SGMSEAttack,
 )
 from audioseal_robust.config import load_config, load_eval_config
+from audioseal_robust.distributed import DistEnv
 from audioseal_robust.evaluate import (
     build_eval_attacks,
     evaluate_attack,
@@ -134,6 +135,39 @@ def test_prepare_eval_batches_is_seeded():
 
     assert len(first) == 1  # n_eval_batches caps the dataloader
     assert all(torch.equal(a, b) for a, b in zip(first[0], second[0]))
+
+
+def test_prepare_eval_batches_allows_an_idle_ranks_empty_shard():
+    """Fewer global batches than ranks is a supported configuration: the
+    surplus ranks get a zero-size shard from `shard_size` and contribute
+    nothing to the all-gathers (see `_cat_or_empty`). Raising here would kill
+    the job before any rank reached a collective -- i.e. exactly on the setup
+    the idle-rank support exists for."""
+    generator = _tiny_generator(nbits=4).eval()
+    cfg = load_eval_config(["eval_dir=.", "nbits=4", "n_eval_batches=2"])
+    dataloader = [torch.randn(2, 1, 4000), torch.randn(2, 1, 4000)]
+    idle = DistEnv(rank=3, world_size=4)  # shard_size(2, rank 3 of 4) == 0
+
+    assert prepare_eval_batches(generator, dataloader, cfg, torch.device("cpu"), idle) == []
+
+
+def test_prepare_eval_batches_still_rejects_a_starved_nonempty_shard():
+    """A rank that was asked for batches and got none is a real failure (the
+    dataset is too small for this batch_size / GPU count), and must not be
+    quietly turned into an idle rank."""
+    generator = _tiny_generator(nbits=4).eval()
+    cfg = load_eval_config(["eval_dir=.", "nbits=4", "n_eval_batches=2"])
+    busy = DistEnv(rank=0, world_size=2)  # shard_size(2, rank 0 of 2) == 1
+
+    with pytest.raises(RuntimeError, match="no batches"):
+        prepare_eval_batches(generator, [], cfg, torch.device("cpu"), busy)
+
+
+def test_evaluate_perceptual_tolerates_an_empty_shard():
+    """The empty-shard path must reach the all-gathers, not die on a
+    loop-scoped variable that was never bound."""
+    cfg = load_eval_config(["eval_dir=.", "nbits=4", "compute_visqol=true"])
+    assert evaluate_perceptual([], cfg, torch.device("cpu")) == {}
 
 
 def test_evaluate_attack_uses_prepared_batches():

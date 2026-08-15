@@ -1,0 +1,130 @@
+$schema: https://azuremlschemas.azureedge.net/latest/commandJob.schema.json
+
+# az ml job create -f azureml/jobs/train_audioldm_manifold.yaml \
+#   --name "train-audioldm-manifold-$(date +%m%d-%H%M%S)" \
+#   --resource-group manifold3-rg --workspace-name as-manifold3-w3-ws
+#
+# Stage 2 of 2 on Singularity ("manifold"), 4x A100 via DDP. Do not submit this
+# until smoke_audioldm_manifold.yaml has come back Completed -- it is the same
+# code path, so a failure here costs 4 GPUs for however long it takes to notice
+# rather than a few minutes on the smoke.
+#
+# Compliance: no WANDB_API_KEY, deliberately. See smoke_audioldm_manifold.yaml.
+type: command
+
+experiment_name: audioseal-robust-diffusion-swap
+display_name: train-audioldm-manifold-4gpu
+description: >-
+  Full 100h AudioLDM-direction training run on 4x A100 under torchrun/DDP,
+  with SGMSE held out as the unseen attack at evaluation.
+
+code: ../..
+environment: azureml:audioseal-robust-diffusion@latest
+
+compute: /subscriptions/5c9e4789-4852-4ffe-8551-d682affcbd74/resourceGroups/manifold3-rg/providers/Microsoft.MachineLearningServices/virtualclusters/as-manifold3-w3-vc
+
+resources:
+  instance_type: Singularity.NC96ad_A100_v4
+  instance_count: 1
+  shm_size: 64g
+
+queue_settings:
+  # STANDARD ONLY. Never premium -- see smoke_audioldm_manifold.yaml. This is
+  # the long-running job, so the temptation to buy a faster slot is highest
+  # here; do not.
+  job_tier: standard
+
+inputs:
+  librispeech:
+    type: uri_folder
+    path: azureml:librispeech-asr:1
+    mode: download
+  checkpoints:
+    type: uri_folder
+    path: azureml:psiml-diffusion-checkpoints:1
+    mode: ro_mount
+
+outputs:
+  artifacts:
+    type: uri_folder
+    # rw_mount, not upload-on-finish: CHECKPOINT_DIR points straight in here
+    # (azureml/aml_run.sh), so a completed epoch survives a later crash or a
+    # timeout kill. On a run this long that is the difference between losing an
+    # afternoon and losing everything.
+    mode: rw_mount
+
+# ---------------------------------------------------------------------------
+# BUDGET -- estimated, NOT yet measured. Submitted in parallel with the smoke
+# rather than after it, at the user's explicit request, so these numbers are
+# reasoned from the playground plan rather than from observed s/step. Revise
+# once the smoke reports real timings.
+#
+# 10,000 steps (10 x 1000), not the 20,000 the 1-GPU playground spec planned,
+# and that is deliberately the SAME amount of data: this runs batch_size=4 on
+# each of 4 ranks = 16 per step, against the playground spec's 8 on one GPU. So
+# 10,000 steps here cover the same number of samples as 20,000 there. It is a
+# rescale of the existing plan, not a reduction in scope.
+#
+# Sized to finish well inside limits.timeout with room for the evaluation
+# stage, because the failure modes are asymmetric: a run that is killed
+# mid-training yields checkpoints but NO evaluation, and the evaluation is the
+# actual result. An undertrained but fully-evaluated run is far more useful, so
+# the step count errs low. At a pessimistic 4 s/step this is ~11h of training
+# inside a 24h budget; at 2 s/step, ~5.6h.
+#
+# Why the config defaults are not usable: config.py ships epochs=100 x
+# updates_per_epoch=1000, and updates_per_epoch is a per-epoch CAP rather than a
+# target -- the inner loop also breaks when the dataloader is exhausted,
+# whichever comes first. On the full 100h split that is 28,539 files; at
+# batch_size=4 per GPU x 4 ranks = 16 per step with drop_last that is ~1,783
+# steps/epoch, so the cap binds and the run would be a genuine 100,000 steps.
+# Every step backprops through AudioLDM's VAE encoder plus its UNet reverse
+# loop.
+#
+# DDP changes this arithmetic in one direction only: 4 ranks cut the number of
+# steps needed to cover the corpus, they do not make an individual step 4x
+# cheaper.
+#
+# batch_size=4 PER GPU (16 effective), down from 8 on the single-GPU playground
+# spec, because 1x A100 was already OOMing there -- this halves per-GPU
+# activation memory relative to that. Raise it only after reading the smoke's
+# reported peak_reserved_gb, which is now MAX-reduced across ranks.
+#
+# optim.lr is NOT rescaled for the larger effective batch -- see
+# docs/MULTI_GPU.md. If you change the rank count, revisit it deliberately.
+#
+# attack.sgmse.num_steps only affects the held-out attack at eval time.
+# attack.audioldm.strength_max stays at its default 0.08 -- config.py:91-100
+# explains why that ceiling exists (backprop through the full DDPM reverse loop
+# is not memory-tractable), so raising it is how you OOM this job.
+# ---------------------------------------------------------------------------
+command: >-
+  bash azureml/aml_run.sh audioldm
+  --librispeech ${{inputs.librispeech}}
+  --checkpoints ${{inputs.checkpoints}}
+  --artifacts ${{outputs.artifacts}}
+  --
+  epochs=10
+  updates_per_epoch=1000
+  log_every=50
+  eval_every=250
+  data.batch_size=4
+  data.num_workers=8
+  data.segment_duration=2.0
+  attack.sgmse.num_steps=15
+
+environment_variables:
+  PYTHONUNBUFFERED: "1"
+  AZUREML_ARTIFACTS_DEFAULT_TIMEOUT: "1200"
+  # Full eval here, unlike the smoke. These are GLOBAL totals that evaluate.py
+  # splits across ranks with shard_size(), so they must stay >= the GPU count.
+  TORCH_NCCL_ASYNC_ERROR_HANDLING: "1"
+  TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC: "86400"
+  _AZUREML_SINGULARITY_JOB_UAI: /subscriptions/5c9e4789-4852-4ffe-8551-d682affcbd74/resourceGroups/shared-rg/providers/Microsoft.ManagedIdentity/userAssignedIdentities/as-shared-w3-id
+
+limits:
+  # 24h. Generous relative to the ~11h worst-case training estimate above, on
+  # purpose: the margin is what guarantees the evaluation stage actually runs.
+  # A timeout kill is survivable but produces checkpoints with no metrics, and
+  # the metrics are the result.
+  timeout: 86400

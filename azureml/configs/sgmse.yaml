@@ -1,0 +1,55 @@
+# python azureml/aml_submit.py --config azureml/configs/sgmse.yaml
+#
+# Trains against SGMSE, holds AudioLDM + MBD out (recipes.yaml's `sgmse` /
+# `after_sgmse_training` pair). The static equivalent is
+# azureml/jobs/train_sgmse.yaml -- keep the two in sync, or pick one.
+
+# Leave `workspace` commented out to use whatever `az configure --defaults`
+# / config.json already points at. Fill it in to pin the submission to one
+# workspace regardless of local CLI state.
+workspace:
+  subscription_id: 5c9e4789-4852-4ffe-8551-d682affcbd74  # ASG Azure ML
+  resource_group_name: playground-rg
+  workspace_name: as-playground-w3-ws
+
+direction: sgmse
+# STANDARD_NC24ADS_A100_V4 -- 1x A100 80GB. Nothing here is distributed, so
+# the a100x2/a100x4 clusters would just leave GPUs idle.
+compute: a100x1
+environment: azureml:audioseal-robust-diffusion@latest
+
+experiment_name: audioseal-robust-diffusion-swap
+display_name: swap-sgmse
+description: >-
+  Generator-only robustness fine-tuning against the SGMSE attack, then eval
+  with AudioLDM and MBD held out.
+
+inputs:
+  librispeech: azureml:librispeech-asr:1
+  checkpoints: azureml:psiml-diffusion-checkpoints:1
+
+timeout_minutes: 720
+
+# Forwarded verbatim to train.py as `key=value` argv. Anything settable on
+# TrainConfig (src/audioseal_robust/config.py) works here; the merge order is
+# schema <- default.yaml <- recipe <- these.
+#
+# ~600 steps, deliberately. config.py's defaults (epochs=100 x
+# updates_per_epoch=1000) are 100k steps, and every step backprops through
+# num_steps x (predictor + corrector) score-model calls -- far past a day of
+# A100. Scale up after the first green run.
+overrides:
+  epochs: 3
+  updates_per_epoch: 200
+  log_every: 20
+  # Needs data.valid_dir, which aml_run.sh/run_diffusion_swap.sh always set
+  # (train.py:303-305 raises otherwise). Defaults to 0 = validation off.
+  eval_every: 100
+  data.batch_size: 8
+  data.num_workers: 4
+  data.segment_duration: 2.0
+  attack.sgmse.num_steps: 15
+  # Console only for the first run. tracking.py:84-85 does
+  # set_experiment() + start_run(), and AML has already started a run for
+  # this job -- flip to mlflow once you've confirmed those coexist.
+  tracking.backend: none
