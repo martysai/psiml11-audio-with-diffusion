@@ -8,8 +8,8 @@
 
 `clip_grad_norm_` only ever shrinks, so in a mixed-attack recipe it silently
 reweights the branches: the branch whose gradients explode is scaled down on
-every step while the cheap branch passes through untouched. Measured on the
-4x A100 run <redacted-run>, median parameter-gradient norms
+every step while the cheap branch passes through untouched. In a measured
+4-GPU run, median parameter-gradient norms
 were 1.69 (identity, under max_norm=3.0) versus 42.94 (audioldm, over it on
 every step and cut 14.3x), and the audioldm branch did not move in 1550 steps.
 

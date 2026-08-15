@@ -1,6 +1,7 @@
 $schema: https://azuremlschemas.azureedge.net/latest/commandJob.schema.json
 
 # az ml job create -f azureml/jobs/train_sgmse.yaml \
+#   --set compute=azureml:<compute-name> \
 #     --set compute=azureml:<your-a100-cluster>
 #
 # Trains the AudioSeal generator against SGMSE and holds AudioLDM
@@ -18,8 +19,7 @@ description: >-
 # Repo root: this file is two levels down. A few MB, 224 tracked files.
 code: ../..
 environment: azureml:audioseal-robust-diffusion@latest
-# STANDARD_NC24ADS_A100_V4 -- 1x A100 80GB, 24 vCPU. Single-GPU: nothing here
-# is distributed, so gpu-cluster/gpu-cluster would leave GPUs idle.
+# This job is single-device; a multi-GPU compute target would leave GPUs idle.
 compute: azureml:gpu-cluster
 
 inputs:

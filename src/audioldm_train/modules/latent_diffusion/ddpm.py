@@ -2289,8 +2289,10 @@ class LatentDiffusionVAELearnable(LatentDiffusion):
 if __name__ == "__main__":
     import yaml
 
-    model_config = "<user-home><user-home>/projects/general_audio_generation/stable-diffusion/models/ldm/text2img256/config.yaml"
-    model_config = yaml.load(open(model_config, "r"), Loader=yaml.FullLoader)
+    if len(sys.argv) != 2:
+        raise SystemExit(f"usage: {sys.argv[0]} <model-config.yaml>")
+    with open(sys.argv[1], "r") as config_file:
+        model_config = yaml.load(config_file, Loader=yaml.FullLoader)
 
     latent_diffusion = LatentDiffusion(**model_config["model"]["params"])
 

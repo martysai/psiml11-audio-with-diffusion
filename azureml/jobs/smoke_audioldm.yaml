@@ -1,6 +1,7 @@
 $schema: https://azuremlschemas.azureedge.net/latest/commandJob.schema.json
 
-# az ml job create -f azureml/jobs/smoke_audioldm.yaml
+# az ml job create -f azureml/jobs/smoke_audioldm.yaml \
+#   --set compute=azureml:<compute-name>
 #
 # Stage 1 of 2. Same code path, same assets, same compute and the same
 # direction as train_audioldm.yaml -- only the step counts differ. The point
