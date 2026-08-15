@@ -49,6 +49,29 @@ train:
       weights:
         identity: 0.5
         sgmse: 0.5
+  # Same identity/attacked split as sgmse_mixed above, but the attacked half
+  # is now split between BOTH diffusion attacks instead of sgmse alone --
+  # trains against sgmse and audioldm together so robustness doesn't have to
+  # generalize zero-shot from one to the other (sgmse_mixed-trained
+  # checkpoints measured much worse on held-out audioldm eval than on
+  # sgmse itself). identity stays at the same 0.5 anchor as sgmse_mixed, for
+  # the same reason (easy steps to anchor bit accuracy, less exposure to
+  # either attack's own gradient instability) -- not lowered further just
+  # because a second attack was added.
+  # Pairs with data.segment_duration=10.24 at train time (see
+  # run_train_10h_audioldm.sh) -- AudioLDMAttack expects exactly that
+  # duration or it zero-pads (the eval-side "10.24s gap" that
+  # build_fixed_duration_eval_set.py works around). WavDirDataset crops
+  # longer files and tiles/repeats shorter ones to reach whatever
+  # segment_duration it's given (data.py) -- it never zero-pads -- so
+  # setting segment_duration directly sidesteps the same padding problem on
+  # the training side without needing a separate fixed-duration dataset.
+  sgmse_audioldm_mixed:
+    attack:
+      weights:
+        identity: 0.5
+        sgmse: 0.25
+        audioldm: 0.25
 
 eval:
   # Pair with `recipe=audioldm` at train time: reports AudioLDM alongside
@@ -62,3 +85,10 @@ eval:
   after_sgmse_training:
     eval_attacks: [identity, bigvgan, dac, sgmse]
     held_out_attacks: [audioldm, mbd]
+  # Pair with `recipe=sgmse_audioldm_mixed` at train time: both diffusion
+  # attacks were trained against, so both get reported here instead of
+  # either being held out -- only MBD (never trainable, no weight entry at
+  # all) remains a genuine generalization probe for this recipe.
+  after_sgmse_audioldm_training:
+    eval_attacks: [identity, bigvgan, dac, sgmse, audioldm]
+    held_out_attacks: [mbd]
