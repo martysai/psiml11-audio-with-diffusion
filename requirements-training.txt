@@ -11,7 +11,11 @@ torchaudio>=2.1.0
 soundfile               # data.py's WavDirDataset: avoids torchaudio.load's torchcodec/FFmpeg
                         # requirement (recent torchaudio routes .load() through torchcodec
                         # unconditionally, which needs a system FFmpeg install)
-mlflow>=2.0.0          # default experiment tracking backend (local, no account needed)
+mlflow>=2.0.0          # default experiment tracking backend (local, no account needed).
+                        # Left open on purpose for local use. Inside AzureML it is capped
+                        # to <=3.13.0 (azureml/docker/Dockerfile constraints) because the
+                        # azureml-mlflow plugin -- which supplies the azureml:// URI scheme
+                        # that AML injects -- supports no higher.
 wandb                  # optional alternative backend: set tracking.backend=wandb
 torchmetrics            # evaluate.py: SI-SNR, PESQ (see metrics.py)
 pesq                    # backing library for torchmetrics' PESQ wrapper

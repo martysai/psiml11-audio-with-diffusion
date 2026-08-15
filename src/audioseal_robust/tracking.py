@@ -20,8 +20,9 @@ no internet egress, which is why Azure job submissions (no wandb access
 there) pin this backend explicitly. Run `mlflow ui` in that directory to
 browse it.
 
-If the selected backend's package isn't installed, we fall back to a
-console-only tracker rather than crashing the training run.
+If the selected backend cannot be brought up -- not installed, misconfigured,
+unreachable -- we fall back to a console-only tracker rather than crashing the
+training run. See _tracker_or_console() for why that is deliberately broad.
 """
 
 import logging
@@ -68,6 +69,17 @@ class ConsoleTracker(ExperimentTracker):
 
     def log(self, metrics: tp.Dict[str, float], step: int) -> None:
         logger.info("step=%d %s", step, metrics)
+
+
+class NullTracker(ExperimentTracker):
+    """Discards everything. Used on non-zero ranks under DDP: a tracker is a
+    process-external side effect, so letting all 4 ranks build a real one
+    creates 4 runs per training run -- three of them holding metrics from a
+    single shard. Unlike ConsoleTracker this stays silent, since those ranks
+    are sharing rank 0's terminal."""
+
+    def log(self, metrics: tp.Dict[str, float], step: int) -> None:
+        pass
 
 
 class MLflowTracker(ExperimentTracker):
@@ -140,6 +152,90 @@ class WandbTracker(ExperimentTracker):
         self._wandb.finish()
 
 
+class _ResilientTracker(ExperimentTracker):
+    """Delegates to a real tracker, surviving failures that happen *after*
+    construction.
+
+    _tracker_or_console covers the constructor; this covers the calls made
+    during the run. log() fires every step for hours, so an outage in the
+    tracking backend partway through an 11-hour job would otherwise discard
+    everything computed up to that point -- the run dies at hour 6 holding a
+    complete set of checkpoints and no evaluation.
+
+    On the first failure it degrades to ConsoleTracker permanently rather than
+    just swallowing the error, so metrics keep being emitted to the job log
+    instead of silently stopping. That also bounds the noise: one stack trace,
+    not one per step.
+    """
+
+    def __init__(self, inner: ExperimentTracker):
+        self._inner = inner
+
+    def _guard(self, method: str, *args: tp.Any) -> None:
+        try:
+            getattr(self._inner, method)(*args)
+        except Exception:
+            logger.warning(
+                "%s.%s() failed -- degrading to console logging for the rest of the run "
+                "so metrics are not lost. Training is unaffected.",
+                type(self._inner).__name__,
+                method,
+                exc_info=True,
+            )
+            self._inner = ConsoleTracker()
+            getattr(self._inner, method)(*args)
+
+    def log(self, metrics: tp.Dict[str, float], step: int) -> None:
+        self._guard("log", metrics, step)
+
+    def log_audio(self, key: str, wav: torch.Tensor, sample_rate: int, step: int) -> None:
+        self._guard("log_audio", key, wav, sample_rate, step)
+
+    def log_figure(self, path: tp.Any) -> None:
+        self._guard("log_figure", path)
+
+    def finish(self) -> None:
+        self._guard("finish")
+
+
+def _tracker_or_console(
+    backend: str, install_hint: str, factory: tp.Callable[[], ExperimentTracker]
+) -> ExperimentTracker:
+    """Build a tracker, degrading to console logging if it cannot be created.
+
+    The except clause is deliberately broad. A tracker records what a run did;
+    it is not part of what a run *does*. Letting its constructor propagate means
+    a logging problem takes down the training job it was only supposed to be
+    observing -- which is exactly what happened here: a missing mlflow plugin
+    (azureml-mlflow, which registers the `azureml://` URI scheme that AzureML
+    injects into every job) killed two 4x A100 runs at step 0, before a single
+    batch was processed, with 8 GPU-hours of queueing in front of each.
+
+    Failing here costs the run its dashboard. It must not also cost the run its
+    GPUs -- especially since nothing is actually lost: ConsoleTracker puts every
+    metric in the job log, and evaluate.py writes the plots and metric JSON that
+    are the real deliverable to eval_outputs/ regardless of the tracker.
+
+    Unknown-backend stays fatal, in build_tracker: that is a typo in the config
+    rather than a sick dependency, it is free to detect, and silently logging to
+    a console the user did not ask for would just hide it.
+    """
+    try:
+        return _ResilientTracker(factory())
+    except ImportError:
+        logger.warning(
+            "%s is not installed (%s) -- falling back to console logging", backend, install_hint
+        )
+    except Exception:
+        logger.warning(
+            "could not initialise the %s tracker -- falling back to console logging. "
+            "Training continues; metrics go to stdout and eval_outputs/ only.",
+            backend,
+            exc_info=True,
+        )
+    return ConsoleTracker()
+
+
 def build_tracker(
     backend: str,
     project: str,
@@ -154,17 +250,17 @@ def build_tracker(
         return ConsoleTracker()
 
     if backend == "mlflow":
-        try:
-            return MLflowTracker(project, run_name, mlflow_tracking_uri, config)
-        except ImportError:
-            logger.warning("mlflow not installed (`pip install mlflow`), falling back to console logging")
-            return ConsoleTracker()
+        return _tracker_or_console(
+            "mlflow",
+            "pip install mlflow",
+            lambda: MLflowTracker(project, run_name, mlflow_tracking_uri, config),
+        )
 
     if backend == "wandb":
-        try:
-            return WandbTracker(project, run_name, wandb_mode, config)
-        except ImportError:
-            logger.warning("wandb not installed (`pip install wandb`), falling back to console logging")
-            return ConsoleTracker()
+        return _tracker_or_console(
+            "wandb",
+            "pip install wandb",
+            lambda: WandbTracker(project, run_name, wandb_mode, config),
+        )
 
     raise ValueError(f"Unknown tracking backend: {backend!r} (expected 'mlflow', 'wandb', or 'none')")
