@@ -72,8 +72,9 @@ from .metrics import (
     tpr_at_fpr,
     visqol_score,
 )
+from sklearn.metrics import roc_auc_score, roc_curve
 from .model_init import build_untrained_generator
-from .plotting import plot_confusion_matrices, plot_robustness_curve
+from .plotting import plot_confusion_matrices, plot_robustness_curve, plot_roc_curves
 from .train import embed_watermark, random_message
 from .tracking import build_tracker
 
@@ -448,6 +449,17 @@ def evaluate_attack(
 
     positive_cat = torch.cat(positive_scores)
     negative_cat = torch.cat(negative_scores)
+    # Build labels and pooled scores for ROC/AUC computation
+    try:
+        y_pos = torch.ones_like(positive_cat)
+        y_neg = torch.zeros_like(negative_cat)
+        y = torch.cat([y_pos, y_neg]).cpu().numpy()
+        scores = torch.cat([positive_cat, negative_cat]).cpu().numpy()
+        fpr, tpr, thresholds = roc_curve(y, scores)
+        roc_auc = float(roc_auc_score(y, scores))
+    except Exception:
+        # If sklearn isn't available or computation fails, skip ROC
+        fpr, tpr, thresholds, roc_auc = None, None, None, None
     confusion = confusion_counts(positive_cat, negative_cat, cfg.fpr_target)
     metrics = {
         "bit_accuracy": sum(bit_accs) / len(bit_accs),
@@ -455,6 +467,8 @@ def evaluate_attack(
         "confusion": confusion,
         "f1": f1_score(confusion),
         "attack_sisnr": sum(attack_sisnr_values) / len(attack_sisnr_values),
+        "roc_auc": roc_auc,
+        "roc_curve": {"fpr": fpr.tolist() if fpr is not None else None, "tpr": tpr.tolist() if tpr is not None else None},
     }
 
     # Is the negative sample size big enough for `fpr_target` to mean
@@ -759,6 +773,11 @@ def run(cfg: EvalConfig) -> tp.Dict[str, tp.Any]:
             results["robustness_curve_plot"] = str(curve_path)
             tracker.log_figure(curve_path)
             logger.info("robustness curve plot: %s", curve_path)
+        roc_path = plot_roc_curves(results, out_dir / f"{cfg.label}_roc.png")
+        if roc_path is not None:
+            results["roc_plot"] = str(roc_path)
+            tracker.log_figure(roc_path)
+            logger.info("roc plot: %s", roc_path)
         results["total_seconds"] = time.perf_counter() - run_started
         # Persist BEFORE main()'s summary printer runs: that printer has
         # crashed on a missing key before (KeyError 'pesq' under
@@ -884,10 +903,12 @@ def _write_result_files(cfg: EvalConfig, results: tp.Dict[str, tp.Any]) -> None:
         "bit_accuracy", "tpr_at_fpr", "tpr_at_fpr_attacked", "f1", "attack_sisnr",
         "tp", "fn", "fp", "tn",
         "attack_failure_rate", "n_attack_failures",
+        "roc_auc",
         "seconds", "peak_reserved_gb",
     ]
     scalar_keys = (
         "bit_accuracy", "tpr_at_fpr", "tpr_at_fpr_attacked", "f1", "attack_sisnr",
+        "roc_auc",
         "attack_failure_rate", "n_attack_failures", "seconds", "peak_reserved_gb",
     )
     with metrics_path.open("w", newline="", encoding="utf-8") as fh:
