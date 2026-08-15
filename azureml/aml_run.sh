@@ -114,9 +114,32 @@ PYTHONPATH="$REPO_ROOT/src" python3 azureml/preflight.py \
   --audioldm-config "$ALDM_CONFIG"
 
 # --- Wire run_diffusion_swap.sh's env-var contract --------------------------
-export TRAIN_DIR="$DATA_ROOT/train-clean-100"
-export VALID_DIR="$DATA_ROOT/dev-clean"
-export EVAL_DIR="$DATA_ROOT/test-clean"
+# Each split can be overridden. That exists so a run can mix data sources --
+# specifically, training on a fixed-duration corpus (every file exactly
+# 10.24s, so AudioLDMAttack's window is filled with real audio and never
+# padded or tiled) while validation and evaluation stay on the stock
+# dev-clean/test-clean, which keeps every reported number comparable with
+# earlier runs. Unset, these resolve exactly as before.
+export TRAIN_DIR="${TRAIN_DIR_OVERRIDE:-$DATA_ROOT/train-clean-100}"
+export VALID_DIR="${VALID_DIR_OVERRIDE:-$DATA_ROOT/dev-clean}"
+export EVAL_DIR="${EVAL_DIR_OVERRIDE:-$DATA_ROOT/test-clean}"
+
+# preflight.py only sees --data-root, so an override points somewhere it
+# never checked. Validate here instead: a typo or a mount that did not
+# materialise should cost seconds, not the image pull plus model load it
+# would otherwise take to surface as an empty-dataset error.
+for _split in TRAIN_DIR VALID_DIR EVAL_DIR; do
+  eval "_dir=\$$_split"
+  eval "_ovr=\$${_split}_OVERRIDE"
+  [ -n "$_ovr" ] || continue
+  [ -d "$_dir" ] || { echo "preflight: ${_split}_OVERRIDE points at a missing directory: $_dir" >&2; exit 1; }
+  # -print -quit stops at the first hit rather than walking a 20k-file tree.
+  if [ -z "$(find "$_dir" \( -name '*.flac' -o -name '*.wav' \) -print -quit 2>/dev/null)" ]; then
+    echo "preflight: ${_split}_OVERRIDE has no .flac/.wav under it: $_dir" >&2
+    exit 1
+  fi
+  echo "override: $_split -> $_dir"
+done
 export SGMSE_CHECKPOINT="$SGMSE_CKPT"
 export AUDIOLDM_CHECKPOINT="$ALDM_CKPT"
 export AUDIOLDM_CONFIG="$ALDM_CONFIG"
