@@ -530,6 +530,42 @@ def run(cfg: EvalConfig) -> tp.Dict[str, tp.Any]:
 
     all_attack_names = list(cfg.eval_attacks) + list(cfg.held_out_attacks)
     attacks, skipped_at_construction = build_eval_attacks(all_attack_names, device, cfg)
+
+    # Union the skip set across ranks before anyone acts on it.
+    #
+    # build_eval_attacks decides locally, and construction can genuinely fail
+    # on one rank and not another -- a per-rank HF cache miss, a transient
+    # download error, a checkpoint that only some node-local disk has. Whatever
+    # the cause, an asymmetric skip set is fatal rather than merely uneven: the
+    # loop below runs `for name in all_attack_names` and every non-skipped
+    # attack enters evaluate_attack, which is full of collectives
+    # (all_gather_scores/all_gather_values/gather_objects). A rank that skips
+    # an attack the others evaluate simply never reaches those calls, so the
+    # ranks that did block until the NCCL timeout (~30 min) and take the job
+    # down pointing at the wrong line.
+    #
+    # Union, not intersection: a rank that could not build an attack cannot
+    # evaluate it, so the only globally consistent choice is to skip it
+    # everywhere. Each rank keeps its own reason where it has one, and adopts a
+    # peer's otherwise, so the log says why rather than just that.
+    if env.is_distributed:
+        merged: tp.Dict[str, str] = {}
+        for rank, remote in enumerate(gather_objects(skipped_at_construction, env)):
+            for name, reason in tp.cast(tp.Dict[str, str], remote).items():
+                merged.setdefault(name, f"{reason} (first seen on rank {rank})")
+        newly_skipped = set(merged) - set(skipped_at_construction)
+        if newly_skipped and env.is_main:
+            logger.warning(
+                "skipping %s on every rank: another rank could not construct %s",
+                ", ".join(sorted(newly_skipped)),
+                "it" if len(newly_skipped) == 1 else "them",
+            )
+        skipped_at_construction = merged
+        # Drop the local instances too, so nothing downstream can reach for an
+        # attack this rank is contractually skipping.
+        for name in newly_skipped:
+            attacks.pop(name, None)
+
     held_out = set(cfg.held_out_attacks)
 
     # Eval is pure forward passes -- no DDP wrapper needed, no gradients to

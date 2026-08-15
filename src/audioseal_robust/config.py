@@ -169,6 +169,40 @@ class OptimConfig:
     weight_decay: float = 0.0
     max_norm: tp.Optional[float] = 3.0
     max_x_wm_grad_norm: tp.Optional[float] = 1000.0
+    # Rescale the generator's gradient to exactly `max_norm` every step,
+    # instead of only shrinking it when it exceeds `max_norm`.
+    #
+    # This exists because plain clipping silently reweights a mixed-attack
+    # recipe. The branches produce gradients of wildly different scale: on the
+    # 4x A100 run train-audioldm-mixed-0814-155734 (recipe=audioldm_mixed, so
+    # ~50/50 identity vs audioldm), the median parameter-gradient norm was
+    #     identity 1.69   -- under max_norm=3.0, so 26/30 steps passed through
+    #                        untouched
+    #     audioldm 42.94  -- over it on 33/33 steps, scaled down 14.3x
+    # because backprop through the diffusion chain amplifies the gradient ~252x
+    # between x_att and x_wm (identity, a no-op, amplifies 1.0x). Clipping
+    # therefore let identity steps through at full strength while shrinking
+    # every audioldm step, leaving the optimizer on a ~93% identity diet -- a
+    # task the pretrained checkpoint has already solved. Measured effect: over
+    # 1550 steps the audioldm branch did not move at all (presence_prob
+    # 0.0646 -> 0.0648, bit_loss 0.6977 -> 0.6912, both statistically
+    # indistinguishable from flat), while identity drifted slightly.
+    #
+    # Adam does not rescue this. It is scale-invariant to a *uniform* rescale,
+    # but its moment estimates are shared across steps, so a branch that is
+    # consistently scaled down 14x relative to the other contributes
+    # proportionally less to the running direction.
+    #
+    # Normalizing makes every step contribute an update of comparable size
+    # regardless of which branch produced it. It discards gradient magnitude as
+    # a signal -- but clipping already discarded it for 100% of audioldm steps,
+    # so this trades an accidental, branch-dependent reweighting for a
+    # deliberate, uniform one. Off by default: it changes the update rule for
+    # every recipe, and single-attack runs do not have the imbalance it fixes.
+    normalize_grad: bool = False
+    # Below this gradient norm, normalization is skipped rather than amplifying
+    # what is essentially numerical noise up to `max_norm`.
+    normalize_grad_floor: float = 1e-6
 
 
 @dataclass

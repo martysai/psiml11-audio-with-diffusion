@@ -20,18 +20,43 @@ no internet egress, which is why Azure job submissions (no wandb access
 there) pin this backend explicitly. Run `mlflow ui` in that directory to
 browse it.
 
+Inside an AzureML job that same backend behaves differently, and
+deliberately: AzureML injects an `azureml://` tracking URI and has already
+created a run, whose id arrives in MLFLOW_RUN_ID. MLflowTracker attaches to
+that run instead of creating its own, which is what makes metrics appear in
+the job's own Metrics tab rather than in a store on a node that is deleted
+when the job ends. See MLflowTracker's docstring for why that path goes
+through MlflowClient rather than MLflow's fluent API.
+
 If the selected backend cannot be brought up -- not installed, misconfigured,
 unreachable -- we fall back to a console-only tracker rather than crashing the
 training run. See _tracker_or_console() for why that is deliberately broad.
 """
 
 import logging
+import os
+import time
 import typing as tp
 from abc import ABC, abstractmethod
 
 import torch
 
 logger = logging.getLogger(__name__)
+
+
+def _ambient_mlflow_run_id() -> tp.Optional[str]:
+    """The run MLflow will resume from the environment, if any.
+
+    AzureML starts an MLflow run for every job and exports its ID as
+    MLFLOW_RUN_ID. MLflow's own `start_run()` picks that up and *resumes* it
+    rather than creating a new run, which is exactly what we want -- metrics
+    logged to it land in the job's Metrics tab in the Studio UI.
+
+    This is read rather than acted on directly because the value is consumed
+    (and deleted from os.environ) by `mlflow.start_run()` itself; see
+    MLflowTracker.__init__ for what it changes.
+    """
+    return os.environ.get("MLFLOW_RUN_ID") or None
 
 
 def _flatten(d: tp.Mapping, parent_key: str = "", sep: str = ".") -> tp.Dict[str, tp.Any]:
@@ -83,6 +108,36 @@ class NullTracker(ExperimentTracker):
 
 
 class MLflowTracker(ExperimentTracker):
+    """Logs through `MlflowClient` against an explicit run id, rather than
+    through MLflow's fluent `start_run()`/`log_metrics()` API.
+
+    That choice is what makes the AzureML path work. MLflow's fluent API keeps
+    a process-global *active run stack*, and pushing AzureML's run onto it
+    causes three separate problems:
+
+      * `start_run()` refuses outright once `set_experiment()` has been called,
+        because the experiment we ask for is not the one owning the
+        environment's run --
+            Cannot start run with ID <job> because active experiment ID does
+            not match environment run ID
+        AzureML owns that experiment (it comes from the job YAML), so ours
+        never matched: every AzureML run lost its tracker at construction,
+        `_tracker_or_console` degraded it to console logging, and the job's
+        Metrics tab stayed empty.
+      * fluent `start_run(run_name=...)` forwards the name to `update_run()`
+        when resuming, silently *renaming* the AzureML job's run.
+      * fluent registers `atexit.register(_safe_end_run)`, so an active run is
+        terminated when the process exits. aml_run.sh drives training [1/2] and
+        evaluation [2/2] as two processes through one AzureML run, so that
+        would mark the job's run FINISHED as soon as training ended -- before
+        the evaluation that produces the actual result had reported anything.
+        Simply not calling `end_run()` ourselves is not enough to avoid this.
+
+    Going through the client sidesteps all three: no global state is touched,
+    the run is addressed by id, and its lifecycle stays with whoever created
+    it.
+    """
+
     def __init__(
         self,
         experiment_name: str,
@@ -91,17 +146,83 @@ class MLflowTracker(ExperimentTracker):
         config: tp.Dict[str, tp.Any],
     ):
         import mlflow
+        from mlflow.tracking import MlflowClient
 
         self._mlflow = mlflow
         if tracking_uri:
             mlflow.set_tracking_uri(tracking_uri)
-        mlflow.set_experiment(experiment_name)
-        self._run = mlflow.start_run(run_name=run_name)
-        flat_config = {k: str(v) for k, v in _flatten(config).items()}
-        mlflow.log_params(flat_config)
+        self._client = MlflowClient(tracking_uri) if tracking_uri else MlflowClient()
+
+        # Inside an AzureML job the run already exists and its id arrives in
+        # MLFLOW_RUN_ID; attaching to it is what puts metrics in that job's
+        # Metrics tab. Anywhere else (a laptop, CI) we create and own one.
+        ambient_run_id = _ambient_mlflow_run_id()
+        self._owns_run = ambient_run_id is None
+        if self._owns_run:
+            experiment = self._client.get_experiment_by_name(experiment_name)
+            experiment_id = (
+                experiment.experiment_id
+                if experiment is not None
+                else self._client.create_experiment(experiment_name)
+            )
+            self._run_id = self._client.create_run(experiment_id, run_name=run_name).info.run_id
+        else:
+            self._run_id = ambient_run_id
+            logger.info(
+                "attached to the ambient MLflow run %s; AzureML owns its name, experiment "
+                "and lifecycle, and metrics will appear in this job's Metrics tab",
+                ambient_run_id,
+            )
+        self._log_params({k: str(v) for k, v in _flatten(config).items()})
+
+    def _log_params(self, params: tp.Dict[str, str]) -> None:
+        """Log config as params, never at the cost of the run's metrics.
+
+        Two things make this fallible in a way a bare log_params is not, and
+        both only bite on the attached path:
+
+          * The two stages log their own config to the SAME run, so the second
+            re-logs overlapping keys. MLflow treats params as write-once and
+            rejects a *changed* value (an identical re-log is fine), and
+            TrainConfig/EvalConfig genuinely disagree on some shared keys.
+          * This runs in __init__, so an exception propagates to
+            _tracker_or_console, which drops the whole tracker to console --
+            costing exactly the metrics we came here to record. Params are
+            secondary; losing them must not lose the metrics too.
+
+        So conflicting keys are dropped (reported once, not per key) and any
+        remaining failure is downgraded to a warning.
+        """
+        try:
+            if not self._owns_run and params:
+                existing = self._client.get_run(self._run_id).data.params
+                conflicting = sorted(k for k, v in params.items() if existing.get(k, v) != v)
+                if conflicting:
+                    shown = ", ".join(conflicting[:5]) + ("..." if len(conflicting) > 5 else "")
+                    logger.info(
+                        "not re-logging %d param(s) an earlier stage already set to a different "
+                        "value on this run (%s); MLflow params are write-once",
+                        len(conflicting), shown,
+                    )
+                    params = {k: v for k, v in params.items() if k not in set(conflicting)}
+            for key, value in params.items():
+                self._client.log_param(self._run_id, key, value)
+        except Exception:
+            logger.warning(
+                "could not log config params to MLflow -- continuing, metrics are unaffected",
+                exc_info=True,
+            )
 
     def log(self, metrics: tp.Dict[str, float], step: int) -> None:
-        self._mlflow.log_metrics(metrics, step=step)
+        # One batched call rather than one request per key: this fires every
+        # log_every steps for hours, with ~10 metrics a time.
+        from mlflow.entities import Metric
+
+        timestamp = int(time.time() * 1000)
+        self._client.log_batch(
+            self._run_id,
+            metrics=[Metric(key, float(value), timestamp, step) for key, value in metrics.items()],
+        )
 
     def log_audio(self, key: str, wav: torch.Tensor, sample_rate: int, step: int) -> None:
         import tempfile
@@ -112,13 +233,16 @@ class MLflowTracker(ExperimentTracker):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / f"{key}_step{step}.wav"
             torchaudio.save(str(path), wav.detach().cpu().reshape(1, -1), sample_rate)
-            self._mlflow.log_artifact(str(path), artifact_path=f"audio/{key}")
+            self._client.log_artifact(self._run_id, str(path), artifact_path=f"audio/{key}")
 
     def log_figure(self, path: tp.Any) -> None:
-        self._mlflow.log_artifact(str(path), artifact_path="plots")
+        self._client.log_artifact(self._run_id, str(path), artifact_path="plots")
 
     def finish(self) -> None:
-        self._mlflow.end_run()
+        # Only terminate a run we created. On the attached path the run belongs
+        # to AzureML and the evaluation stage still has to report into it.
+        if self._owns_run:
+            self._client.set_terminated(self._run_id)
 
 
 class WandbTracker(ExperimentTracker):
