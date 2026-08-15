@@ -24,8 +24,11 @@ def tokenizer(text):
     return {k: v.squeeze(0) for k, v in result.items()}
 
 
-PRETRAINED_PATH = "/mnt/fast/nobackup/users/hl01486/projects/contrastive_pretraining/CLAP/assets/checkpoints/epoch_top_0_audioset_no_fusion.pt"
-WAVE_48k_PATH = "/mnt/fast/nobackup/users/hl01486/projects/contrastive_pretraining/CLAP/assets/audio/machine.wav"
+PRETRAINED_PATH = os.environ.get(
+    "CLAP_PRETRAINED_PATH",
+    "assets/checkpoints/epoch_top_0_audioset_no_fusion.pt",
+)
+WAVE_48k_PATH = os.environ.get("CLAP_AUDIO_PATH", "assets/audio/example.wav")
 
 
 def infer_text():

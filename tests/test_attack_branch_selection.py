@@ -11,10 +11,9 @@ for training and wrong for measurement. `eval_step` used to call it that way,
 so each eval point measured a *different task*: with identity and audioldm in
 one recipe the eval curve alternated between two populations (loss ~0.8 vs
 ~5), which reads as instability or a regression rather than the
-branch-switching it actually was. Verified on
-train-audioldm-gradnorm-0814-171739, where simulating the seeded RNG predicted
-the drawn branch for 7/7 observed draws: eval at step 0 drew identity, eval at
-step 83 drew audioldm.
+branch-switching it actually was. Simulating the seeded RNG predicted the drawn
+branch for 7/7 observed draws: eval at step 0 drew identity, while eval at step
+83 drew audioldm.
 
 Sampling in eval also consumed from the shared RNG, so evaluating shifted the
 branch sequence training itself saw.

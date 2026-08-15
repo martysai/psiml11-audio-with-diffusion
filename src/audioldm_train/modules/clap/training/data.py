@@ -165,15 +165,10 @@ class ToyDataset(Dataset):
         s_index = self.queue[index]
 
         audio_name = self.fp["audio_name"][s_index].decode()
-        # Hardcode here CHANGE
-        hdf5_path = (
-            self.fp["hdf5_path"][s_index]
-            .decode()
-            .replace(
-                "../workspace",
-                "/home/la/kechen/Research/ke_zsasp/workspace",
-            )
-        )
+        hdf5_path = self.fp["hdf5_path"][s_index].decode()
+        workspace = os.environ.get("CLAP_WORKSPACE")
+        if workspace:
+            hdf5_path = hdf5_path.replace("../workspace", workspace)
         r_idx = self.fp["index_in_hdf5"][s_index]
         target = self.fp["target"][s_index].astype(np.float32)
         text = self.prompt_text(target)

@@ -3,15 +3,12 @@
 # The opposite direction from sgmse.yaml: trains against AudioLDM (AudioLDM),
 # holds SGMSE + MBD out. Static equivalent: azureml/jobs/train_audioldm.yaml.
 
-# `subscription_id` is deliberately absent: this repo is PUBLIC. aml_submit.py
-# resolves it at submit time from $AZUREML_SUBSCRIPTION_ID, then `az account
-# show` -- see make_client().
-workspace:
-  resource_group_name: playground-rg
-  workspace_name: as-playground-w3-ws
+# Workspace coordinates come from AZUREML_SUBSCRIPTION_ID,
+# AZUREML_RESOURCE_GROUP and AZUREML_WORKSPACE_NAME, or from Azure CLI defaults.
 
 direction: audioldm
-compute: a100x1
+# Override with --compute for your workspace.
+compute: gpu-cluster
 environment: azureml:audioseal-robust-diffusion@latest
 
 experiment_name: audioseal-robust-diffusion-swap
