@@ -75,6 +75,13 @@ compute_pesq: true
 compute_sisnr: true
 compute_visqol: false
 
+# Reference-point mode -- prefer the `--stock-baseline` flag, which sets this.
+# Forces the unmodified pretrained AudioSeal generator+detector, identity
+# attack only, no fine-tuned weights, and exits non-zero if the resulting
+# detection / bit accuracy / watermark SNR aren't where known-good weights
+# must land. See EvalConfig.stock_baseline in config.py.
+stock_baseline: false
+
 # Per-attack checkpoints -- None/null keeps that attack a stub (see
 # attacks.py). Override on the CLI, e.g.:
 #   attack.audioldm.checkpoint=/path/to/audioldm_root/data/checkpoints/audioldm-s-full \
