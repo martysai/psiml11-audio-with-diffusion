@@ -127,6 +127,65 @@ attack:
     # watermark robustness.
     init_from_reference: true
 
+  # ---------------------------------------------------------------------
+  # Fixed-budget attacks (AudioMarkBench's white-box adversarial + "common
+  # perturbation" families). None of these needs a `checkpoint` enable gate:
+  # they load no external weights, and none is expensive enough to have to
+  # be opted into. Just name them in eval_attacks/held_out_attacks, e.g.:
+  #   python -m audioseal_robust.evaluate eval_dir=... label=baseline \
+  #       eval_attacks=[identity,gaussian_noise,lowpass,quantization] \
+  #       held_out_attacks=[pgd,speed,codec_mp3]
+  #
+  # WHY THIS GROUP EXISTS ALONGSIDE hopskipjump: HSJ is a *minimum-norm*
+  # attack -- it searches for the smallest perturbation that flips the
+  # decision, so by construction its output lands ON the decision boundary
+  # and every example scores at presence ~= 0.5 whichever class it started
+  # from. Measured over 800 held-out examples: 99.4% of scores within +-0.01
+  # of 0.5, class means 0.4998 vs 0.5009. ROC-AUC on that is decided in the
+  # 4th decimal and is not interpretable; only the attack's COST
+  # (attack_sisnr, query budget) is. The attacks below instead cap the
+  # perturbation in advance and let the score land where it lands, so the
+  # distribution keeps its spread and ROC-AUC / TPR@FPR mean something.
+  # Sweep each attack's own budget field for a robustness curve (they are
+  # not commensurable, so they deliberately do NOT share the t_star_grid).
+  # ---------------------------------------------------------------------
+  pgd:
+    # L-infinity budget on the [-1, 1] waveform. Sweep e.g.
+    # 0.0005 / 0.001 / 0.002 / 0.005 / 0.01.
+    epsilon: 0.002
+    num_steps: 20
+    step_size: null  # null -> 2.5 * epsilon / num_steps (Madry et al.)
+  gaussian_noise:
+    # dB SNR of the added noise; lower = stronger. Sweep 40/30/20/10/5.
+    snr_db: 20.0
+  lowpass:
+    sample_rate: 16000
+    # Hz. 4000 discards the whole upper half of the 16 kHz band while
+    # leaving speech intelligible. Sweep 8000/6000/4000/3000/2000.
+    cutoff_hz: 4000.0
+  speed:
+    sample_rate: 16000
+    # Playback rate multiplier. NOTE: attack_sisnr is a misalignment
+    # measure for this attack and is not comparable with the others'
+    # (see attacks.py:SpeedAttack). Sweep 0.9/0.95/1.05/1.1.
+    factor: 1.05
+  quantization:
+    # Bits per sample over full-scale. Sweep 12/10/8/6/4.
+    bits: 8
+  # MP3/Opus round-trip via the `ffmpeg` binary. Present in this project's
+  # AzureML image (azureml/docker/Dockerfile) but usually NOT in a local
+  # conda env -- where it is missing the attack is reported as "skipped"
+  # rather than failing the run. Same attack_sisnr caveat as speed (codec
+  # delay shifts the signal).
+  codec_mp3:
+    sample_rate: 16000
+    codec: mp3
+    bitrate_kbps: 64
+  codec_opus:
+    sample_rate: 16000
+    codec: opus
+    bitrate_kbps: 32
+
 tracking:
   backend: wandb
   project: audioseal-robust-eval
