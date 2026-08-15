@@ -38,8 +38,23 @@ inputs:
   librispeech:
     type: uri_folder
     path: azureml:librispeech-asr:1
+    # download, not ro_mount -- data.py:WavDirDataset walks the tree once per
+    # audio extension per split, and directory listings over blobfuse are
+    # network round-trips.
+    mode: download
+  # Fixed-duration training audio: every file is exactly 10.24s, AudioLDM's
+  # native window, so the attack never zero-pads. Kept as a SECOND input rather
+  # than replacing librispeech, because it only contains a training split --
+  # validation and evaluation stay on the stock dev-clean/test-clean above, so
+  # the reported numbers remain comparable with every earlier run. Wired in via
+  # TRAIN_DIR_OVERRIDE in the command below.
+  trainfixed:
+    type: uri_folder
+    path: azureml:librispeech-train-fixed-10s:1
     mode: download
   checkpoints:
+    # uri_folder, not custom_model: see assets/diffusion_checkpoints_manifold.yaml
+    # for why the model-asset registration path is closed to us here.
     type: uri_folder
     path: azureml:psiml-diffusion-checkpoints:1
     mode: ro_mount
