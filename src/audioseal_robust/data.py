@@ -8,7 +8,13 @@
 end to end. Not a replacement for AudioCraft's manifest-based dataset
 pipeline (egs/, audio_dataset.py, dset configs) -- if you need dataset
 sharding, metadata filtering, etc. at scale, use that instead and pass its
-output into `train_step`, which only requires batches of shape (B, 1, T)."""
+output into `train_step`, which only requires batches of shape (B, 1, T).
+
+Multi-GPU: `build_dataloader` attaches a `DistributedSampler` when handed a
+distributed `DistEnv`, so each rank reads a disjoint shard of the files
+rather than all four ranks training on the same audio. See its docstring for
+the `set_epoch` requirement that comes with it.
+"""
 
 import random
 import typing as tp
@@ -18,6 +24,9 @@ import soundfile as sf
 import torch
 import torchaudio
 from torch.utils.data import Dataset
+from torch.utils.data.distributed import DistributedSampler
+
+from .distributed import DistEnv
 
 
 _AUDIO_EXTENSIONS = (".wav", ".flac")
@@ -73,12 +82,55 @@ def build_dataloader(
     batch_size: int,
     num_workers: int,
     shuffle: bool = True,
-) -> torch.utils.data.DataLoader:
+    env: tp.Optional[DistEnv] = None,
+) -> tp.Tuple[torch.utils.data.DataLoader, tp.Optional[DistributedSampler]]:
+    """Returns `(dataloader, sampler)`.
+
+    `batch_size` is PER RANK (the standard DDP convention): under
+    `torchrun --nproc_per_node=4` a batch_size of 16 means 16 examples per
+    GPU and an effective batch of 64. Configs are unchanged from the
+    single-GPU runs; the effective batch is what scales.
+
+    `sampler` is a `DistributedSampler` when `env` is distributed, else None.
+    The caller must call `sampler.set_epoch(epoch)` every epoch when it is
+    not None -- otherwise the sampler reshuffles identically every epoch, so
+    each rank sees the exact same subset of files for the whole run (see
+    train.py, which does this).
+
+    `drop_last=True` on both the sampler and the loader is load-bearing under
+    DDP, not just tidiness: it makes every rank run the same number of steps
+    with the same number of examples. Without it a rank that runs out of
+    batches first stops calling into DDP's gradient allreduce and the others
+    hang waiting for it, and the per-rank metric averages combined by
+    `distributed.all_reduce_mean` would be weighted wrong.
+    """
     dataset = WavDirDataset(root, sample_rate=sample_rate, segment_duration=segment_duration)
-    return torch.utils.data.DataLoader(
+
+    sampler: tp.Optional[DistributedSampler] = None
+    if env is not None and env.is_distributed:
+        if len(dataset) < env.world_size * batch_size:
+            raise RuntimeError(
+                f"{root} has {len(dataset)} audio files, too few for world_size={env.world_size} x "
+                f"batch_size={batch_size}={env.world_size * batch_size} examples per step with "
+                "drop_last=True -- every rank would get zero batches. Lower batch_size, use fewer "
+                "GPUs, or point at more data."
+            )
+        sampler = DistributedSampler(
+            dataset,
+            num_replicas=env.world_size,
+            rank=env.rank,
+            shuffle=shuffle,
+            drop_last=True,
+        )
+
+    dataloader = torch.utils.data.DataLoader(
         dataset,
         batch_size=batch_size,
-        shuffle=shuffle,
+        # Mutually exclusive with `sampler`: DistributedSampler does the
+        # shuffling itself (per-epoch, seeded by set_epoch).
+        shuffle=shuffle if sampler is None else False,
+        sampler=sampler,
         num_workers=num_workers,
         drop_last=True,
     )
+    return dataloader, sampler

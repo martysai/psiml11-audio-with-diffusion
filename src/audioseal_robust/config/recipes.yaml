@@ -49,6 +49,32 @@ train:
       weights:
         identity: 0.5
         sgmse: 0.5
+  # The AudioLDM counterpart of `sgmse_mixed` above, and for a sharper reason
+  # than that one: at `recipe=audioldm` (audioldm 1.0, identity 0.0) the
+  # generator never sees an unattacked step, and AudioLDM destroys the
+  # watermark outright rather than merely degrading it. Measured on the 4x
+  # A100 manifold run train-audioldm-manifold-0814-121056: bit_loss sat at
+  # 0.698 against ln(2)=0.6931 -- chance, i.e. zero recoverable bits -- flat
+  # across 530 steps, with presence_prob ~0.08 and no trend in the loss
+  # (slope t=-0.04 against a per-step sd of 1.10). Evaluation on the smoke run
+  # shows why: audioldm's attack_sisnr is -50 dB, so `x_att` is essentially
+  # uncorrelated with `x_wm` at the sample level -- the HiFi-GAN vocoder
+  # resynthesises phase from scratch. A loss pinned at chance carries no
+  # gradient signal to learn from, so the identity half is what gives the
+  # generator something to anchor bit accuracy on.
+  #
+  # Orthogonal knob, deliberately not baked in here: attack strength.
+  # `attack.audioldm.strength_max` (default 0.08 ~ 80 diffusion steps) caps
+  # the randomly sampled t*; lowering it to e.g. 0.02 both weakens the attack
+  # and cuts step time, since that reverse loop dominates it. Pass it on the
+  # CLI to combine the two axes, e.g.
+  #   recipe=audioldm_mixed attack.audioldm.strength_max=0.02
+  audioldm_mixed:
+    attack:
+      weights:
+        identity: 0.5
+        audioldm: 0.5
+
   # Same identity/attacked split as sgmse_mixed above, but the attacked half
   # is now split between BOTH diffusion attacks instead of sgmse alone --
   # trains against sgmse and audioldm together so robustness doesn't have to
@@ -58,14 +84,14 @@ train:
   # the same reason (easy steps to anchor bit accuracy, less exposure to
   # either attack's own gradient instability) -- not lowered further just
   # because a second attack was added.
-  # Pairs with data.segment_duration=10.24 at train time (see
-  # run_train_10h_audioldm.sh) -- AudioLDMAttack expects exactly that
-  # duration or it zero-pads (the eval-side "10.24s gap" that
-  # build_fixed_duration_eval_set.py works around). WavDirDataset crops
-  # longer files and tiles/repeats shorter ones to reach whatever
-  # segment_duration it's given (data.py) -- it never zero-pads -- so
-  # setting segment_duration directly sidesteps the same padding problem on
-  # the training side without needing a separate fixed-duration dataset.
+  # Pairs well with data.segment_duration=10.24 at train time (see
+  # run_train_10h_audioldm.sh), though no longer out of necessity: on this
+  # branch AudioLDMAttack tiles rather than zero-pads a short input to its
+  # 10.24s window, so a 2s segment is repeated instead of being surrounded by
+  # ~80% silence. Matching segment_duration to the window is still the
+  # cheapest option -- the attack then sees real, non-repeating audio and
+  # skips the tile entirely. WavDirDataset likewise crops longer files and
+  # tiles shorter ones (data.py); neither stage zero-pads any more.
   sgmse_audioldm_mixed:
     attack:
       weights:

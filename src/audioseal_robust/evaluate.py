@@ -33,12 +33,10 @@ to this script.
 import csv
 import json
 import logging
-import random
 import time
 import typing as tp
 from pathlib import Path
 
-import numpy as np
 import torch
 import torch.nn as nn
 import torchaudio
@@ -61,7 +59,18 @@ from .attacks import (
 )
 from .config import EvalConfig, load_eval_config
 from .data import build_dataloader
-from .device import resolve_device
+from .distributed import (
+    DistEnv,
+    all_gather_scores,
+    all_gather_values,
+    all_reduce_max,
+    cleanup_distributed,
+    configure_logging,
+    gather_objects,
+    init_distributed,
+    seed_everything,
+    shard_size,
+)
 from .metrics import (
     bit_accuracy,
     confusion_counts,
@@ -76,7 +85,7 @@ from sklearn.metrics import roc_auc_score, roc_curve
 from .model_init import build_untrained_generator
 from .plotting import plot_confusion_matrices, plot_robustness_curve, plot_roc_curves
 from .train import embed_watermark, random_message
-from .tracking import build_tracker
+from .tracking import NullTracker, build_tracker
 
 logger = logging.getLogger(__name__)
 
@@ -105,7 +114,7 @@ def _reset_peak_memory(device: torch.device) -> None:
         torch.cuda.reset_peak_memory_stats(device)
 
 
-def _peak_memory_metrics(device: torch.device) -> tp.Dict[str, float]:
+def _peak_memory_metrics(device: torch.device, env: DistEnv = DistEnv()) -> tp.Dict[str, float]:
     """Peak GPU memory since the last `_reset_peak_memory`, in GB, plus what
     fraction of the card that is.
 
@@ -114,17 +123,24 @@ def _peak_memory_metrics(device: torch.device) -> tp.Dict[str, float]:
     you out of memory. `allocated` is only the live-tensor subset of that, and
     reads lower than the pressure you'd actually hit.
 
+    Reduced with MAX, not mean, across ranks: the number worth knowing is the
+    worst card's, because that is the one that decides whether the job OOMs.
+
     Empty dict off CUDA, so callers can just `.update()` it unconditionally.
     """
     if device.type != "cuda":
         return {}
     total = torch.cuda.get_device_properties(device).total_memory
     reserved = torch.cuda.max_memory_reserved(device)
-    return {
-        "peak_alloc_gb": torch.cuda.max_memory_allocated(device) / 1e9,
-        "peak_reserved_gb": reserved / 1e9,
-        "peak_reserved_frac": reserved / total,
-    }
+    return all_reduce_max(
+        {
+            "peak_alloc_gb": torch.cuda.max_memory_allocated(device) / 1e9,
+            "peak_reserved_gb": reserved / 1e9,
+            "peak_reserved_frac": reserved / total,
+        },
+        env,
+        device,
+    )
 
 
 def load_generator_under_test(checkpoint: str, nbits: int, device: torch.device) -> AudioSealWM:
@@ -228,14 +244,37 @@ def prepare_eval_batches(
     dataloader,
     cfg: EvalConfig,
     device: torch.device,
+    env: DistEnv = DistEnv(),
 ) -> tp.List[PreparedEvalBatch]:
     """Materialize one set of (clean, watermarked, message) batches, held on
     CPU and reused by every attack and every t* point, so all reported
     numbers come from identical audio and identical messages. The curve
-    points read a prefix of this list (see `cfg.n_curve_batches`)."""
+    points read a prefix of this list (see `cfg.n_curve_batches`).
+
+    Under DDP this holds only THIS rank's shard: `cfg.n_eval_batches` is a
+    global total, so each rank materializes `shard_size(...)` of it from its
+    own disjoint `DistributedSampler` slice. The same config therefore
+    evaluates the same audio whether it runs on 1 GPU or 4 -- it just splits
+    the work. Per-rank scores are pooled with `all_gather_*` before any
+    metric is computed (see `evaluate_attack`).
+
+    A rank whose shard is legitimately empty (fewer batches requested than
+    there are ranks -- `shard_size` gives the surplus ranks 0) returns an
+    empty list rather than raising: it still has to enter every collective
+    downstream, and `evaluate_attack`/`evaluate_perceptual` are built to let
+    it contribute nothing (see `_cat_or_empty`). Raising here would take the
+    job down on exactly the configuration that support is meant to cover.
+    """
+    local_n_batches = shard_size(cfg.n_eval_batches, env)
+    if env.is_distributed and local_n_batches == 0:
+        logger.warning(
+            "rank %d gets no batches: n_eval_batches=%d is below world_size=%d, so this rank only "
+            "sits in the collectives. The numbers stay correct -- the GPU is just wasted.",
+            env.rank, cfg.n_eval_batches, env.world_size,
+        )
     prepared = []
     for batch_index, batch in enumerate(dataloader):
-        if batch_index >= cfg.n_eval_batches:
+        if batch_index >= local_n_batches:
             break
         x = batch.to(device)
         message = random_message(cfg.nbits, x.size(0), device=device)
@@ -246,25 +285,42 @@ def prepare_eval_batches(
         # produce unscaled, an operating point training never sees.
         x_wm = embed_watermark(generator, x, message, cfg.watermark_snr_db, cfg.watermark_snr_db)
         prepared.append((x.cpu(), x_wm.cpu(), message.cpu()))
-    if not prepared:
-        raise RuntimeError("Evaluation dataloader produced no batches")
-    # A dataloader with drop_last=True silently yields fewer batches than
-    # asked for when the dataset is too small, and every downstream number
-    # (including n_negatives, which sets the achievable FPR resolution) would
-    # then be computed over a smaller sample than the label claims -- a
-    # "full_1h" run quietly becoming an 8-minute one. Fail loudly instead.
-    if len(prepared) < cfg.n_eval_batches:
+    # Compare against this rank's LOCAL expected batch count
+    # (local_n_batches), not the global cfg.n_eval_batches -- under DDP each
+    # rank only materializes its own shard (see shard_size above), so
+    # comparing against the global total would make every multi-GPU run
+    # raise here even when nothing is wrong. Still a strict "<", not just
+    # "== 0": a dataloader with drop_last=True silently yields fewer batches
+    # than asked for when the dataset is too small, and every downstream
+    # number (including n_negatives, which sets the achievable FPR
+    # resolution) would then be computed over a smaller sample than the
+    # label claims -- a "full_1h" run quietly becoming an 8-minute one. A
+    # rank whose shard is legitimately empty (local_n_batches == 0, see the
+    # docstring above) still passes this check (0 < 0 is False), so it can
+    # enter the collectives with nothing rather than raising.
+    if len(prepared) < local_n_batches:
         dataset = getattr(dataloader, "dataset", None)
         n_files = len(dataset) if dataset is not None else "unknown"
         raise RuntimeError(
             f"Evaluation dataloader produced only {len(prepared)} batches, but "
-            f"n_eval_batches={cfg.n_eval_batches} was requested "
-            f"(eval_dir={cfg.eval_dir!r} holds {n_files} usable files; "
+            f"local_n_batches={local_n_batches} was expected on rank {env.rank} "
+            f"(cfg.n_eval_batches={cfg.n_eval_batches} globally, "
+            f"eval_dir={cfg.eval_dir!r} holds {n_files} usable files; "
             f"batch_size={cfg.batch_size} with drop_last=True needs at least "
-            f"{cfg.n_eval_batches * cfg.batch_size}). Lower n_eval_batches or "
-            f"point eval_dir at a larger set."
+            f"{local_n_batches * cfg.batch_size} on this rank). Lower "
+            f"n_eval_batches, use fewer GPUs, or point eval_dir at a larger set."
         )
     return prepared
+
+
+def _cat_or_empty(chunks: tp.List[torch.Tensor]) -> torch.Tensor:
+    """`torch.cat` that tolerates an empty list, which it otherwise rejects.
+
+    A rank holding a zero-size shard has no score chunks to concatenate but
+    still has to take part in the all-gather, so it needs a well-formed
+    zero-length tensor rather than an exception.
+    """
+    return torch.cat(chunks) if chunks else torch.zeros(0)
 
 
 def _save_row_artifacts(
@@ -312,6 +368,7 @@ def evaluate_attack(
     strength: tp.Optional[float] = None,
     n_batches: tp.Optional[int] = None,
     progress_desc: str = "attack",
+    env: DistEnv = DistEnv(),
     row_artifacts_name: tp.Optional[str] = None,
 ) -> tp.Dict[str, tp.Any]:
     """Robustness metrics for one attack (optionally at one fixed t*
@@ -367,10 +424,23 @@ def evaluate_attack(
     applied_neg: tp.List[torch.Tensor] = []
     pop_application_mask = getattr(attack, "pop_application_mask", None)
 
+    # `n_batches` is a global total; take this rank's share of it. The list
+    # itself is already this rank's shard (see prepare_eval_batches), so this
+    # is a prefix of local batches, not a re-slice of the global set.
+    local_n_batches = shard_size(n_batches, env)
+
+    # Row artifacts are written per rank. Every rank holds a different shard
+    # but would otherwise write audio/00000_x.wav and rows.csv into the same
+    # directory, clobbering each other's files. Under torchrun each rank gets
+    # its own rank<N>/ subfolder, so row_index can stay a local counter; a
+    # single-process run keeps the original flat layout unchanged.
     row_writer = None
     row_file = None
+    rows_dir: tp.Optional[Path] = None
     if row_artifacts_name is not None and cfg.save_row_artifacts:
         rows_dir = Path(cfg.output_dir) / f"{cfg.label}_{row_artifacts_name}_rows"
+        if env.is_distributed:
+            rows_dir = rows_dir / f"rank{env.rank}"
         rows_dir.mkdir(parents=True, exist_ok=True)
         row_file = open(rows_dir / "rows.csv", "w", newline="")
         row_writer = csv.DictWriter(
@@ -388,8 +458,21 @@ def evaluate_attack(
         )
         row_writer.writeheader()
 
+    # A stub attack raises NotImplementedError from its first forward. That
+    # has to become the SAME decision on every rank: if one rank skipped the
+    # attack while another carried on into the all-gather below, the ones
+    # still going would block until the NCCL timeout (~30 min) and take the
+    # job down with a stack trace pointing at the wrong line. So the failure
+    # is recorded, gathered, and only then re-raised -- everywhere or nowhere.
+    local_failure: tp.Optional[str] = None
     row_index = 0
-    progress = tqdm(eval_batches[:n_batches], desc=progress_desc, unit="batch", leave=False)
+    progress = tqdm(
+        eval_batches[:local_n_batches],
+        desc=progress_desc,
+        unit="batch",
+        leave=False,
+        disable=not env.is_main,
+    )
     try:
         for x_cpu, x_wm_cpu, message_cpu in progress:
             x = x_cpu.to(device)
@@ -421,11 +504,12 @@ def evaluate_attack(
             attack_sisnr_values.append(sisnr_score(x_wm, x_att_pos))
 
             if row_writer is not None:
+                assert rows_dir is not None  # set together with row_writer
                 decoded = (m_hat > 0.5).float()
                 per_example_bit_acc = (decoded == message.float()).float().mean(dim=-1)
                 for i in range(x.shape[0]):
                     _save_row_artifacts(
-                        Path(cfg.output_dir) / f"{cfg.label}_{row_artifacts_name}_rows",
+                        rows_dir,
                         row_index,
                         x[i],
                         x_wm[i],
@@ -442,14 +526,42 @@ def evaluate_attack(
                         torch.tensor(sisnr_score(x_wm[i : i + 1], x_att_pos[i : i + 1])),
                     )
                     row_index += 1
+    except NotImplementedError as e:
+        local_failure = str(e)
     finally:
         progress.close()
         if row_file is not None:
             row_file.close()
 
-    positive_cat = torch.cat(positive_scores)
-    negative_cat = torch.cat(negative_scores)
-    # Build labels and pooled scores for ROC/AUC computation
+    failures = [f for f in gather_objects(local_failure, env) if f is not None]
+    if failures:
+        raise NotImplementedError(failures[0])
+
+    # Pool the RAW scores across ranks before computing anything. TPR@FPR and
+    # the confusion matrix both hang off a threshold that is a quantile of the
+    # negative-score distribution, and a quantile cannot be averaged out of
+    # per-rank quantiles -- 4 ranks each thresholding their own shard is a
+    # different (and wrong) operating point from one threshold over all of it.
+    #
+    # `local_n_batches` can legitimately be 0 on the high ranks (the curve
+    # uses cfg.n_curve_batches, which can be smaller than world_size), and
+    # torch.cat([]) raises. Such a rank contributes nothing but must still
+    # enter every collective below, or the ranks that do have data block.
+    positive_cat = all_gather_scores(_cat_or_empty(positive_scores), env)
+    negative_cat = all_gather_scores(_cat_or_empty(negative_scores), env)
+    bit_accs = all_gather_values(bit_accs, env)
+    attack_sisnr_values = all_gather_values(attack_sisnr_values, env)
+
+    if not bit_accs:
+        raise RuntimeError(
+            f"No rank produced any batch for '{progress_desc}' "
+            f"(requested {n_batches} batch(es) over {env.world_size} rank(s))"
+        )
+
+    # ROC/AUC over the SAME pooled (post-all_gather) scores as everything
+    # else below -- computing it from per-rank-local scores instead would
+    # give each rank its own curve, the same wrong-operating-point problem
+    # the comment above describes for TPR@FPR.
     try:
         y_pos = torch.ones_like(positive_cat)
         y_neg = torch.zeros_like(negative_cat)
@@ -460,6 +572,7 @@ def evaluate_attack(
     except Exception:
         # If sklearn isn't available or computation fails, skip ROC
         fpr, tpr, thresholds, roc_auc = None, None, None, None
+
     confusion = confusion_counts(positive_cat, negative_cat, cfg.fpr_target)
     metrics = {
         "bit_accuracy": sum(bit_accs) / len(bit_accs),
@@ -531,16 +644,21 @@ def evaluate_attack(
 
 @torch.no_grad()
 def evaluate_perceptual(
-    eval_batches: tp.List[PreparedEvalBatch], cfg: EvalConfig, device: torch.device
+    eval_batches: tp.List[PreparedEvalBatch],
+    cfg: EvalConfig,
+    device: torch.device,
+    env: DistEnv = DistEnv(),
 ) -> tp.Dict[str, float]:
     """No attack: x vs x_wm only."""
     sisnr_values = []
     pesq_values = []
+    last_pair: tp.Optional[tp.Tuple[torch.Tensor, torch.Tensor]] = None
 
-    progress = tqdm(eval_batches, desc="perceptual", unit="batch", leave=False)
+    progress = tqdm(eval_batches, desc="perceptual", unit="batch", leave=False, disable=not env.is_main)
     for x_cpu, x_wm_cpu, _ in progress:
         x = x_cpu.to(device)
         x_wm = x_wm_cpu.to(device)
+        last_pair = (x, x_wm)
 
         if cfg.compute_sisnr:
             sisnr_values.append(sisnr_score(x, x_wm))
@@ -552,27 +670,32 @@ def evaluate_perceptual(
 
     progress.close()
 
+    # Pool across ranks so the reported mean is over all the audio, not this
+    # rank's shard. Done unconditionally (not under the `if` below) because
+    # all_gather is collective: a rank that skipped it while others called it
+    # would hang the job.
+    sisnr_values = all_gather_values(sisnr_values, env)
+    pesq_values = all_gather_values(pesq_values, env)
+
     metrics: tp.Dict[str, float] = {}
     if sisnr_values:
         metrics["sisnr"] = sum(sisnr_values) / len(sisnr_values)
     if pesq_values:
         metrics["pesq"] = sum(pesq_values) / len(pesq_values)
-    if cfg.compute_visqol:
+    if cfg.compute_visqol and last_pair is not None:
         try:
-            metrics["visqol"] = visqol_score(x, x_wm, cfg.sample_rate)
+            metrics["visqol"] = visqol_score(*last_pair, cfg.sample_rate)
         except NotImplementedError as e:
             logger.warning("visqol_score not available, skipping: %s", e)
     return metrics
 
 
 def run(cfg: EvalConfig) -> tp.Dict[str, tp.Any]:
-    device = resolve_device(cfg.device)
-    # See train.py's train() for why all four (not just torch's default CPU
-    # generator) need seeding here too.
-    torch.manual_seed(cfg.seed)
-    torch.cuda.manual_seed_all(cfg.seed)
-    np.random.seed(cfg.seed)
-    random.seed(cfg.seed)
+    env, device = init_distributed(cfg.device)
+    # Every rank draws the SAME messages and the same attack randomness, and
+    # the sharding comes from the sampler, not from the seed. See
+    # distributed.seed_everything.
+    seed_everything(cfg.seed, env)
 
     generator = load_generator_under_test(cfg.generator_checkpoint, cfg.nbits, device)
     generator.eval()
@@ -581,6 +704,42 @@ def run(cfg: EvalConfig) -> tp.Dict[str, tp.Any]:
 
     all_attack_names = list(cfg.eval_attacks) + list(cfg.held_out_attacks)
     attacks, skipped_at_construction = build_eval_attacks(all_attack_names, device, cfg)
+
+    # Union the skip set across ranks before anyone acts on it.
+    #
+    # build_eval_attacks decides locally, and construction can genuinely fail
+    # on one rank and not another -- a per-rank HF cache miss, a transient
+    # download error, a checkpoint that only some node-local disk has. Whatever
+    # the cause, an asymmetric skip set is fatal rather than merely uneven: the
+    # loop below runs `for name in all_attack_names` and every non-skipped
+    # attack enters evaluate_attack, which is full of collectives
+    # (all_gather_scores/all_gather_values/gather_objects). A rank that skips
+    # an attack the others evaluate simply never reaches those calls, so the
+    # ranks that did block until the NCCL timeout (~30 min) and take the job
+    # down pointing at the wrong line.
+    #
+    # Union, not intersection: a rank that could not build an attack cannot
+    # evaluate it, so the only globally consistent choice is to skip it
+    # everywhere. Each rank keeps its own reason where it has one, and adopts a
+    # peer's otherwise, so the log says why rather than just that.
+    if env.is_distributed:
+        merged: tp.Dict[str, str] = {}
+        for rank, remote in enumerate(gather_objects(skipped_at_construction, env)):
+            for name, reason in tp.cast(tp.Dict[str, str], remote).items():
+                merged.setdefault(name, f"{reason} (first seen on rank {rank})")
+        newly_skipped = set(merged) - set(skipped_at_construction)
+        if newly_skipped and env.is_main:
+            logger.warning(
+                "skipping %s on every rank: another rank could not construct %s",
+                ", ".join(sorted(newly_skipped)),
+                "it" if len(newly_skipped) == 1 else "them",
+            )
+        skipped_at_construction = merged
+        # Drop the local instances too, so nothing downstream can reach for an
+        # attack this rank is contractually skipping.
+        for name in newly_skipped:
+            attacks.pop(name, None)
+
     held_out = set(cfg.held_out_attacks)
 
     # Query-based attacks (currently just HopSkipJumpAttack) need the
@@ -594,15 +753,18 @@ def run(cfg: EvalConfig) -> tp.Dict[str, tp.Any]:
         if bind_detector is not None:
             bind_detector(detector)
 
-    dataloader = build_dataloader(
+    # Eval is pure forward passes -- no DDP wrapper needed, no gradients to
+    # sync. The parallelism is purely data sharding via the sampler.
+    dataloader, _sampler = build_dataloader(
         cfg.eval_dir,
         sample_rate=cfg.sample_rate,
         segment_duration=cfg.segment_duration,
         batch_size=cfg.batch_size,
         num_workers=cfg.num_workers,
         shuffle=False,
+        env=env,
     )
-    eval_batches = prepare_eval_batches(generator, dataloader, cfg, device)
+    eval_batches = prepare_eval_batches(generator, dataloader, cfg, device, env)
 
     # Real-audio starting points for query-based search attacks, same
     # duck-typed opt-in as bind_detector above. Deliberately built AFTER
@@ -624,25 +786,37 @@ def run(cfg: EvalConfig) -> tp.Dict[str, tp.Any]:
             bind_reference_pool(reference_pool)
             logger.info("bound a %d-waveform reference pool for query-based init", reference_pool.shape[0])
 
-    tracker = build_tracker(
-        backend=cfg.tracking.backend,
-        project=cfg.tracking.project,
-        run_name=cfg.tracking.run_name or cfg.label,
-        config={"label": cfg.label, "generator_checkpoint": cfg.generator_checkpoint},
-        mlflow_tracking_uri=cfg.tracking.mlflow_tracking_uri,
-        wandb_mode=cfg.tracking.wandb_mode,
+    # Only rank 0 talks to the tracker: 4 ranks logging the same all-reduced
+    # numbers to the same run would quadruple every point.
+    tracker = (
+        build_tracker(
+            backend=cfg.tracking.backend,
+            project=cfg.tracking.project,
+            run_name=cfg.tracking.run_name or cfg.label,
+            config={
+                "label": cfg.label,
+                "generator_checkpoint": cfg.generator_checkpoint,
+                "world_size": env.world_size,
+            },
+            mlflow_tracking_uri=cfg.tracking.mlflow_tracking_uri,
+            wandb_mode=cfg.tracking.wandb_mode,
+        )
+        if env.is_main
+        else NullTracker()
     )
 
-    results: tp.Dict[str, tp.Any] = {"label": cfg.label, "device": str(device)}
+    results: tp.Dict[str, tp.Any] = {"label": cfg.label, "device": str(device), "world_size": env.world_size}
     if device.type == "cuda":
         props = torch.cuda.get_device_properties(device)
         results["gpu"] = {"name": props.name, "total_gb": props.total_memory / 1e9}
         logger.info(
-            "gpu: %s, %.1f GB total | batch_size=%d segment_duration=%.1fs "
-            "-- peak memory is reported per attack below, size batches off the "
-            "largest peak_reserved_gb (attacks differ a lot)",
+            "gpu: %s, %.1f GB total | world_size=%d batch_size=%d (per rank) "
+            "segment_duration=%.1fs -- peak memory is reported per attack "
+            "below (max over ranks), size batches off the largest "
+            "peak_reserved_gb (attacks differ a lot)",
             props.name,
             props.total_memory / 1e9,
+            env.world_size,
             cfg.batch_size,
             cfg.segment_duration,
         )
@@ -679,8 +853,8 @@ def run(cfg: EvalConfig) -> tp.Dict[str, tp.Any]:
     try:
         logger.info("=== perceptual metrics (no attack) ===")
         _reset_peak_memory(device)
-        perceptual = evaluate_perceptual(eval_batches, cfg, device)
-        perceptual.update(_peak_memory_metrics(device))
+        perceptual = evaluate_perceptual(eval_batches, cfg, device, env)
+        perceptual.update(_peak_memory_metrics(device, env))
         results["perceptual"] = perceptual
         tracker.log({f"perceptual/{k}": v for k, v in perceptual.items()}, step=0)
         logger.info("perceptual: %s", perceptual)
@@ -710,10 +884,11 @@ def run(cfg: EvalConfig) -> tp.Dict[str, tp.Any]:
                     device,
                     strength=headline_strength,
                     progress_desc=f"{name} (headline)",
+                    env=env,
                     row_artifacts_name=name,
                 )
                 robustness["seconds"] = time.perf_counter() - attack_started
-                robustness.update(_peak_memory_metrics(device))
+                robustness.update(_peak_memory_metrics(device, env))
                 results["attacks"][name] = {"tag": tag, **robustness}
                 # Flatten the dict-valued entries: mlflow's log_metric only
                 # takes scalars, so passing `confusion`/`fpr_support` through
@@ -751,6 +926,7 @@ def run(cfg: EvalConfig) -> tp.Dict[str, tp.Any]:
                             strength=t_star,
                             n_batches=cfg.n_curve_batches,
                             progress_desc=f"{name} curve t*={t_star:g} ({i}/{len(cfg.t_star_grid)})",
+                            env=env,
                         )
                         curve.append({"t_star": t_star, **point})
                         tracker.log({f"{name}/tpr_at_fpr_vs_t_star": point["tpr_at_fpr"]}, step=int(t_star * 1000))
@@ -761,23 +937,26 @@ def run(cfg: EvalConfig) -> tp.Dict[str, tp.Any]:
                     results["attacks"][name]["curve_seconds"] = time.perf_counter() - curve_started
                     logger.info("%s robustness curve (detection vs t*): %s", name, curve)
 
-        out_dir = Path(cfg.output_dir)
-        confusion_path = plot_confusion_matrices(results, out_dir / f"{cfg.label}_confusion.png")
-        if confusion_path is not None:
-            results["confusion_matrix_plot"] = str(confusion_path)
-            tracker.log_figure(confusion_path)
-            logger.info("confusion matrix plot: %s", confusion_path)
+        # Plots are written once, by rank 0 -- 4 ranks racing to write the
+        # same two PNG paths would interleave partial files.
+        if env.is_main:
+            out_dir = Path(cfg.output_dir)
+            confusion_path = plot_confusion_matrices(results, out_dir / f"{cfg.label}_confusion.png")
+            if confusion_path is not None:
+                results["confusion_matrix_plot"] = str(confusion_path)
+                tracker.log_figure(confusion_path)
+                logger.info("confusion matrix plot: %s", confusion_path)
 
-        curve_path = plot_robustness_curve(results, out_dir / f"{cfg.label}_robustness_curve.png")
-        if curve_path is not None:
-            results["robustness_curve_plot"] = str(curve_path)
-            tracker.log_figure(curve_path)
-            logger.info("robustness curve plot: %s", curve_path)
-        roc_path = plot_roc_curves(results, out_dir / f"{cfg.label}_roc.png")
-        if roc_path is not None:
-            results["roc_plot"] = str(roc_path)
-            tracker.log_figure(roc_path)
-            logger.info("roc plot: %s", roc_path)
+            curve_path = plot_robustness_curve(results, out_dir / f"{cfg.label}_robustness_curve.png")
+            if curve_path is not None:
+                results["robustness_curve_plot"] = str(curve_path)
+                tracker.log_figure(curve_path)
+                logger.info("robustness curve plot: %s", curve_path)
+            roc_path = plot_roc_curves(results, out_dir / f"{cfg.label}_roc.png")
+            if roc_path is not None:
+                results["roc_plot"] = str(roc_path)
+                tracker.log_figure(roc_path)
+                logger.info("roc plot: %s", roc_path)
         results["total_seconds"] = time.perf_counter() - run_started
         # Persist BEFORE main()'s summary printer runs: that printer has
         # crashed on a missing key before (KeyError 'pesq' under
@@ -786,6 +965,7 @@ def run(cfg: EvalConfig) -> tp.Dict[str, tp.Any]:
         _write_result_files(cfg, results)
     finally:
         tracker.finish()
+        cleanup_distributed(env)
 
     return results
 
@@ -1061,9 +1241,16 @@ def _print_results_table(results: tp.Dict[str, tp.Any]) -> None:
 
 
 def main() -> None:
-    logging.basicConfig(level=logging.INFO)
+    # Rank-aware logging: rank 0 at INFO, the others at WARNING, so a 4-GPU
+    # run doesn't print every line four times. Returns the env read from
+    # torchrun's environment variables (no process group needed).
+    env = configure_logging(logging.INFO)
     cfg = load_eval_config()
     results = run(cfg)
+
+    # Every rank holds the same all-gathered results; only one prints them.
+    if not env.is_main:
+        return
 
     _print_results_table(results)
     _print_timing_and_projection(cfg, results)

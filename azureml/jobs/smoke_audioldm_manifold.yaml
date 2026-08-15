@@ -1,0 +1,110 @@
+$schema: https://azuremlschemas.azureedge.net/latest/commandJob.schema.json
+
+# az ml job create -f azureml/jobs/smoke_audioldm_manifold.yaml \
+#   --resource-group manifold3-rg --workspace-name as-manifold3-w3-ws
+#
+# Stage 1 of 2 on Singularity ("manifold"), 4x A100 via DDP.
+#
+# Why this exists alongside smoke_audioldm.yaml (playground, 1x A100):
+#   * playground's a100x1 pool is fully contended -- all 27 nodes were busy and
+#     our job sat Queued for over an hour. as-manifold3-w3-vc has 32 A100
+#     NC_A100_v4 cores with 0 in use.
+#   * a single A100 was already hitting OOM on this workload.
+#
+# Compliance: manifold is a compliant cluster, so there is deliberately no
+# WANDB_API_KEY here. aml_run.sh resolves the tracker to mlflow whenever it is
+# inside an AzureML job with no wandb key, which records to this run in Studio
+# with no outbound network. wandb would be external egress, and
+# tracking.py:WandbTracker uploads audio samples and figures, not just scalars.
+type: command
+
+experiment_name: audioseal-robust-diffusion-swap
+display_name: smoke-audioldm-manifold-4gpu
+description: >-
+  Cheap end-to-end validation of the AudioLDM-direction pipeline on 4x A100
+  under torchrun/DDP: a handful of train steps and a reduced eval, purely to
+  prove the Singularity path works before committing to the full run.
+
+code: ../..
+environment: azureml:audioseal-robust-diffusion@latest
+
+# The virtual cluster ARM id, not a compute name -- this is how Singularity
+# jobs are targeted.
+compute: /subscriptions/5c9e4789-4852-4ffe-8551-d682affcbd74/resourceGroups/manifold3-rg/providers/Microsoft.MachineLearningServices/virtualclusters/as-manifold3-w3-vc
+
+resources:
+  # NC96ad_A100_v4 = 4x A100 80GB on one node. aml_run.sh reads the GPU count
+  # off nvidia-smi and launches torchrun --nproc_per_node=4 automatically, so
+  # the SKU is the only thing that needs changing to scale this.
+  instance_type: Singularity.NC96ad_A100_v4
+  instance_count: 1
+  # NCCL's shared-memory transport lives in /dev/shm; the 64MB default makes
+  # multi-GPU collectives fail or crawl. Belongs directly under `resources`
+  # (not under `properties`) -- verified against a working job in this VC.
+  shm_size: 64g
+
+queue_settings:
+  # STANDARD ONLY. Never premium -- premium is a materially more expensive
+  # tier and is not ours to spend on this workload, regardless of how long
+  # standard has to wait for a node. This applies to every job in this repo.
+  job_tier: standard
+
+inputs:
+  librispeech:
+    type: uri_folder
+    path: azureml:librispeech-asr:1
+    # download, not ro_mount -- data.py:WavDirDataset walks the tree once per
+    # audio extension per split, and directory listings over blobfuse are
+    # network round-trips.
+    mode: download
+  checkpoints:
+    # uri_folder, not custom_model: see assets/diffusion_checkpoints_manifold.yaml
+    # for why the model-asset registration path is closed to us here.
+    type: uri_folder
+    path: azureml:psiml-diffusion-checkpoints:1
+    mode: ro_mount
+
+outputs:
+  artifacts:
+    type: uri_folder
+    mode: rw_mount
+
+# data.batch_size is PER GPU under DDP, so batch_size=2 here means an effective
+# batch of 8 across the four ranks.
+#
+# n_eval_batches=4 / n_curve_batches=4 are NOT arbitrary: both are GLOBAL
+# totals that evaluate.py splits with shard_size(), so anything below
+# world_size leaves the high ranks with an empty shard. n_eval_batches=2 on 4
+# ranks would give ranks 2 and 3 zero batches and fail the run outright. 4 is
+# the smallest value that keeps every rank fed.
+command: >-
+  bash azureml/aml_run.sh audioldm
+  --librispeech ${{inputs.librispeech}}
+  --checkpoints ${{inputs.checkpoints}}
+  --artifacts ${{outputs.artifacts}}
+  --
+  epochs=1
+  updates_per_epoch=5
+  log_every=1
+  eval_every=2
+  data.batch_size=2
+  data.num_workers=2
+  data.segment_duration=2.0
+  attack.sgmse.num_steps=10
+
+environment_variables:
+  PYTHONUNBUFFERED: "1"
+  AZUREML_ARTIFACTS_DEFAULT_TIMEOUT: "1200"
+  EVAL_EXTRA_ARGS: "n_eval_batches=4 n_curve_batches=4"
+  # Surface the real NCCL error instead of a generic hang, and do not let a
+  # slow rank-0 checkpoint download trip the heartbeat watchdog.
+  TORCH_NCCL_ASYNC_ERROR_HANDLING: "1"
+  TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC: "86400"
+  # Singularity runs the job under this user-assigned identity; it is what
+  # holds Storage Blob Data Contributor on the playground storage account
+  # backing the psiml_assets_playground datastore.
+  _AZUREML_SINGULARITY_JOB_UAI: /subscriptions/5c9e4789-4852-4ffe-8551-d682affcbd74/resourceGroups/shared-rg/providers/Microsoft.ManagedIdentity/userAssignedIdentities/as-shared-w3-id
+
+limits:
+  # 2h. Dominated by the image pull and the 6.8 GB download, not the 5 steps.
+  timeout: 7200
