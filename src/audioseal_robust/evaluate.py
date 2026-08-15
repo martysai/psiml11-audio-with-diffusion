@@ -337,18 +337,18 @@ def evaluate_attack(
     # is a prefix of local batches, not a re-slice of the global set.
     local_n_batches = shard_size(n_batches, env)
 
-    # Row artifacts are written by rank 0 only, like every other side effect in
-    # this project (the tracker, the plots, the checkpoints). Four ranks
-    # opening the same rows.csv would interleave headers and rows into
-    # nonsense, and their row_index counters would collide. Rank 0's shard is a
-    # sample of the eval set, which is all these are for -- listening to
-    # individual (x, x_wm, x_att) triples -- while every reported metric below
-    # is still computed over all ranks.
+    # Row artifacts are written per rank. Every rank holds a different shard
+    # but would otherwise write audio/00000_x.wav and rows.csv into the same
+    # directory, clobbering each other's files. Under torchrun each rank gets
+    # its own rank<N>/ subfolder, so row_index can stay a local counter; a
+    # single-process run keeps the original flat layout unchanged.
     row_writer = None
     row_file = None
-    rows_dir = None
-    if row_artifacts_name is not None and cfg.save_row_artifacts and env.is_main:
+    rows_dir: tp.Optional[Path] = None
+    if row_artifacts_name is not None and cfg.save_row_artifacts:
         rows_dir = Path(cfg.output_dir) / f"{cfg.label}_{row_artifacts_name}_rows"
+        if env.is_distributed:
+            rows_dir = rows_dir / f"rank{env.rank}"
         rows_dir.mkdir(parents=True, exist_ok=True)
         row_file = open(rows_dir / "rows.csv", "w", newline="")
         row_writer = csv.DictWriter(
@@ -404,6 +404,7 @@ def evaluate_attack(
             attack_sisnr_values.append(sisnr_score(x_wm, x_att_pos))
 
             if row_writer is not None:
+                assert rows_dir is not None  # set together with row_writer
                 decoded = (m_hat > 0.5).float()
                 per_example_bit_acc = (decoded == message.float()).float().mean(dim=-1)
                 for i in range(x.shape[0]):
