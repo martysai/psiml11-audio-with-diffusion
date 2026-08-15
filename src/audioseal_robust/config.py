@@ -29,19 +29,22 @@ from omegaconf import OmegaConf
 
 @dataclass
 class GeneratorConfig:
-    # Model card name (see src/audioseal/cards/) or path/HF uri to a
-    # checkpoint, passed to audioseal.AudioSeal.load_generator.
+    # Model card name (see src/audioseal/cards/), path, or HF uri to a
+    # checkpoint, passed to audioseal.AudioSeal.load_generator. A checkpoint
+    # written by audioseal_robust.export_checkpoint also works here, since that
+    # rewrites `xp.cfg` into the architecture config parse_config wants.
     checkpoint: str = "audioseal_wm_16bits"
 
-    # Optional path to a train.py-saved checkpoint (a .pth with a "model"
+    # Optional path to a raw train.py-saved checkpoint (a .pth with a "model"
     # key, e.g. checkpoints/.../generator_epochN.pth) to load ON TOP of
     # `checkpoint` above once the model is built. Kept separate from
     # `checkpoint` because that field goes through AudioSeal.load_generator's
     # parse_model/parse_config, which requires a full model config (asserts
-    # "seanet" in config) that our saved dicts don't carry -- only the
-    # architecture-defining pretrained checkpoint can go there. This just
-    # does a plain load_state_dict for resuming fine-tuning from a later
-    # epoch without retraining from the pretrained baseline.
+    # "seanet" in config) that train.py's saved dicts don't carry -- their
+    # "xp.cfg" is the TrainConfig, not a seanet architecture. This just does a
+    # plain load_state_dict for resuming fine-tuning from a later epoch without
+    # retraining from the pretrained baseline. Run the checkpoint through
+    # audioseal_robust.export_checkpoint if you want it usable in `checkpoint`.
     resume_from: tp.Optional[str] = None
 
 
