@@ -994,7 +994,13 @@ class SampledReconstructionAttack(nn.Module):
             point happened to draw.
           * Sampling here also consumes from the shared RNG, so evaluating
             shifts the branch sequence that training itself sees. Passing an
-            explicit name draws nothing.
+            explicit name draws nothing. That matters under DDP too: the
+            shared RNG is seeded identically on every rank so all ranks walk
+            the same branch sequence, and an eval that consumed from it would
+            have to consume identically everywhere to keep them aligned.
+
+        A weight-0 attack can still be named explicitly: the name selects a
+        branch directly and bypasses the sampling weights entirely.
         """
         if name is None:
             name = self._rng.choices(self._names, weights=self._sampling_weights, k=1)[0]

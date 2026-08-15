@@ -30,6 +30,8 @@ import torch.nn as nn  # noqa: E402
 
 from audioseal_robust.attacks import IdentityAttack, SampledReconstructionAttack  # noqa: E402
 
+SEED = 1234
+
 
 class _ScaleAttack(nn.Module):
     """Stands in for a real attack; identifiable by what it does to the input."""
@@ -45,7 +47,7 @@ class _ScaleAttack(nn.Module):
 def _build(weights=None):
     attacks = {"identity": IdentityAttack(), "loud": _ScaleAttack(3.0)}
     weights = weights or {"identity": 0.5, "loud": 0.5}
-    return SampledReconstructionAttack(attacks, weights, rng=random.Random(1234))
+    return SampledReconstructionAttack(attacks, weights)
 
 
 def test_branch_names_lists_only_enabled_attacks():
@@ -75,20 +77,21 @@ def test_explicit_name_is_deterministic_across_calls():
 
 
 def test_explicit_name_does_not_consume_the_shared_rng():
-    """Evaluating must not shift the branch sequence training sees. Two
-    attacks with identical seeds must stay in lockstep even when one of them
-    also serves explicit-name calls in between."""
-    training_only = _build()
-    with_evals = _build()
+    """Evaluating must not shift the branch sequence training sees. From the
+    same seed, the sampled sequence must be identical whether or not
+    explicit-name calls are interleaved between the draws."""
+    attack = _build()
     x = torch.ones(1, 1, 4)
 
-    expected = [training_only(x)[1] for _ in range(6)]
+    random.seed(SEED)
+    expected = [attack(x)[1] for _ in range(6)]
 
+    random.seed(SEED)
     got = []
     for _ in range(6):
-        got.append(with_evals(x)[1])
-        with_evals(x, name="identity")  # an "eval" in between
-        with_evals(x, name="loud")
+        got.append(attack(x)[1])
+        attack(x, name="identity")  # an "eval" in between
+        attack(x, name="loud")
 
     assert got == expected
 
@@ -99,6 +102,7 @@ def test_sampling_still_happens_without_a_name():
     attack = _build()
     x = torch.ones(1, 1, 4)
 
+    random.seed(SEED)
     drawn = {attack(x)[1] for _ in range(50)}
 
     assert drawn == {"identity", "loud"}
@@ -115,9 +119,10 @@ def test_sampled_sequence_is_reproducible_for_a_given_seed():
     seed and the call count, which is how the eval artifact was confirmed
     rather than guessed at."""
     x = torch.ones(1, 1, 4)
-
     attack = _build()
+
+    random.seed(SEED)
     sequence = [attack(x)[1] for _ in range(8)]
 
-    replay = _build()  # same seed
-    assert [replay(x)[1] for _ in range(8)] == sequence
+    random.seed(SEED)
+    assert [attack(x)[1] for _ in range(8)] == sequence
