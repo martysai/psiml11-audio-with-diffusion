@@ -132,8 +132,21 @@ def checkpoint(func, inputs, params, flag):
     :param flag: if False, disable gradient checkpointing.
     """
     if flag:
-        args = tuple(inputs) + tuple(params)
-        return CheckpointFunction.apply(func, len(inputs), *args)
+        input_tensors = tuple(inputs)
+        # Hand autograd only the parameters it can actually differentiate.
+        # CheckpointFunction.backward runs torch.autograd.grad over every
+        # tensor it was given, which raises
+        #     RuntimeError: One of the differentiated Tensors does not require grad
+        # as soon as one of them has requires_grad=False. That happens whenever
+        # a checkpointed module is frozen but still differentiated through --
+        # gradients only need to reach the input, not the weights.
+        # allow_unused=True does not cover this: it is about tensors that are
+        # unreachable from the output, not tensors that never wanted a gradient.
+        # Frozen parameters are constants during recomputation, so leaving them
+        # out changes no gradient that would have been produced.
+        grad_params = tuple(p for p in params if p.requires_grad)
+        args = input_tensors + grad_params
+        return CheckpointFunction.apply(func, len(input_tensors), *args)
     else:
         return func(*inputs)
 

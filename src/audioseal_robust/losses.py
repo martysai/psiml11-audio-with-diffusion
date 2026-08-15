@@ -49,16 +49,24 @@ def detection_loss_components(
     message: torch.Tensor,
     presence_target: float = 1.0,
     eps: float = 1e-6,
+    bit_weight: float = 1.0,
 ) -> tp.Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Same computation as `detection_loss`, but also returns the two terms
     separately -- for logging (see train.py's train_step), where "all the
     losses" means presence and bit-message loss individually, not just their
     sum.
 
-    Args: same as `detection_loss`.
+    Args: same as `detection_loss`, plus:
+        bit_weight: extra weight on bit_loss within this function's own sum
+            (presence_loss + bit_weight * bit_loss) -- see
+            TrainConfig.lambda_bit for why you'd raise this above 1.0.
+            Returned presence_loss/bit_loss are still the raw, UNweighted
+            per-term values (so logging shows the actual loss, not the
+            scaled contribution) -- only the combined first return value
+            includes bit_weight.
 
     Returns:
-        (presence_loss + bit_loss, presence_loss, bit_loss) -- all scalars.
+        (presence_loss + bit_weight * bit_loss, presence_loss, bit_loss).
     """
     # Forces fp32 regardless of any ambient bf16/fp16 autocast (see train.py's
     # _autocast): BCELoss/binary_cross_entropy raises rather than silently
@@ -78,7 +86,7 @@ def detection_loss_components(
 
         bit_loss = bce(m_hat.clamp(eps, 1 - eps), message.float())
 
-    return presence_loss + bit_loss, presence_loss, bit_loss
+    return presence_loss + bit_weight * bit_loss, presence_loss, bit_loss
 
 
 def detection_loss(

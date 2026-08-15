@@ -33,6 +33,17 @@ class GeneratorConfig:
     # checkpoint, passed to audioseal.AudioSeal.load_generator.
     checkpoint: str = "audioseal_wm_16bits"
 
+    # Optional path to a train.py-saved checkpoint (a .pth with a "model"
+    # key, e.g. checkpoints/.../generator_epochN.pth) to load ON TOP of
+    # `checkpoint` above once the model is built. Kept separate from
+    # `checkpoint` because that field goes through AudioSeal.load_generator's
+    # parse_model/parse_config, which requires a full model config (asserts
+    # "seanet" in config) that our saved dicts don't carry -- only the
+    # architecture-defining pretrained checkpoint can go there. This just
+    # does a plain load_state_dict for resuming fine-tuning from a later
+    # epoch without retraining from the pretrained baseline.
+    resume_from: tp.Optional[str] = None
+
 
 @dataclass
 class DetectorConfig:
@@ -212,6 +223,7 @@ class OptimConfig:
     betas: tp.Tuple[float, float] = (0.5, 0.9)
     weight_decay: float = 0.0
     max_norm: tp.Optional[float] = 3.0
+    max_x_wm_grad_norm: tp.Optional[float] = 1000.0
 
 
 @dataclass
@@ -241,6 +253,13 @@ class TrackingConfig:
     mlflow_tracking_uri: tp.Optional[str] = None  # None -> local ./mlruns
     wandb_mode: str = "online"  # "online" | "offline" | "disabled"
     log_audio_every: int = 0  # 0 disables; else log one x_wm sample every N steps
+    # Per-step CUDA allocator metrics under the "mem/" prefix -- the only way
+    # to see whether the diffusion attacks' activation checkpointing is
+    # actually buying anything, since the wandb/nvidia-smi system panels
+    # report reserved (pool) memory and stay flat either way. Costs a few
+    # counter reads per step, no device sync. Ignored off CUDA. See
+    # train.py:CudaMemoryProbe.
+    log_memory: bool = True
 
 
 @dataclass
@@ -272,6 +291,19 @@ class TrainConfig:
     # overlap with if that solver were used instead/also.
     lambda_det: float = 1.0
     lambda_perc: float = 1.0
+    # Extra weight on bit_loss specifically, within detection_loss_components'
+    # (presence_loss + lambda_bit * bit_loss) -- separate from lambda_det,
+    # which scales the whole presence+bit sum together and so can't rebalance
+    # the two against each other. Default 1.0 == old unweighted behavior
+    # (equivalent to no bit_loss field at all). See run_train_10h.sh's
+    # lambda_bit=2.0 override for why: presence_loss is the "easy" half of
+    # detection_loss (the generator can win it just by embedding *something*
+    # detectable, without correctly encoding bits), so it drops fast and
+    # plateaus while bit_loss doesn't move (see the comic-snowball-9 run's
+    # eval/bit_loss curve) -- weighting bit_loss higher pushes optimization
+    # toward the actually-hard sub-problem instead of letting it settle for
+    # the cheap presence-only win.
+    lambda_bit: float = 1.0
 
     # Per-example watermark SNR (dB) is sampled uniformly from this range
     # every training step (see train.py:embed_watermark) rather than using
@@ -381,6 +413,17 @@ class EvalConfig:
     # Where the confusion-matrix and robustness-curve PNGs (see plotting.py)
     # get written, one pair per run under f"{label}_*.png".
     output_dir: str = "./eval_outputs"
+
+    # Per-example artifacts (x, x_wm, x_att as .wav + a CSV of per-row
+    # metrics: bit_accuracy, presence_pos, presence_neg, attack_sisnr) under
+    # f"{output_dir}/{label}_{attack_name}_rows/" -- one dir per attack,
+    # every row from the HEADLINE pass only (not the robustness-curve sweep,
+    # which would multiply this by len(t_star_grid) for numbers nobody
+    # inspects per-example). Off by default: batch_size * n_eval_batches
+    # examples * 3 wavs each adds up (e.g. 8*20*3 = 480 files at the config
+    # defaults, 8*150*3=3600 for run_full_eval_1h.sh) and most runs only
+    # need the aggregate metrics evaluate_attack already returns.
+    save_row_artifacts: bool = False
 
     # Robustness (measured after the attack).
     fpr_target: float = 0.01  # TPR@FPR operating point
