@@ -30,6 +30,8 @@ attack's real numbers as its checkpoint gets configured without any change
 to this script.
 """
 
+import csv
+import json
 import logging
 import random
 import time
@@ -223,6 +225,22 @@ def prepare_eval_batches(
         prepared.append((x.cpu(), x_wm.cpu(), message.cpu()))
     if not prepared:
         raise RuntimeError("Evaluation dataloader produced no batches")
+    # A dataloader with drop_last=True silently yields fewer batches than
+    # asked for when the dataset is too small, and every downstream number
+    # (including n_negatives, which sets the achievable FPR resolution) would
+    # then be computed over a smaller sample than the label claims -- a
+    # "full_1h" run quietly becoming an 8-minute one. Fail loudly instead.
+    if len(prepared) < cfg.n_eval_batches:
+        dataset = getattr(dataloader, "dataset", None)
+        n_files = len(dataset) if dataset is not None else "unknown"
+        raise RuntimeError(
+            f"Evaluation dataloader produced only {len(prepared)} batches, but "
+            f"n_eval_batches={cfg.n_eval_batches} was requested "
+            f"(eval_dir={cfg.eval_dir!r} holds {n_files} usable files; "
+            f"batch_size={cfg.batch_size} with drop_last=True needs at least "
+            f"{cfg.n_eval_batches * cfg.batch_size}). Lower n_eval_batches or "
+            f"point eval_dir at a larger set."
+        )
     return prepared
 
 
@@ -485,7 +503,7 @@ def run(cfg: EvalConfig) -> tp.Dict[str, tp.Any]:
         wandb_mode=cfg.tracking.wandb_mode,
     )
 
-    results: tp.Dict[str, tp.Any] = {"label": cfg.label}
+    results: tp.Dict[str, tp.Any] = {"label": cfg.label, "device": str(device)}
     if device.type == "cuda":
         props = torch.cuda.get_device_properties(device)
         results["gpu"] = {"name": props.name, "total_gb": props.total_memory / 1e9}
@@ -625,6 +643,11 @@ def run(cfg: EvalConfig) -> tp.Dict[str, tp.Any]:
             tracker.log_figure(curve_path)
             logger.info("robustness curve plot: %s", curve_path)
         results["total_seconds"] = time.perf_counter() - run_started
+        # Persist BEFORE main()'s summary printer runs: that printer has
+        # crashed on a missing key before (KeyError 'pesq' under
+        # compute_pesq=false), which used to throw away a whole run's
+        # numbers even though every metric had already been computed.
+        _write_result_files(cfg, results)
     finally:
         tracker.finish()
 
@@ -700,6 +723,115 @@ def _print_timing_and_projection(cfg: EvalConfig, results: tp.Dict[str, tp.Any])
         f"(curve held fixed at {_fmt_duration(curve_seconds_total)} total -- "
         f"raise n_curve_batches={cfg.n_curve_batches} if you want it more precise, "
         "that's the only thing that changes its cost)"
+    )
+
+
+def _write_result_files(cfg: EvalConfig, results: tp.Dict[str, tp.Any]) -> None:
+    """Dump `results` to disk next to the PNGs: a flat per-attack CSV, a
+    flat per-curve-point CSV, and the full nested JSON.
+
+    The harness only ever emitted plots and a stdout table, so every number
+    behind a run lived in a log that has to be re-parsed by hand (and in a
+    tracking backend that may be offline/none). Each CSV row carries its own
+    run-level context (label, device, sample sizes, perceptual metrics) so
+    runs can simply be concatenated for cross-run comparison without a join.
+
+    The caveat fields travel WITH the numbers on purpose: `fpr_supported`
+    and `attack_failure_rate` are exactly what distinguishes a real result
+    from one where the negative sample was too thin to resolve the target
+    FPR, or where the attack never actually perturbed anything.
+    """
+    out_dir = Path(cfg.output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    perceptual = results.get("perceptual") or {}
+
+    # n_positives == n_negatives: evaluate_attack scores each batch twice,
+    # once on the watermarked copy and once on the clean one.
+    n_headline = cfg.batch_size * cfg.n_eval_batches
+    n_curve = cfg.batch_size * cfg.n_curve_batches
+
+    run_ctx = {
+        "label": results.get("label"),
+        "device": str(results.get("device", "")),
+        "eval_dir": str(cfg.eval_dir),
+        "segment_duration": cfg.segment_duration,
+        "batch_size": cfg.batch_size,
+        "perceptual_sisnr": perceptual.get("sisnr"),
+        "perceptual_pesq": perceptual.get("pesq"),
+    }
+
+    metrics_path = out_dir / f"{cfg.label}_metrics.csv"
+    metrics_cols = list(run_ctx) + [
+        "attack", "tag", "skipped", "n_eval_batches", "n_positives", "n_negatives",
+        "fpr_target", "fpr_resolution", "min_negatives_for_target", "fpr_supported",
+        "bit_accuracy", "tpr_at_fpr", "tpr_at_fpr_attacked", "f1", "attack_sisnr",
+        "tp", "fn", "fp", "tn",
+        "attack_failure_rate", "n_attack_failures",
+        "seconds", "peak_reserved_gb",
+    ]
+    scalar_keys = (
+        "bit_accuracy", "tpr_at_fpr", "tpr_at_fpr_attacked", "f1", "attack_sisnr",
+        "attack_failure_rate", "n_attack_failures", "seconds", "peak_reserved_gb",
+    )
+    with metrics_path.open("w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=metrics_cols, extrasaction="ignore")
+        writer.writeheader()
+        for name, r in results.get("attacks", {}).items():
+            confusion = r.get("confusion") or {}
+            support = r.get("fpr_support") or {}
+            row = {
+                **run_ctx,
+                "attack": name,
+                "tag": r.get("tag", ""),
+                "skipped": r.get("skipped", ""),
+                "n_eval_batches": cfg.n_eval_batches,
+                "n_positives": n_headline,
+                "n_negatives": support.get("n_negatives", n_headline),
+                "fpr_target": cfg.fpr_target,
+                "fpr_resolution": support.get("fpr_resolution"),
+                "min_negatives_for_target": support.get("min_negatives_for_target"),
+                "fpr_supported": support.get("supported"),
+                **{k: confusion.get(k) for k in ("tp", "fn", "fp", "tn")},
+                **{k: r.get(k) for k in scalar_keys},
+            }
+            writer.writerow(row)
+
+    curve_rows = []
+    for name, r in results.get("attacks", {}).items():
+        for point in r.get("robustness_curve") or []:
+            flat = {k: v for k, v in point.items() if not isinstance(v, dict)}
+            curve_rows.append({
+                **run_ctx,
+                "attack": name,
+                "n_curve_batches": cfg.n_curve_batches,
+                "n_positives": n_curve,
+                "n_negatives": n_curve,
+                **flat,
+            })
+    curve_path = out_dir / f"{cfg.label}_curve.csv"
+    if curve_rows:
+        curve_cols = list(run_ctx) + [
+            "attack", "n_curve_batches", "n_positives", "n_negatives",
+            "t_star", "bit_accuracy", "tpr_at_fpr", "tpr_at_fpr_attacked", "f1",
+            "attack_sisnr", "attack_failure_rate", "n_attack_failures",
+        ]
+        with curve_path.open("w", newline="", encoding="utf-8") as fh:
+            writer = csv.DictWriter(fh, fieldnames=curve_cols, extrasaction="ignore")
+            writer.writeheader()
+            writer.writerows(curve_rows)
+
+    json_path = out_dir / f"{cfg.label}_results.json"
+    with json_path.open("w", encoding="utf-8") as fh:
+        # default=str: results carries a few non-JSON-native values (Paths,
+        # numpy/torch scalars) that are only ever read back as text.
+        json.dump(results, fh, indent=2, sort_keys=True, default=str)
+
+    results["metrics_csv"] = str(metrics_path)
+    if curve_rows:
+        results["curve_csv"] = str(curve_path)
+    results["results_json"] = str(json_path)
+    logger.info(
+        "wrote %s, %s%s", metrics_path, json_path, f", {curve_path}" if curve_rows else ""
     )
 
 
@@ -797,6 +929,13 @@ def main() -> None:
 
     _print_results_table(results)
     _print_timing_and_projection(cfg, results)
+    for key, caption in (
+        ("metrics_csv", "metrics csv"),
+        ("curve_csv", "curve csv"),
+        ("results_json", "results json"),
+    ):
+        if key in results:
+            print(f"{caption}: {results[key]}")
     if "confusion_matrix_plot" in results:
         print(f"confusion matrix plot: {results['confusion_matrix_plot']}")
     if "robustness_curve_plot" in results:
