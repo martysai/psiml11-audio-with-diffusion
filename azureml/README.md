@@ -26,7 +26,7 @@ The workspace this was set up against:
 
 | | |
 |---|---|
-| subscription | `5c9e4789-4852-4ffe-8551-d682affcbd74` (ASG Azure ML) |
+| subscription | ASG Azure ML — resolved at submit time, never committed (this repo is public) |
 | resource group | `playground-rg` |
 | workspace | `as-playground-w3-ws` (westus3) |
 | compute | `a100x1` — `STANDARD_NC24ADS_A100_V4`, 1× A100 80GB |
@@ -37,8 +37,12 @@ larger clusters would leave GPUs idle.
 ```bash
 az login
 az extension add -n ml
-az account set --subscription 5c9e4789-4852-4ffe-8551-d682affcbd74
+az account set --subscription <your-subscription-id>   # ASG Azure ML
 az configure --defaults group=playground-rg workspace=as-playground-w3-ws
+
+# Everything below resolves the subscription from the CLI session above, so no
+# subscription id is committed anywhere in this repo. To pin it explicitly
+# instead, export AZUREML_SUBSCRIPTION_ID.
 
 az ml data create -f azureml/assets/librispeech.yaml
 az ml model create -f azureml/assets/diffusion_checkpoints.yaml
@@ -183,10 +187,18 @@ az ml data create -f azureml/assets/diffusion_checkpoints_manifold.yaml `
 az ml environment create -f azureml/environment.yaml `
   --resource-group $rg --workspace-name $ws
 
-# then, per run:
-az ml job create -f azureml/jobs/smoke_audioldm_manifold.yaml `
-  --name "smoke-audioldm-manifold-$(Get-Date -Format 'MMdd-HHmmss')" `
-  --resource-group $rg --workspace-name $ws
+# then, per run -- via the wrapper, which fills in the subscription id the
+# manifold YAMLs carry as a ${AZUREML_SUBSCRIPTION_ID} placeholder (a virtual
+# cluster is targeted by full ARM id, and this repo is public). It already
+# passes --resource-group/--workspace-name above; everything after the YAML
+# path is forwarded to `az ml job create`.
+python azureml/submit_manifold.py azureml/jobs/smoke_audioldm_manifold.yaml `
+  --name "smoke-audioldm-manifold-$(Get-Date -Format 'MMdd-HHmmss')"
+
+# the three HopSkipJump eval arms submit the same way:
+python azureml/submit_manifold.py azureml/jobs/eval_hsj_baseline_manifold.yaml
+python azureml/submit_manifold.py azureml/jobs/eval_hsj_sgmse_epoch3_manifold.yaml
+python azureml/submit_manifold.py azureml/jobs/eval_hsj_audioldm_epoch18_manifold.yaml
 ```
 
 Three things about this that are not obvious:

@@ -51,11 +51,17 @@ from audioseal.models import AudioSealDetector, AudioSealWM
 from .attacks import (
     AudioLDMAttack,
     BigVGANAttack,
+    CodecAttack,
     DACAttack,
+    GaussianNoiseAttack,
     HopSkipJumpAttack,
     IdentityAttack,
+    LowpassAttack,
     MBDAttack,
+    PGDAttack,
+    QuantizationAttack,
     SGMSEAttack,
+    SpeedAttack,
 )
 from .config import EvalConfig, load_eval_config
 from .data import build_dataloader
@@ -97,6 +103,20 @@ _ATTACK_CLASSES: tp.Dict[str, tp.Type[nn.Module]] = {
     "audioldm": AudioLDMAttack,
     "mbd": MBDAttack,
     "hopskipjump": HopSkipJumpAttack,
+    # Fixed-budget attacks. Unlike hopskipjump (minimum-norm, so its output
+    # collapses onto the decision boundary and only its *cost* is
+    # informative), these apply a perturbation capped in advance and leave
+    # the score distribution spread out -- so ROC-AUC and TPR@FPR mean
+    # something on them. See attacks.py:PGDAttack / _SignalLevelAttack.
+    "pgd": PGDAttack,
+    "gaussian_noise": GaussianNoiseAttack,
+    "lowpass": LowpassAttack,
+    "speed": SpeedAttack,
+    "quantization": QuantizationAttack,
+    # Both are CodecAttack; the codec/bitrate distinction lives in their
+    # separate EvalAttackConfig entries.
+    "codec_mp3": CodecAttack,
+    "codec_opus": CodecAttack,
 }
 
 # Attacks with a meaningful `strength` (t*) axis: these are the ones that get
@@ -742,12 +762,12 @@ def run(cfg: EvalConfig) -> tp.Dict[str, tp.Any]:
 
     held_out = set(cfg.held_out_attacks)
 
-    # Query-based attacks (currently just HopSkipJumpAttack) need the
-    # detector under test at forward() time, unlike every resynthesis
-    # attack -- see HopSkipJumpAttack's class docstring for why. Duck-typed
-    # via bind_detector rather than threading the detector through every
-    # attack's constructor/forward signature, so this stays a no-op for
-    # every other attack.
+    # Attacks that query the detector under test at forward() time
+    # (HopSkipJumpAttack's hard-label search, PGDAttack's white-box gradient
+    # ascent), unlike every resynthesis attack -- see those classes'
+    # docstrings for why. Duck-typed via bind_detector rather than threading
+    # the detector through every attack's constructor/forward signature, so
+    # this stays a no-op for every other attack.
     for attack in attacks.values():
         bind_detector = getattr(attack, "bind_detector", None)
         if bind_detector is not None:

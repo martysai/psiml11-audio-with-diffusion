@@ -1,8 +1,10 @@
 $schema: https://azuremlschemas.azureedge.net/latest/commandJob.schema.json
 
-# az ml job create -f azureml/jobs/train_audioldm_manifold.yaml \
-#   --name "train-audioldm-manifold-$(date +%m%d-%H%M%S)" \
-#   --resource-group manifold3-rg --workspace-name as-manifold3-w3-ws
+# python azureml/submit_manifold.py azureml/jobs/train_audioldm_manifold.yaml \
+#   --name "train-audioldm-manifold-$(date +%m%d-%H%M%S)"#
+# Use the wrapper, not `az ml job create` directly: `compute:` and
+# `_AZUREML_SINGULARITY_JOB_UAI` below carry a `${AZUREML_SUBSCRIPTION_ID}`
+# placeholder (this repo is PUBLIC) and the CLI does not expand it.
 #
 # Stage 2 of 2 on Singularity ("manifold"), 4x A100 via DDP. Do not submit this
 # until smoke_audioldm_manifold.yaml has come back Completed -- it is the same
@@ -21,7 +23,7 @@ description: >-
 code: ../..
 environment: azureml:audioseal-robust-diffusion@latest
 
-compute: /subscriptions/5c9e4789-4852-4ffe-8551-d682affcbd74/resourceGroups/manifold3-rg/providers/Microsoft.MachineLearningServices/virtualclusters/as-manifold3-w3-vc
+compute: /subscriptions/${AZUREML_SUBSCRIPTION_ID}/resourceGroups/manifold3-rg/providers/Microsoft.MachineLearningServices/virtualclusters/as-manifold3-w3-vc
 
 resources:
   instance_type: Singularity.NC96ad_A100_v4
@@ -135,7 +137,7 @@ environment_variables:
   # splits across ranks with shard_size(), so they must stay >= the GPU count.
   TORCH_NCCL_ASYNC_ERROR_HANDLING: "1"
   TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC: "86400"
-  _AZUREML_SINGULARITY_JOB_UAI: /subscriptions/5c9e4789-4852-4ffe-8551-d682affcbd74/resourceGroups/shared-rg/providers/Microsoft.ManagedIdentity/userAssignedIdentities/as-shared-w3-id
+  _AZUREML_SINGULARITY_JOB_UAI: /subscriptions/${AZUREML_SUBSCRIPTION_ID}/resourceGroups/shared-rg/providers/Microsoft.ManagedIdentity/userAssignedIdentities/as-shared-w3-id
 
 limits:
   # 24h. Generous relative to the ~11h worst-case training estimate above, on

@@ -1,0 +1,135 @@
+$schema: https://azuremlschemas.azureedge.net/latest/commandJob.schema.json
+
+# python azureml/submit_manifold.py azureml/jobs/eval_hsj_baseline_manifold.yaml
+#
+# Use the wrapper, not `az ml job create` directly: `compute:` and
+# `_AZUREML_SINGULARITY_JOB_UAI` below carry a `${AZUREML_SUBSCRIPTION_ID}`
+# placeholder (this repo is PUBLIC) and the CLI does not expand it.
+#
+# Arm 1 of 3. Stock AudioSeal generator + stock detector, under HopSkipJump.
+# The other two arms (eval_hsj_sgmse_epoch3_manifold.yaml,
+# eval_hsj_audioldm_epoch18_manifold.yaml) are identical to this file except
+# for the generator input, --generator, --label and display_name -- that is
+# deliberate, so any difference in the numbers is attributable to the
+# generator alone. Change a protocol knob here and change it in all three.
+#
+# Submitted to Singularity ("manifold") rather than playground because
+# playground's a100x1 pool is fully contended; as-manifold3-w3-vc reports 32
+# NC_A100_v4 GPUs with 0 in use. The playground copies of these three jobs are
+# deliberately left queued as a fallback.
+#
+# Compliance: manifold is a compliant cluster, so there is deliberately no
+# WANDB_API_KEY here. aml_run.sh resolves the tracker to mlflow whenever it is
+# inside an AzureML job with no wandb key, which records to this run in Studio
+# with no outbound network.
+type: command
+
+experiment_name: audioseal-robust-hsj-eval
+display_name: hsj-eval-baseline-manifold
+description: >-
+  HopSkipJump robustness evaluation of the STOCK AudioSeal watermark
+  (audioseal_wm_16bits + audioseal_detector_16bits), 400 positives + 400
+  negatives, with per-sample detector scores written to rows.csv.
+
+code: ../..
+# Pinned rather than @latest: the SDK's label resolution raises
+# ResourceNotFoundError against these workspaces even though versions 1-3
+# exist, and an explicit version is what makes the three arms reproducible.
+environment: azureml:audioseal-robust-diffusion:3
+
+# The virtual cluster ARM id, not a compute name -- this is how Singularity
+# jobs are targeted.
+compute: /subscriptions/${AZUREML_SUBSCRIPTION_ID}/resourceGroups/manifold3-rg/providers/Microsoft.MachineLearningServices/virtualclusters/as-manifold3-w3-vc
+
+resources:
+  # NC24ad_A100_v4 = 1x A100 80GB, the single-GPU member of the same
+  # NC_A100_v4 family the VC has quota for (confirmed in use by existing jobs
+  # in this workspace). HopSkipJump is a sequential per-example search of
+  # hundreds of detector queries and does not shard, so a 4-GPU SKU would
+  # leave three GPUs idle. aml_run.sh reads the GPU count off nvidia-smi, so
+  # it will run plain python3 here rather than torchrun.
+  instance_type: Singularity.NC24ad_A100_v4
+  # Singularity does not support instance_count > 1 for this job shape; the
+  # per-node GPU count is implied by instance_type.
+  instance_count: 1
+  shm_size: 64g
+
+queue_settings:
+  # STANDARD ONLY. Never premium -- premium is a materially more expensive
+  # tier and is not ours to spend on this workload, regardless of how long
+  # standard has to wait for a node. This applies to every job in this repo.
+  job_tier: standard
+
+inputs:
+  librispeech:
+    type: uri_folder
+    path: azureml:librispeech-asr:1
+    # download, not ro_mount -- data.py:WavDirDataset walks the tree once per
+    # audio extension per split, and directory listings over blobfuse are
+    # network round-trips.
+    mode: download
+  # No `checkpoints` input: identity and hopskipjump load no diffusion
+  # backbone, so mounting the 10.9 GB asset would only add startup latency.
+  # No `generators` input either -- this arm evaluates the stock AudioSeal
+  # card, which needs no file.
+
+outputs:
+  artifacts:
+    type: uri_folder
+    # rw_mount so per-sample rows and .wav artifacts land incrementally rather
+    # than only on a clean exit.
+    mode: rw_mount
+
+# Overrides after `--` go to evaluate.py (EvalConfig in
+# src/audioseal_robust/config.py).
+#
+# 50 x 8 = 400 positives + 400 negatives. fpr_target=0.01 needs >=100
+# negatives to resolve at all and ~1000 to be stable, so 400 is a deliberate
+# compromise -- evaluate.py reports fpr_support alongside the number so the
+# caveat travels with the result.
+#
+# identity measures the clean operating point (and the perceptual PESQ /
+# SI-SNR baseline); hopskipjump is the actual attack, held out because it was
+# never trained against. attack.hopskipjump.checkpoint=auto is purely an
+# enable gate -- HopSkipJump needs no weights file.
+#
+# The query budget (num_iterations / init_num_evals / max_num_evals /
+# init_max_trials) matches the reference run. Lowering any of them makes the
+# attack weaker and the watermark look more robust than it is.
+#
+# save_row_artifacts=true is the point of this sweep: per-example CSV with
+# presence_pos / presence_neg (the detector's raw scores), bit_accuracy,
+# attack_sisnr and the x / x_wm / x_att .wav files, under
+# eval_outputs/<label>_hopskipjump_rows/.
+command: >-
+  bash azureml/aml_run.sh eval
+  --librispeech ${{inputs.librispeech}}
+  --artifacts ${{outputs.artifacts}}
+  --label hsj_baseline
+  --
+  batch_size=8
+  n_eval_batches=50
+  segment_duration=3.0
+  eval_attacks=[identity]
+  held_out_attacks=[hopskipjump]
+  attack.hopskipjump.checkpoint=auto
+  attack.hopskipjump.num_iterations=25
+  attack.hopskipjump.init_num_evals=20
+  attack.hopskipjump.max_num_evals=100
+  attack.hopskipjump.init_max_trials=300
+  save_row_artifacts=true
+  tracking.backend=mlflow
+
+environment_variables:
+  PYTHONUNBUFFERED: "1"
+  AZUREML_ARTIFACTS_DEFAULT_TIMEOUT: "1200"
+  # Singularity runs the job under this user-assigned identity; it is what
+  # holds Storage Blob Data Contributor on the playground storage account
+  # backing the psiml_assets_playground datastore.
+  _AZUREML_SINGULARITY_JOB_UAI: /subscriptions/${AZUREML_SUBSCRIPTION_ID}/resourceGroups/shared-rg/providers/Microsoft.ManagedIdentity/userAssignedIdentities/as-shared-w3-id
+
+limits:
+  # 6h. HopSkipJump costs hundreds of detector forward passes PER WAVEFORM;
+  # the reference run of exactly this protocol took 1.7h on one A100. The
+  # margin covers a slower node without letting a hung job burn a day.
+  timeout: 21600
