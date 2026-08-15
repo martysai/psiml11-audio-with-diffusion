@@ -260,6 +260,9 @@ class SGMSEAttack(nn.Module):
         self.sample_rate = sample_rate
         self.checkpoint = checkpoint
         self.num_steps = num_steps
+        # Replaced with a rank-shared generator by SampledReconstructionAttack;
+        # the module default keeps standalone use working exactly as before.
+        self._strength_rng: random.Random = tp.cast(random.Random, random)
         self._model: tp.Optional[nn.Module] = None
         # Overwritten from the checkpoint's own data module in _load_backbone;
         # these are SpecsDataModule's defaults.
@@ -374,7 +377,18 @@ class SGMSEAttack(nn.Module):
             eps = self._model.t_eps
 
             if strength is None:
-                strengths = torch.rand(batch_size, device=device)
+                # Drawn from the rank-shared RNG rather than torch's global
+                # generator, which distributed.seed_everything seeds per rank.
+                # Unlike AudioLDM the step count here is fixed (num_steps), so
+                # this is about comparability rather than cost: identical t*
+                # across ranks means every rank corrupts to the same depth, so
+                # the loss each contributes to the allreduce is measuring the
+                # same difficulty. The per-example spread within the batch is
+                # preserved -- each rank still sees different audio.
+                strengths = torch.tensor(
+                    [self._strength_rng.random() for _ in range(batch_size)],
+                    device=device,
+                )
             else:
                 strengths = torch.full(
                     (batch_size,), float(min(max(strength, 0.0), 1.0)), device=device
@@ -542,6 +556,10 @@ class AudioLDMAttack(nn.Module):
         self.checkpoint = checkpoint
         self.config_path = config
         self.strength_max = strength_max
+        # Replaced with a rank-shared generator by SampledReconstructionAttack;
+        # the module default keeps standalone use (tests, evaluate.py) working
+        # exactly as before. See forward() for why sharing this matters.
+        self._strength_rng: random.Random = tp.cast(random.Random, random)
         self._model: tp.Optional[nn.Module] = None
         self._vocoder: tp.Optional[nn.Module] = None
         self._stft: tp.Optional[nn.Module] = None
@@ -662,7 +680,18 @@ class AudioLDMAttack(nn.Module):
                 "eval_attacks to skip it."
             )
         if strength is None:
-            strength = random.random() * self.strength_max
+            # self._strength_rng, not the global `random`: under DDP the global
+            # RNG is seeded per rank (distributed.seed_everything uses
+            # seed + rank), so each rank would draw a different t* and run a
+            # different number of reverse-diffusion steps. DDP synchronises at
+            # every backward, so the step costs whatever the deepest draw on
+            # any rank costs -- with 4 ranks that is E[max of 4 uniforms] =
+            # 0.8 * strength_max instead of 0.5, ~1.6x the expected work, paid
+            # on every step. It also makes peak memory a function of the
+            # unluckiest rank, and eval numbers less comparable. See
+            # SampledReconstructionAttack, which injects a rank-shared RNG for
+            # exactly the reason it already shares the branch draw.
+            strength = self._strength_rng.random() * self.strength_max
         strength = float(min(max(strength, 0.0), 1.0))
 
         device = x.device
@@ -911,6 +940,17 @@ class SampledReconstructionAttack(nn.Module):
         # see distributed.attack_sampling_rng for why that has to be shared
         # when nothing else is.
         self._rng: random.Random = rng if rng is not None else tp.cast(random.Random, random)
+        # Share that same generator with the branches' own strength sampling.
+        # The branch draw was already synchronised across ranks; t* was not,
+        # and for AudioLDM t* sets the number of reverse-diffusion steps, so an
+        # unsynchronised draw makes every DDP step cost the deepest trajectory
+        # any rank happened to draw (~1.6x the expected work at world_size=4)
+        # and leaves peak memory hostage to the unluckiest rank. Injected here
+        # rather than passed through every constructor so an attack added later
+        # is covered by declaring the attribute.
+        for module in self.attacks.values():
+            if hasattr(module, "_strength_rng"):
+                module._strength_rng = self._rng
 
     def train(self, mode: bool = True) -> "SampledReconstructionAttack":
         # Keep the outer module's `.training` flag consistent with the rest of
