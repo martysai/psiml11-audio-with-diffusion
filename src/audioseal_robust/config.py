@@ -358,6 +358,17 @@ class EvalConfig:
     # get written, one pair per run under f"{label}_*.png".
     output_dir: str = "./eval_outputs"
 
+    # Per-example artifacts (x, x_wm, x_att as .wav + a CSV of per-row
+    # metrics: bit_accuracy, presence_pos, presence_neg, attack_sisnr) under
+    # f"{output_dir}/{label}_{attack_name}_rows/" -- one dir per attack,
+    # every row from the HEADLINE pass only (not the robustness-curve sweep,
+    # which would multiply this by len(t_star_grid) for numbers nobody
+    # inspects per-example). Off by default: batch_size * n_eval_batches
+    # examples * 3 wavs each adds up (e.g. 8*20*3 = 480 files at the config
+    # defaults, 8*150*3=3600 for run_full_eval_1h.sh) and most runs only
+    # need the aggregate metrics evaluate_attack already returns.
+    save_row_artifacts: bool = False
+
     # Robustness (measured after the attack).
     fpr_target: float = 0.01  # TPR@FPR operating point
     # Robustness curve: detection vs. attack strength t* (diffusion
