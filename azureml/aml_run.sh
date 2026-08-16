@@ -60,7 +60,8 @@ LABEL_ARG=""
 # because AzureML only expands ${{inputs.*}} inside a job's `command` -- set
 # one in `environment_variables` and the container receives the literal
 # string "${{inputs.trainfixed}}/...", which is exactly how
-# <redacted-run> failed. Passing them here puts them in
+# A prior job failed when these values were passed through the environment.
+# Passing them here puts them in
 # the command, where substitution happens.
 TRAIN_DIR_ARG=""
 VALID_DIR_ARG=""
@@ -225,12 +226,8 @@ mkdir -p "$CHECKPOINT_DIR"
 #           hangs until its timeout rather than failing -- strictly worse than
 #           logging to stdout.
 #   mlflow  the default inside any AzureML job. MLflow's tracking URI is
-#           injected by the runtime, so metrics land on the Studio run with no
-#           outbound network access at all. This is the ONLY correct choice on
-#           a compliant cluster (managed compute): wandb is an external
-#           endpoint, and tracking.py's WandbTracker uploads audio samples and
-#           figures, not just scalars -- that is training data leaving the
-#           compliance boundary, not just telemetry.
+#           injected by the runtime, so metrics land on the Studio run without
+#           requiring a third-party tracking service.
 #   none    outside AML with no key: console logging.
 #
 # Set TRACKING_BACKEND explicitly to override the detection.
@@ -269,7 +266,7 @@ case "$TRACKING_BACKEND" in
     if [ -n "${AZUREML_RUN_ID:-}" ]; then
       tracking_args+=(tracking.run_name="$AZUREML_RUN_ID")
     fi
-    echo "tracking: mlflow -> the AzureML run (no external egress)"
+    echo "tracking: mlflow -> the AzureML run"
     ;;
   none)
     tracking_args+=(tracking.backend=none)

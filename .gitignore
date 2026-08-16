@@ -229,9 +229,3 @@ checkpoints/
 data/
 logs/
 eval_outputs/
-
-# azureml/submit_job.py: the subscription-substituted copy of a
-# *_cluster.yaml. Written beside the original (the `code:` path is relative
-# to it) and deleted after submit, but never commit one -- it carries the
-# subscription id the placeholder exists to keep out of this public repo.
-azureml/jobs/.*.resolved.yaml

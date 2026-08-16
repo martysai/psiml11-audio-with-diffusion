@@ -69,7 +69,7 @@ RUN python3 -m pip install \
 # torch` behind is_torch_available() but then subclasses torch.autograd.Function
 # at module scope regardless, so the import dies with a bare
 # `NameError: name 'torch' is not defined` that says nothing about versions.
-# That is what killed all 4 ranks of <redacted-run>.
+# This previously failed every distributed worker during image startup.
 #
 # 4.x is also the right major on API grounds: the vendored audioldm_train is
 # 2023-era code importing RobertaTokenizer/T5EncoderModel/MT5EncoderModel,
@@ -121,8 +121,7 @@ RUN python3 -m pip install -c /tmp/constraints.txt \
 # and artifact URI schemes with MLflow. Local users get plain MLflow (a SQLite
 # file / mlruns dir) and have no use for a mandatory Azure dependency.
 #
-# Its absence is what killed <redacted-run> and
-# <redacted-run> at step 0: AzureML sets the tracking URI
+# Without it, jobs fail at step 0 because AzureML sets the tracking URI
 # to azureml://<region>.api.azureml.ms/mlflow/..., MLflow looked the scheme up
 # in its store registry, found nothing, and raised. Before the layer below,
 # nothing in this build would have noticed.

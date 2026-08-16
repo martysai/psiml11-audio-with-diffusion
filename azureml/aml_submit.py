@@ -119,7 +119,7 @@ def make_client(cfg: Dict[str, Any]):
 
     # AzureCliCredential first: this repo's workflow is `az login` on a laptop,
     # and DefaultAzureCredential's earlier links (env vars, managed identity)
-    # can silently pick a different, wrong identity on a corp machine.
+    # can silently pick a different identity on a configured host.
     try:
         credential = AzureCliCredential()
         credential.get_token("https://management.azure.com/.default")
