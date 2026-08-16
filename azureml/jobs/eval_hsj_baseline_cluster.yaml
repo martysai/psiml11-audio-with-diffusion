@@ -1,64 +1,33 @@
 $schema: https://azuremlschemas.azureedge.net/latest/commandJob.schema.json
 
-# python azureml/submit_manifold.py azureml/jobs/eval_hsj_baseline_manifold.yaml
-#
-# Use the wrapper, not `az ml job create` directly: `compute:` and
-# `_AZUREML_SINGULARITY_JOB_UAI` below carry a `${AZUREML_SUBSCRIPTION_ID}`
-# placeholder (this repo is PUBLIC) and the CLI does not expand it.
+# az ml job create -f azureml/jobs/eval_hsj_baseline_cluster.yaml \
+#   --set compute=azureml:<compute-name>
 #
 # Arm 1 of 3. Stock AudioSeal generator + stock detector, under HopSkipJump.
-# The other two arms (eval_hsj_sgmse_epoch3_manifold.yaml,
-# eval_hsj_audioldm_epoch18_manifold.yaml) are identical to this file except
+# The other two arms (eval_hsj_sgmse_epoch3_cluster.yaml,
+# eval_hsj_audioldm_epoch18_cluster.yaml) are identical to this file except
 # for the generator input, --generator, --label and display_name -- that is
 # deliberate, so any difference in the numbers is attributable to the
 # generator alone. Change a protocol knob here and change it in all three.
 #
-# Submitted to Singularity ("manifold") rather than playground because
-# playground's a100x1 pool is fully contended; as-manifold3-w3-vc reports 32
-# NC_A100_v4 GPUs with 0 in use. The playground copies of these three jobs are
-# deliberately left queued as a fallback.
-#
-# Compliance: manifold is a compliant cluster, so there is deliberately no
-# WANDB_API_KEY here. aml_run.sh resolves the tracker to mlflow whenever it is
-# inside an AzureML job with no wandb key, which records to this run in Studio
-# with no outbound network.
 type: command
 
 experiment_name: audioseal-robust-hsj-eval
-display_name: hsj-eval-baseline-manifold
+display_name: hsj-eval-baseline
 description: >-
   HopSkipJump robustness evaluation of the STOCK AudioSeal watermark
   (audioseal_wm_16bits + audioseal_detector_16bits), 400 positives + 400
   negatives, with per-sample detector scores written to rows.csv.
 
 code: ../..
-# Pinned rather than @latest: the SDK's label resolution raises
-# ResourceNotFoundError against these workspaces even though versions 1-3
-# exist, and an explicit version is what makes the three arms reproducible.
-environment: azureml:audioseal-robust-diffusion:3
+environment: azureml:audioseal-robust-diffusion@latest
 
-# The virtual cluster ARM id, not a compute name -- this is how Singularity
-# jobs are targeted.
-compute: /subscriptions/${AZUREML_SUBSCRIPTION_ID}/resourceGroups/manifold3-rg/providers/Microsoft.MachineLearningServices/virtualclusters/as-manifold3-w3-vc
+compute: azureml:gpu-cluster
 
 resources:
-  # NC24ad_A100_v4 = 1x A100 80GB, the single-GPU member of the same
-  # NC_A100_v4 family the VC has quota for (confirmed in use by existing jobs
-  # in this workspace). HopSkipJump is a sequential per-example search of
-  # hundreds of detector queries and does not shard, so a 4-GPU SKU would
-  # leave three GPUs idle. aml_run.sh reads the GPU count off nvidia-smi, so
-  # it will run plain python3 here rather than torchrun.
-  instance_type: Singularity.NC24ad_A100_v4
-  # Singularity does not support instance_count > 1 for this job shape; the
-  # per-node GPU count is implied by instance_type.
+  # HopSkipJump is sequential; use a single-GPU compute target.
   instance_count: 1
   shm_size: 64g
-
-queue_settings:
-  # STANDARD ONLY. Never premium -- premium is a materially more expensive
-  # tier and is not ours to spend on this workload, regardless of how long
-  # standard has to wait for a node. This applies to every job in this repo.
-  job_tier: standard
 
 inputs:
   librispeech:
@@ -123,11 +92,6 @@ command: >-
 environment_variables:
   PYTHONUNBUFFERED: "1"
   AZUREML_ARTIFACTS_DEFAULT_TIMEOUT: "1200"
-  # Singularity runs the job under this user-assigned identity; it is what
-  # holds Storage Blob Data Contributor on the playground storage account
-  # backing the psiml_assets_playground datastore.
-  _AZUREML_SINGULARITY_JOB_UAI: /subscriptions/${AZUREML_SUBSCRIPTION_ID}/resourceGroups/shared-rg/providers/Microsoft.ManagedIdentity/userAssignedIdentities/as-shared-w3-id
-
 limits:
   # 6h. HopSkipJump costs hundreds of detector forward passes PER WAVEFORM;
   # the reference run of exactly this protocol took 1.7h on one A100. The

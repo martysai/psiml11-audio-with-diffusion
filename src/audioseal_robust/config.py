@@ -330,9 +330,9 @@ class OptimConfig:
     # instead of only shrinking it when it exceeds `max_norm`.
     #
     # This exists because plain clipping silently reweights a mixed-attack
-    # recipe. The branches produce gradients of wildly different scale: on the
-    # 4x A100 run train-audioldm-mixed-0814-155734 (recipe=audioldm_mixed, so
-    # ~50/50 identity vs audioldm), the median parameter-gradient norm was
+    # recipe. The branches produce gradients of wildly different scale: in a
+    # measured 4-GPU audioldm_mixed run (~50/50 identity vs audioldm), the
+    # median parameter-gradient norm was
     #     identity 1.69   -- under max_norm=3.0, so 26/30 steps passed through
     #                        untouched
     #     audioldm 42.94  -- over it on 33/33 steps, scaled down 14.3x

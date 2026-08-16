@@ -1,21 +1,17 @@
 $schema: https://azuremlschemas.azureedge.net/latest/commandJob.schema.json
 
-# python azureml/submit_manifold.py azureml/jobs/train_audioldm_manifold.yaml \
-#   --name "train-audioldm-manifold-$(date +%m%d-%H%M%S)"#
-# Use the wrapper, not `az ml job create` directly: `compute:` and
-# `_AZUREML_SINGULARITY_JOB_UAI` below carry a `${AZUREML_SUBSCRIPTION_ID}`
-# placeholder (this repo is PUBLIC) and the CLI does not expand it.
+# az ml job create -f azureml/jobs/train_audioldm_4gpu.yaml \
+#   --set compute=azureml:<multi-gpu-compute-name>
 #
-# Stage 2 of 2 on Singularity ("manifold"), 4x A100 via DDP. Do not submit this
-# until smoke_audioldm_manifold.yaml has come back Completed -- it is the same
+# Stage 2 of 2 on a 4-GPU node via DDP. Do not submit this until
+# smoke_audioldm_4gpu.yaml has completed -- it is the same
 # code path, so a failure here costs 4 GPUs for however long it takes to notice
 # rather than a few minutes on the smoke.
 #
-# Compliance: no WANDB_API_KEY, deliberately. See smoke_audioldm_manifold.yaml.
 type: command
 
 experiment_name: audioseal-robust-diffusion-swap
-display_name: train-audioldm-manifold-4gpu
+display_name: train-audioldm-4gpu
 description: >-
   Full 100h AudioLDM-direction training run on 4x A100 under torchrun/DDP,
   with SGMSE held out as the unseen attack at evaluation.
@@ -23,18 +19,11 @@ description: >-
 code: ../..
 environment: azureml:audioseal-robust-diffusion@latest
 
-compute: /subscriptions/${AZUREML_SUBSCRIPTION_ID}/resourceGroups/manifold3-rg/providers/Microsoft.MachineLearningServices/virtualclusters/as-manifold3-w3-vc
+compute: azureml:multi-gpu-cluster
 
 resources:
-  instance_type: Singularity.NC96ad_A100_v4
   instance_count: 1
   shm_size: 64g
-
-queue_settings:
-  # STANDARD ONLY. Never premium -- see smoke_audioldm_manifold.yaml. This is
-  # the long-running job, so the temptation to buy a faster slot is highest
-  # here; do not.
-  job_tier: standard
 
 inputs:
   librispeech:
@@ -55,9 +44,7 @@ inputs:
     path: azureml:librispeech-train-fixed-10s:1
     mode: download
   checkpoints:
-    # uri_folder, not custom_model: see assets/diffusion_checkpoints_manifold.yaml
-    # for why the model-asset registration path is closed to us here.
-    type: uri_folder
+    type: custom_model
     path: azureml:psiml-diffusion-checkpoints:1
     mode: ro_mount
 
@@ -72,13 +59,13 @@ outputs:
 
 # ---------------------------------------------------------------------------
 # BUDGET -- estimated, NOT yet measured. Submitted in parallel with the smoke
-# rather than after it, at the user's explicit request, so these numbers are
-# reasoned from the playground plan rather than from observed s/step. Revise
+# rather than after it, so these numbers are reasoned from the single-GPU plan
+# rather than from observed s/step. Revise
 # once the smoke reports real timings.
 #
-# 10,000 steps (10 x 1000), not the 20,000 the 1-GPU playground spec planned,
+# 10,000 steps (10 x 1000), not the 20,000 the 1-GPU spec planned,
 # and that is deliberately the SAME amount of data: this runs batch_size=4 on
-# each of 4 ranks = 16 per step, against the playground spec's 8 on one GPU. So
+# each of 4 ranks = 16 per step, against the single-GPU spec's batch of 8. So
 # 10,000 steps here cover the same number of samples as 20,000 there. It is a
 # rescale of the existing plan, not a reduction in scope.
 #
@@ -102,7 +89,7 @@ outputs:
 # steps needed to cover the corpus, they do not make an individual step 4x
 # cheaper.
 #
-# batch_size=4 PER GPU (16 effective), down from 8 on the single-GPU playground
+# batch_size=4 PER GPU (16 effective), down from 8 on the single-GPU
 # spec, because 1x A100 was already OOMing there -- this halves per-GPU
 # activation memory relative to that. Raise it only after reading the smoke's
 # reported peak_reserved_gb, which is now MAX-reduced across ranks.
@@ -118,6 +105,7 @@ outputs:
 command: >-
   bash azureml/aml_run.sh audioldm
   --librispeech ${{inputs.librispeech}}
+  --train-dir ${{inputs.trainfixed}}
   --checkpoints ${{inputs.checkpoints}}
   --artifacts ${{outputs.artifacts}}
   --
@@ -127,7 +115,7 @@ command: >-
   eval_every=250
   data.batch_size=4
   data.num_workers=8
-  data.segment_duration=2.0
+  data.segment_duration=10.24
   attack.sgmse.num_steps=15
 
 environment_variables:
@@ -137,8 +125,6 @@ environment_variables:
   # splits across ranks with shard_size(), so they must stay >= the GPU count.
   TORCH_NCCL_ASYNC_ERROR_HANDLING: "1"
   TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC: "86400"
-  _AZUREML_SINGULARITY_JOB_UAI: /subscriptions/${AZUREML_SUBSCRIPTION_ID}/resourceGroups/shared-rg/providers/Microsoft.ManagedIdentity/userAssignedIdentities/as-shared-w3-id
-
 limits:
   # 24h. Generous relative to the ~11h worst-case training estimate above, on
   # purpose: the margin is what guarantees the evaluation stage actually runs.

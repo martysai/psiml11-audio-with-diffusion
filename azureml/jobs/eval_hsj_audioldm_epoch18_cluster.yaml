@@ -1,20 +1,17 @@
 $schema: https://azuremlschemas.azureedge.net/latest/commandJob.schema.json
 
-# python azureml/submit_manifold.py azureml/jobs/eval_hsj_audioldm_epoch18_manifold.yaml
-#
-# Use the wrapper, not `az ml job create` directly: `compute:` and
-# `_AZUREML_SINGULARITY_JOB_UAI` below carry a `${AZUREML_SUBSCRIPTION_ID}`
-# placeholder (this repo is PUBLIC) and the CLI does not expand it.
+# az ml job create -f azureml/jobs/eval_hsj_audioldm_epoch18_cluster.yaml \
+#   --set compute=azureml:<compute-name>
 #
 # Arm 3 of 3. The AudioLDM-trained fine-tuned generator, under HopSkipJump.
-# Identical to eval_hsj_baseline_manifold.yaml except for the generators
+# Identical to eval_hsj_baseline_cluster.yaml except for the generators
 # input, --generator, --label and display_name -- see that file for the full
 # rationale behind every protocol knob below. Change one here and change it in
 # all three.
 type: command
 
 experiment_name: audioseal-robust-hsj-eval
-display_name: hsj-eval-audioldm-epoch18-manifold
+display_name: hsj-eval-audioldm-epoch18
 description: >-
   HopSkipJump robustness evaluation of the AudioLDM-trained fine-tuned
   generator (generator_epoch18.pth) paired with the STOCK AudioSeal detector,
@@ -22,17 +19,13 @@ description: >-
   rows.csv.
 
 code: ../..
-environment: azureml:audioseal-robust-diffusion:3
+environment: azureml:audioseal-robust-diffusion@latest
 
-compute: /subscriptions/${AZUREML_SUBSCRIPTION_ID}/resourceGroups/manifold3-rg/providers/Microsoft.MachineLearningServices/virtualclusters/as-manifold3-w3-vc
+compute: azureml:gpu-cluster
 
 resources:
-  instance_type: Singularity.NC24ad_A100_v4
   instance_count: 1
   shm_size: 64g
-
-queue_settings:
-  job_tier: standard
 
 inputs:
   librispeech:
@@ -40,10 +33,8 @@ inputs:
     path: azureml:librispeech-asr:1
     mode: download
   # Holds both fine-tuned generators; --generator below picks this arm's.
-  # uri_folder, not custom_model: see assets/finetuned_generators_manifold.yaml
-  # for why the model-asset registration path is closed to us here.
   generators:
-    type: uri_folder
+    type: custom_model
     path: azureml:psiml-finetuned-generators:1
     mode: ro_mount
 
@@ -76,7 +67,5 @@ command: >-
 environment_variables:
   PYTHONUNBUFFERED: "1"
   AZUREML_ARTIFACTS_DEFAULT_TIMEOUT: "1200"
-  _AZUREML_SINGULARITY_JOB_UAI: /subscriptions/${AZUREML_SUBSCRIPTION_ID}/resourceGroups/shared-rg/providers/Microsoft.ManagedIdentity/userAssignedIdentities/as-shared-w3-id
-
 limits:
   timeout: 21600

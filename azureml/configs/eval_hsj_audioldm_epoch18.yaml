@@ -1,4 +1,4 @@
-# python azureml/aml_submit.py --config azureml/configs/eval_hsj_baseline.yaml
+# python azureml/aml_submit.py --config azureml/configs/eval_hsj_audioldm_epoch18.yaml
 #
 # Arm 3 of 3. The AudioLDM-trained fine-tuned generator, under HopSkipJump.
 # The two fine-tuned arms (eval_hsj_sgmse_epoch3.yaml,
@@ -7,22 +7,12 @@
 # any difference in the numbers is attributable to the generator alone. Change
 # a protocol knob here and you must change it in all three.
 #
-# `workspace` is intentionally absent: this repo is PUBLIC, so no subscription
-# id is committed. Submission targets whatever
-#   az configure --defaults group=playground-rg workspace=as-playground-w3-ws
-# already points at.
+# Workspace coordinates come from environment variables or Azure CLI defaults.
 
 direction: eval
-# STANDARD_NC24ADS_A100_V4 -- 1x A100 80GB. HopSkipJump is a sequential
-# per-example search (hundreds of detector queries each) and does not shard,
-# so a multi-GPU target would leave GPUs idle. Verified present and lowercase
-# with `az ml compute list -o table`; both a100x1 and A100x1 can exist.
-compute: a100x1
-# Pinned rather than @latest: the SDK's label resolution raises
-# ResourceNotFoundError against this workspace even though versions 1-3 exist
-# (`az ml environment list --name audioseal-robust-diffusion` shows them), and
-# an explicit version is what makes the three arms reproducible anyway.
-environment: azureml:audioseal-robust-diffusion:3
+# HopSkipJump is sequential, so use a single-GPU compute target.
+compute: gpu-cluster
+environment: azureml:audioseal-robust-diffusion@latest
 
 experiment_name: audioseal-robust-hsj-eval
 display_name: hsj-eval-audioldm-epoch18

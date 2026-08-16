@@ -52,8 +52,8 @@ train:
   # The AudioLDM counterpart of `sgmse_mixed` above, and for a sharper reason
   # than that one: at `recipe=audioldm` (audioldm 1.0, identity 0.0) the
   # generator never sees an unattacked step, and AudioLDM destroys the
-  # watermark outright rather than merely degrading it. Measured on the 4x
-  # A100 manifold run train-audioldm-manifold-0814-121056: bit_loss sat at
+  # watermark outright rather than merely degrading it. In a measured 4-GPU
+  # run, bit_loss sat at
   # 0.698 against ln(2)=0.6931 -- chance, i.e. zero recoverable bits -- flat
   # across 530 steps, with presence_prob ~0.08 and no trend in the loss
   # (slope t=-0.04 against a per-step sd of 1.10). Evaluation on the smoke run

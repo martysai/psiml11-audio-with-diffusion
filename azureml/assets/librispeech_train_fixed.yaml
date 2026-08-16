@@ -1,8 +1,7 @@
 $schema: https://azuremlschemas.azureedge.net/latest/data.schema.json
 
 # az ml data create -f azureml/assets/librispeech_train_fixed.yaml \
-#   --path <local>/extracted \
-#   --resource-group manifold3-rg --workspace-name as-manifold3-w3-ws
+#   --path <local>/extracted
 #
 # Fixed-duration training audio: every file is EXACTLY 10.24s, which is
 # AudioLDMAttack's native window (`duration` in audioldm_original.yaml).
