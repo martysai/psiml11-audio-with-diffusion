@@ -33,10 +33,13 @@ workaround -- we can and do backprop through them for real (AudioLDM needs a
 little more care to get there -- see that class's own docstring for why).
 """
 
+import contextlib
 import functools
 import logging
 import os
 import random
+import shutil
+import subprocess
 import typing as tp
 from pathlib import Path
 
@@ -44,6 +47,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint
+import torchaudio.functional as AF
 
 from audioseal.models import AudioSealDetector
 
@@ -146,13 +150,39 @@ def _tile_or_crop(wav: torch.Tensor, target_len: int) -> torch.Tensor:
     return wav[..., :target_len]
 
 
+def _fit_length(wav: torch.Tensor, target_len: int) -> torch.Tensor:
+    """Force `wav` (..., T) to exactly `target_len` samples: crop if long,
+    zero-pad the tail if short.
+
+    Needed by the signal-level attacks whose corruption is not
+    length-preserving -- `speed` resamples (a 1.05x speed-up on a 3s segment
+    comes back ~143ms shorter) and lossy codecs add encoder delay/padding.
+    `evaluate.py` pairs `x_att` with `x_wm` sample-for-sample to compute
+    `attack_sisnr`, and the detector's presence is time-pooled over a tensor
+    that has to line up with the rest of the batch, so a ragged length is not
+    an option.
+
+    Deliberately NOT `_tile_or_crop` (above): that one repeats content to
+    fill, which is right for AudioLDM's fixed 10.24s window where the
+    alternative is an 80% silence plateau, but wrong here -- tiling a
+    time-stretched signal would splice unrelated content into the tail and
+    show up as an attack far more destructive than the one being measured.
+    A short zero tail is the smaller distortion.
+    """
+    cur = wav.shape[-1]
+    if cur == target_len:
+        return wav
+    if cur > target_len:
+        return wav[..., :target_len]
+    return F.pad(wav, (0, target_len - cur))
+
+
 class IdentityAttack(nn.Module):
     """No-op attack: returns the input unchanged. Always available, has no
     parameters, and is trivially differentiable (gradient is the identity)."""
 
     def forward(self, x: torch.Tensor, strength: tp.Optional[float] = None) -> torch.Tensor:
         return x
-
 
 class BigVGANAttack(nn.Module):
     """Resynthesis attack: extract a mel-spectrogram from `x_wm` and vocode it
@@ -1288,6 +1318,394 @@ class HopSkipJumpAttack(nn.Module, AttackApplicationReporter):
             self._reset_application_mask()
             x_att = torch.cat([self._attack_one(x[i : i + 1]) for i in range(x.shape[0])], dim=0)
         return x_att.to(x.dtype)
+
+
+class PGDAttack(nn.Module):
+    """Fixed-budget, epsilon-constrained white-box PGD against the detector
+    (Madry et al. 2018, arXiv:1706.06083), L-infinity variant -- the
+    white-box half of AudioMarkBench's adversarial suite, next to
+    HopSkipJumpAttack's black-box half.
+
+    Complements HopSkipJumpAttack rather than replacing it. Both attack the
+    detector directly, but they ask opposite questions, and that difference
+    decides which metrics mean anything on their output:
+
+      * HopSkipJump is *minimum-norm*: "what is the smallest perturbation
+        that flips the decision?" Its optimum therefore sits ON the decision
+        boundary by construction, so every example it returns scores at
+        presence ~= 0.5 whichever class it started from. Threshold-free
+        ranking metrics (ROC-AUC) are then meaningless on its output -- the
+        ordering is decided in the 4th decimal of a collapsed distribution --
+        and the informative number is the attack's *cost* (`attack_sisnr`,
+        query budget).
+
+      * PGD here is *fixed-budget*: the perturbation is capped at `epsilon`
+        in L-infinity and the attack pushes the detector as far as it can
+        within that cap, then stops. Examples the budget cannot flip stay
+        confidently on their original side, so the score distribution keeps
+        its spread and ROC-AUC / TPR@FPR are meaningful again. Re-run with
+        different `epsilon` to trace a robustness curve.
+
+    Symmetric in exactly the same sense as HopSkipJumpAttack: the attack
+    direction comes from the detector's OWN current decision on the input,
+    not from a ground-truth label, so one module is correct on both branches
+    `evaluate.py:evaluate_attack` calls it on -- evasion on watermarked
+    audio (drive presence down), forgery on clean audio (drive presence up).
+
+    Needs the detector at forward() time, threaded through by `bind_detector`
+    exactly like HopSkipJumpAttack -- see that class's docstring for why this
+    doesn't change `evaluate_attack`'s `attack(x, strength=strength)` call
+    site.
+
+    Cost: `num_steps` detector forward+backward passes per batch. Vastly
+    cheaper than HopSkipJump (hundreds of forwards PER EXAMPLE, since its
+    per-example trajectories cannot be batched) -- PGD steps the whole batch
+    at once, so it costs roughly `2 * num_steps` x a resynthesis attack
+    rather than dominating the run.
+
+    Eval-only, like HopSkipJumpAttack/MBDAttack: `forward` runs an inner
+    optimization loop and returns a `.detach()`-ed tensor, so there is no
+    meaningful gradient to hand back to the generator. NEVER give it a
+    nonzero weight in TrainConfig.AttackWeights -- `x_att` would reach
+    train_step's detector call with `grad_fn=None` and silently zero the
+    generator's gradient.
+    """
+
+    def __init__(
+        self,
+        epsilon: float = 0.002,
+        num_steps: int = 20,
+        step_size: tp.Optional[float] = None,
+        detection_threshold: float = 0.5,
+        random_start: bool = True,
+        clip_min: float = -1.0,
+        clip_max: float = 1.0,
+    ):
+        super().__init__()
+        self.epsilon = epsilon
+        self.num_steps = num_steps
+        # 2.5 * eps / steps is Madry et al.'s own default: large enough to
+        # cross the whole ball within the step budget, small enough that the
+        # sign-gradient path is not just two jumps between corners.
+        self.step_size = step_size if step_size is not None else 2.5 * epsilon / max(num_steps, 1)
+        self.detection_threshold = detection_threshold
+        self.random_start = random_start
+        self.clip_min = clip_min
+        self.clip_max = clip_max
+        self._detector: tp.Optional[AudioSealDetector] = None
+
+    def bind_detector(self, detector: AudioSealDetector) -> None:
+        """Must be called with the detector under test before `forward()`.
+        `evaluate.py:run` does this automatically for every constructed
+        attack exposing this method (duck-typed, same as for
+        HopSkipJumpAttack)."""
+        self._detector = detector
+
+    def _presence(self, x: torch.Tensor) -> torch.Tensor:
+        """Soft per-example presence probability, time-pooled. Unlike
+        HopSkipJumpAttack's `_decision`, this deliberately keeps the
+        continuous value instead of thresholding it -- PGD is white-box and
+        this is the differentiable objective it ascends."""
+        presence, _ = self._detector.forward(x)
+        return presence[:, 1, :].mean(dim=-1)
+
+    def forward(self, x: torch.Tensor, strength: tp.Optional[float] = None) -> torch.Tensor:
+        # strength: unused -- this attack's strength axis is `epsilon`, fixed
+        # at construction (that is what "fixed-budget" means). Same
+        # convention as BigVGANAttack/DACAttack's ignored `strength`.
+        if self._detector is None:
+            raise RuntimeError(
+                "PGDAttack has no detector bound -- call bind_detector(detector) "
+                "before forward() (evaluate.py's run() does this automatically; "
+                "see class docstring)."
+            )
+        x0 = x.detach()
+        # The detector's SEANet encoder contains an LSTM, and cuDNN refuses to
+        # run an RNN *backward* pass on a module in eval() mode ("cudnn RNN
+        # backward can only be called in training mode"). Nothing hit this
+        # before because every other attack in this file only ever runs the
+        # detector forward -- PGD is the first one that differentiates
+        # through it.
+        #
+        # Deliberately NOT fixed by flipping the detector to train(): that
+        # would change the module's behaviour in the middle of an evaluation
+        # and let any normalization layer update its running statistics from
+        # attacked audio, quietly corrupting every attack measured after this
+        # one. Dropping to the native RNN kernels instead is numerically
+        # equivalent and entirely local -- `flags` restores the previous
+        # settings on exit, and everything except `enabled` is passed through
+        # unchanged so this cannot silently alter benchmark/determinism/TF32
+        # behaviour for the duration.
+        if x0.is_cuda and torch.backends.cudnn.is_available():
+            cudnn_ctx: tp.ContextManager = torch.backends.cudnn.flags(
+                enabled=False,
+                benchmark=torch.backends.cudnn.benchmark,
+                deterministic=torch.backends.cudnn.deterministic,
+                allow_tf32=torch.backends.cudnn.allow_tf32,
+            )
+        else:
+            cudnn_ctx = contextlib.nullcontext()
+        # evaluate_attack is decorated @torch.no_grad(), so without this the
+        # autograd.grad call below would fail on a graph that was never
+        # built. Re-enabling grad locally is safe: nothing here touches a
+        # parameter (the detector's are all requires_grad=False) and the
+        # returned tensor is detached, so no graph escapes this function.
+        with cudnn_ctx, torch.enable_grad():
+            with torch.no_grad():
+                label0 = self._presence(x0) > self.detection_threshold
+            # -1 where the detector currently says "watermarked" (push
+            # presence DOWN = evasion), +1 where it says "clean" (push
+            # presence UP = forgery). Ascending `direction * presence` then
+            # does the right thing on both branches with one loop.
+            shape = (-1, *([1] * (x0.dim() - 1)))
+            direction = torch.where(label0, -1.0, 1.0).to(x0.dtype).view(shape)
+
+            if self.random_start:
+                delta = torch.empty_like(x0).uniform_(-self.epsilon, self.epsilon)
+            else:
+                delta = torch.zeros_like(x0)
+            delta = (torch.clamp(x0 + delta, self.clip_min, self.clip_max) - x0).detach()
+
+            for _ in range(self.num_steps):
+                delta.requires_grad_(True)
+                objective = (direction * self._presence(x0 + delta).view(shape)).sum()
+                (grad,) = torch.autograd.grad(objective, delta)
+                with torch.no_grad():
+                    # Sign-gradient ascent, then project back into the
+                    # L-infinity ball AND into the valid waveform range. The
+                    # range projection is re-expressed as a constraint on
+                    # delta so the two never fight: clamping the sum alone
+                    # would let delta drift outside the ball.
+                    delta = delta + self.step_size * grad.sign()
+                    delta = delta.clamp(-self.epsilon, self.epsilon)
+                    delta = torch.clamp(x0 + delta, self.clip_min, self.clip_max) - x0
+                delta = delta.detach()
+
+        return torch.clamp(x0 + delta, self.clip_min, self.clip_max).detach().to(x.dtype)
+
+
+class _SignalLevelAttack(nn.Module):
+    """Base for the fixed-budget, detector-agnostic signal corruptions --
+    AudioMarkBench's "common perturbation" family (additive noise, filtering,
+    speed change, requantization, lossy codecs).
+
+    The cheapest and most realistic robustness axis in the suite: no detector
+    queries, no gradients, no learned weights, and every one of them is
+    something audio genuinely undergoes in transit. Also the family whose
+    score distributions stay well-spread, because -- unlike the
+    boundary-seeking attacks (HopSkipJumpAttack, and any minimum-norm PGD)
+    -- nothing here aims at the decision boundary. The corruption is applied
+    at a budget fixed in advance and the score lands wherever it lands, so
+    watermarked audio that survives stays confidently detected and clean
+    audio stays confidently rejected. ROC-AUC and TPR@FPR are therefore
+    meaningful on this family, and sweeping the budget traces a real
+    robustness curve.
+
+    Subclasses implement `_corrupt`. The base guarantees the returned waveform
+    keeps the input's exact length (see `_fit_length`) and dtype, both of
+    which `evaluate.py:evaluate_attack` relies on when it pairs `x_att` with
+    `x_wm` for `attack_sisnr`.
+
+    Eval-only by construction rather than by policy: some members (codec
+    round-trips) are external, non-differentiable subprocess calls with no
+    gradient at all. Do not wire any of them into TrainConfig.AttackWeights.
+    """
+
+    # NOT named `_apply`: nn.Module._apply is a real PyTorch method (it is
+    # what `.to(device)`, `.cuda()` and `.float()` recurse through), so
+    # overriding it makes `module.to(device)` call this corruption with a
+    # dtype-conversion function as its "waveform" and blow up in
+    # build_eval_attacks.
+    def _corrupt(self, x: torch.Tensor) -> torch.Tensor:
+        raise NotImplementedError
+
+    def forward(self, x: torch.Tensor, strength: tp.Optional[float] = None) -> torch.Tensor:
+        # strength: unused. Each subclass's budget is its own explicitly
+        # named config field (snr_db, cutoff_hz, factor, bits, bitrate_kbps)
+        # rather than a shared abstract [0, 1] knob, because these budgets
+        # are not commensurable -- one "0.04" would have to mean dB in one
+        # attack and Hz in another. Sweep by overriding the field, e.g.
+        # `attack.gaussian_noise.snr_db=10`.
+        return _fit_length(self._corrupt(x.float()), x.shape[-1]).to(x.dtype)
+
+
+class GaussianNoiseAttack(_SignalLevelAttack):
+    """Additive white Gaussian noise at a fixed per-example SNR.
+
+    Parameterized by SNR rather than by a raw noise standard deviation so the
+    budget means the same thing on every utterance regardless of its level.
+    LibriSpeech segments vary by well over 10 dB, so a fixed sigma would be a
+    mild attack on loud speech and an overwhelming one on quiet speech, and
+    the resulting metric would mostly be measuring the corpus's level
+    distribution rather than the watermark's robustness.
+    """
+
+    def __init__(self, snr_db: float = 20.0):
+        super().__init__()
+        self.snr_db = snr_db
+
+    def _corrupt(self, x: torch.Tensor) -> torch.Tensor:
+        signal_power = x.pow(2).mean(dim=-1, keepdim=True)
+        noise = torch.randn_like(x)
+        noise_power = noise.pow(2).mean(dim=-1, keepdim=True).clamp_min(1e-12)
+        target_noise_power = signal_power / (10.0 ** (self.snr_db / 10.0))
+        return x + noise * (target_noise_power / noise_power).sqrt()
+
+
+class LowpassAttack(_SignalLevelAttack):
+    """Second-order Butterworth low-pass -- the classic "throw away the high
+    band" removal attack, and a close stand-in for narrowband telephony.
+
+    Relevant because AudioSeal's carrier is not confined to the frequencies
+    speech intelligibility depends on, so a cutoff that leaves the signal
+    perfectly understandable can still strip a meaningful share of it.
+    """
+
+    def __init__(self, sample_rate: int = 16_000, cutoff_hz: float = 4_000.0):
+        super().__init__()
+        self.sample_rate = sample_rate
+        self.cutoff_hz = cutoff_hz
+
+    def _corrupt(self, x: torch.Tensor) -> torch.Tensor:
+        return AF.lowpass_biquad(x, self.sample_rate, self.cutoff_hz)
+
+
+class SpeedAttack(_SignalLevelAttack):
+    """Playback-speed change (resampling-based, so pitch shifts with it).
+
+    Desynchronizes the watermark: AudioSeal's detector is convolutional and
+    so tolerates translation, but a speed change rescales the carrier's time
+    axis, which translation-invariance does not cover.
+
+    NOTE on `attack_sisnr` for this attack specifically: the output is
+    time-rescaled, so it no longer lines up sample-for-sample with `x_wm`
+    even though `_fit_length` restores the length. The SI-SNR reported for
+    `speed` is therefore a misalignment measure, not a perceptual distortion
+    measure, and is not comparable with the other attacks' SI-SNR. The
+    detection metrics are unaffected.
+    """
+
+    def __init__(self, sample_rate: int = 16_000, factor: float = 1.05):
+        super().__init__()
+        self.sample_rate = sample_rate
+        self.factor = factor
+
+    def _corrupt(self, x: torch.Tensor) -> torch.Tensor:
+        y, _ = AF.speed(x, self.sample_rate, self.factor)
+        return y
+
+
+class QuantizationAttack(_SignalLevelAttack):
+    """Uniform requantization to `bits` bits over the full-scale [-1, 1]
+    range (mid-tread), i.e. bit-depth reduction.
+
+    The cheapest attack in the file -- no filtering, no resampling, just
+    rounding -- and a useful sanity floor: a watermark that 8-bit
+    requantization removes is not surviving any real distribution channel.
+    """
+
+    def __init__(self, bits: int = 8):
+        super().__init__()
+        if bits < 2:
+            raise ValueError(f"bits must be >= 2, got {bits}")
+        self.bits = bits
+
+    def _corrupt(self, x: torch.Tensor) -> torch.Tensor:
+        step = 2.0 / (2**self.bits - 1)
+        return torch.round(x / step).mul(step).clamp(-1.0, 1.0)
+
+
+class CodecAttack(_SignalLevelAttack):
+    """Lossy-codec round-trip (MP3 or Opus) through the `ffmpeg` binary.
+
+    The most realistic attack in the whole file: essentially all audio that
+    travels anywhere is codec-compressed at least once, so this is the
+    perturbation a watermark must survive to be useful at all -- and it is
+    applied by parties with no adversarial intent whatsoever.
+
+    Uses an `ffmpeg` subprocess rather than a Python codec binding on
+    purpose. `torchaudio.io.AudioEffector` and
+    `torchaudio.functional.apply_codec` were both removed by the torchaudio
+    2.11 this project runs on, and the surviving options (torchcodec, PyAV)
+    each pin their own exact torch build -- see azureml/docker/Dockerfile,
+    which deliberately strips `torchcodec` from requirements.txt for exactly
+    that reason. The `ffmpeg` binary is already installed in that image, so
+    this attack runs there with no new dependency.
+
+    Where `ffmpeg` is absent (a bare local conda env, typically), the
+    constructor raises ModuleNotFoundError, which is in
+    `evaluate.py:_CONSTRUCTION_SKIP_EXCEPTIONS` -- so the attack is reported
+    as cleanly "skipped" for that run instead of taking the job down, the
+    same way bigvgan/dac/mbd already behave when their backends are missing.
+
+    NOTE on `attack_sisnr`: lossy encoders introduce algorithmic delay and
+    padding, so the decoded signal is time-shifted by a few ms relative to
+    the input. As with SpeedAttack, that makes the SI-SNR reported here
+    dominated by misalignment rather than by codec noise. Detection metrics
+    are unaffected.
+    """
+
+    # name -> (ffmpeg encoder, container/format to mux into)
+    _CODECS = {
+        "mp3": ("libmp3lame", "mp3"),
+        "opus": ("libopus", "ogg"),
+    }
+
+    def __init__(self, sample_rate: int = 16_000, codec: str = "mp3", bitrate_kbps: int = 64):
+        super().__init__()
+        codec = codec.lower()
+        if codec not in self._CODECS:
+            raise ValueError(f"codec must be one of {sorted(self._CODECS)}, got {codec!r}")
+        ffmpeg = shutil.which("ffmpeg")
+        if ffmpeg is None:
+            raise ModuleNotFoundError(
+                "CodecAttack needs the `ffmpeg` binary on PATH. It is present in this "
+                "project's AzureML image (see azureml/docker/Dockerfile) but usually not "
+                "in a local conda env -- install it (conda install -c conda-forge ffmpeg) "
+                "or drop codec_mp3/codec_opus from eval_attacks/held_out_attacks."
+            )
+        self.ffmpeg = ffmpeg
+        self.sample_rate = sample_rate
+        self.codec = codec
+        self.bitrate_kbps = bitrate_kbps
+
+    def _run(self, args: tp.List[str], payload: bytes) -> bytes:
+        done = subprocess.run(args, input=payload, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if done.returncode != 0:
+            raise RuntimeError(
+                f"ffmpeg failed: {done.stderr.decode('utf-8', 'replace')[:500]}"
+            )
+        return done.stdout
+
+    def _corrupt(self, x: torch.Tensor) -> torch.Tensor:
+        encoder, container = self._CODECS[self.codec]
+        target_len = x.shape[-1]
+        out = []
+        for i in range(x.shape[0]):
+            raw = x[i].reshape(-1).detach().cpu().contiguous().numpy().astype("<f4").tobytes()
+            encoded = self._run(
+                [
+                    self.ffmpeg, "-hide_banner", "-loglevel", "error",
+                    "-f", "f32le", "-ar", str(self.sample_rate), "-ac", "1", "-i", "pipe:0",
+                    "-c:a", encoder, "-b:a", f"{int(self.bitrate_kbps)}k",
+                    "-f", container, "pipe:1",
+                ],
+                raw,
+            )
+            decoded = self._run(
+                [
+                    self.ffmpeg, "-hide_banner", "-loglevel", "error",
+                    "-f", container, "-i", "pipe:0",
+                    "-f", "f32le", "-ar", str(self.sample_rate), "-ac", "1", "pipe:1",
+                ],
+                encoded,
+            )
+            # frombuffer needs a writable buffer (bytearray) to avoid a
+            # UserWarning; clone() then detaches the tensor from that
+            # transient buffer entirely.
+            wav = torch.frombuffer(bytearray(decoded), dtype=torch.float32).clone()
+            out.append(_fit_length(wav, target_len))
+        return torch.stack(out, dim=0).view_as(x).to(x.device)
 
 
 class SampledReconstructionAttack(nn.Module):

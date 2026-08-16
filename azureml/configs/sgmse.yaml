@@ -4,18 +4,12 @@
 # `after_sgmse_training` pair). The static equivalent is
 # azureml/jobs/train_sgmse.yaml -- keep the two in sync, or pick one.
 
-# Leave `workspace` commented out to use whatever `az configure --defaults`
-# / config.json already points at. Fill it in to pin the submission to one
-# workspace regardless of local CLI state.
-workspace:
-  subscription_id: 5c9e4789-4852-4ffe-8551-d682affcbd74  # ASG Azure ML
-  resource_group_name: playground-rg
-  workspace_name: as-playground-w3-ws
+# Workspace coordinates come from AZUREML_SUBSCRIPTION_ID,
+# AZUREML_RESOURCE_GROUP and AZUREML_WORKSPACE_NAME, or from Azure CLI defaults.
 
 direction: sgmse
-# STANDARD_NC24ADS_A100_V4 -- 1x A100 80GB. Nothing here is distributed, so
-# the a100x2/a100x4 clusters would just leave GPUs idle.
-compute: a100x1
+# Override with --compute for your workspace.
+compute: gpu-cluster
 environment: azureml:audioseal-robust-diffusion@latest
 
 experiment_name: audioseal-robust-diffusion-swap

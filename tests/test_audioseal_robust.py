@@ -16,6 +16,7 @@ pretrained checkpoint) so this runs fast and offline.
 """
 
 import copy
+import math
 import os
 import sys
 
@@ -47,15 +48,22 @@ from audioseal_robust.attacks import (
 from audioseal_robust.config import load_config, load_eval_config
 from audioseal_robust.distributed import DistEnv
 from audioseal_robust.evaluate import (
+    SNR_AUDIBLE_DB,
+    SNR_NEAR_SILENT_DB,
+    STOCK_DETECTOR_CARD,
+    STOCK_GENERATOR_CARD,
     _print_results_table,
+    apply_stock_baseline,
     build_eval_attacks,
+    check_watermark_snr,
     evaluate_attack,
     evaluate_perceptual,
     load_generator_under_test,
     prepare_eval_batches,
+    stock_baseline_verdict,
 )
 from audioseal_robust.losses import PsychoacousticMelLoss, detection_loss
-from audioseal_robust.metrics import fpr_support
+from audioseal_robust.metrics import fpr_support, watermark_report, watermark_snr_db
 from audioseal_robust.model_init import build_untrained_generator
 from audioseal_robust.train import (
     CudaMemoryProbe,
@@ -135,12 +143,281 @@ def test_prepare_eval_batches_is_seeded():
     dataloader = [torch.randn(2, 1, 4000), torch.randn(2, 1, 4000)]
 
     torch.manual_seed(123)
-    first = prepare_eval_batches(generator, dataloader, cfg, torch.device("cpu"))
+    first, first_diagnostics = prepare_eval_batches(generator, dataloader, cfg, torch.device("cpu"))
     torch.manual_seed(123)
-    second = prepare_eval_batches(generator, dataloader, cfg, torch.device("cpu"))
+    second, second_diagnostics = prepare_eval_batches(generator, dataloader, cfg, torch.device("cpu"))
 
     assert len(first) == 1  # n_eval_batches caps the dataloader
     assert all(torch.equal(a, b) for a, b in zip(first[0], second[0]))
+    assert first_diagnostics == second_diagnostics
+
+
+def test_prepare_eval_batches_measures_snr_before_any_attack():
+    """The watermark diagnostic must describe the generator's own output:
+    one value per clip actually evaluated, matching a direct measurement of
+    the (clean, watermarked) pair the batches carry."""
+    generator = _tiny_generator(nbits=4).eval()
+    cfg = load_eval_config(["eval_dir=.", "nbits=4", "n_eval_batches=2"])
+    dataloader = [torch.randn(3, 1, 4000), torch.randn(3, 1, 4000), torch.randn(3, 1, 4000)]
+
+    batches, diagnostics = prepare_eval_batches(generator, dataloader, cfg, torch.device("cpu"))
+
+    assert diagnostics["n_clips"] == 6  # 2 batches x 3 clips, not 3 batches
+    expected = torch.cat([watermark_snr_db(x, x_wm) for x, x_wm, _ in batches])
+    # quantile(0.5), not median(): on an even number of clips torch.median
+    # returns the lower of the two middle values instead of interpolating.
+    assert diagnostics["snr_db"]["p50"] == pytest.approx(
+        torch.quantile(expected, 0.5).item(), abs=1e-4
+    )
+    assert diagnostics["snr_db"]["min"] == pytest.approx(expected.min().item(), abs=1e-4)
+    assert diagnostics["delta_rms"] > 0.0
+
+
+def test_check_watermark_snr_warns_on_near_silent_watermark():
+    diagnostics = watermark_report(
+        torch.full((10,), SNR_NEAR_SILENT_DB + 5.0), torch.full((10,), 1e-9)
+    )
+
+    warnings = check_watermark_snr(diagnostics)
+
+    assert any("near-silent" in w for w in warnings)
+
+
+def test_prepare_eval_batches_flags_a_collapsed_generator():
+    """The failure mode this whole diagnostic exists for: a generator whose
+    delta has collapsed to zero. It has to be caught here, pre-attack, as
+    "the generator emitted nothing" -- otherwise it surfaces only as
+    near-chance detection, which looks identical to a broken detector."""
+
+    class CollapsedGenerator(torch.nn.Module):
+        # Not an AudioSealWM, so embed_watermark calls it through forward
+        # (see train._watermark_delta).
+        def forward(self, x, message=None):
+            return torch.zeros_like(x)
+
+    cfg = load_eval_config(["eval_dir=.", "nbits=4", "n_eval_batches=1"])
+
+    _, diagnostics = prepare_eval_batches(
+        CollapsedGenerator(), [torch.randn(4, 1, 4000)], cfg, torch.device("cpu")
+    )
+
+    assert diagnostics["delta_rms"] == 0.0
+    assert diagnostics["delta_rms_min"] == 0.0
+    # A zero delta must saturate, not blow up: an inf here would poison the
+    # aggregates and hide the very thing being diagnosed.
+    assert math.isfinite(diagnostics["snr_db"]["p50"])
+    assert diagnostics["snr_db"]["p50"] > SNR_NEAR_SILENT_DB
+
+    warnings = check_watermark_snr(diagnostics)
+    assert any("near-silent" in w for w in warnings)
+    assert any("exactly-zero" in w for w in warnings)
+
+
+def test_prepare_eval_batches_sees_collapse_that_normalization_hides():
+    """The realistic collapse, and the reason the raw pre-scaling numbers are
+    measured at all: delta is tiny but NOT exactly zero, so
+    embed_watermark's per-clip scaling amplifies it straight back up to the
+    configured target. Post-scaling `snr_db` is then pinned at that target and
+    reports the same value a healthy generator would -- only `raw_snr_db` can
+    still tell the two apart."""
+
+    class NearlyCollapsedGenerator(torch.nn.Module):
+        # Not an AudioSealWM, so embed_watermark calls it through forward
+        # (see train._watermark_delta).
+        def forward(self, x, message=None):
+            return 1e-9 * torch.randn_like(x)
+
+    cfg = load_eval_config(["eval_dir=.", "nbits=4", "n_eval_batches=1", "watermark_snr_db=30.0"])
+
+    _, diagnostics = prepare_eval_batches(
+        NearlyCollapsedGenerator(), [torch.randn(4, 1, 4000)], cfg, torch.device("cpu")
+    )
+
+    # Post-scaling: indistinguishable from healthy, and the delta is nonzero
+    # so delta_rms doesn't give it away either.
+    assert diagnostics["snr_db"]["p50"] == pytest.approx(30.0, abs=0.1)
+    assert diagnostics["delta_rms"] > 0.0
+    # Pre-scaling: the collapse is plainly visible.
+    assert diagnostics["raw_snr_db"]["p50"] > SNR_NEAR_SILENT_DB
+    assert diagnostics["raw_delta_rms"] < 1e-6
+
+    # The normalization itself is working, so the assert must NOT fire -- but
+    # the generator is broken, so the warning must.
+    warnings = check_watermark_snr(diagnostics, snr_db_range=(cfg.watermark_snr_db, cfg.watermark_snr_db))
+    assert any("near-silent" in w for w in warnings)
+    assert any("raw" in w for w in warnings)
+
+
+def test_prepare_eval_batches_stays_quiet_on_a_healthy_generator():
+    """Counterpart to the collapse test: a generator emitting a sane delta
+    passes both the target assertion and every quality gate."""
+
+    class HealthyGenerator(torch.nn.Module):
+        # Not an AudioSealWM, so embed_watermark calls it through forward
+        # (see train._watermark_delta).
+        def forward(self, x, message=None):
+            return 0.01 * torch.randn_like(x)
+
+    cfg = load_eval_config(["eval_dir=.", "nbits=4", "n_eval_batches=1", "watermark_snr_db=30.0"])
+
+    _, diagnostics = prepare_eval_batches(
+        HealthyGenerator(), [torch.randn(4, 1, 4000)], cfg, torch.device("cpu")
+    )
+
+    assert diagnostics["snr_db"]["p50"] == pytest.approx(30.0, abs=0.1)
+    assert SNR_AUDIBLE_DB < diagnostics["raw_snr_db"]["p50"] < SNR_NEAR_SILENT_DB
+    assert check_watermark_snr(diagnostics, snr_db_range=(cfg.watermark_snr_db, cfg.watermark_snr_db)) == []
+
+
+def test_check_watermark_snr_assert_fires_when_normalization_misses_target():
+    """The assertion reads the POST-scaling median even though the warnings
+    read the raw one -- a normalization that doesn't hit its target is a
+    wiring bug, and must not be masked by a healthy-looking raw delta."""
+    diagnostics = watermark_report(
+        torch.full((8,), 12.0),  # post-scaling: nowhere near the 30 dB target
+        torch.full((8,), 0.05),
+        raw_snr_db=torch.full((8,), 30.0),  # raw: perfectly healthy
+        raw_delta_rms=torch.full((8,), 0.01),
+    )
+
+    with pytest.raises(AssertionError, match="outside the configured"):
+        check_watermark_snr(diagnostics, snr_db_range=(30.0, 30.0))
+
+
+def test_check_watermark_snr_warns_on_audible_watermark():
+    diagnostics = watermark_report(torch.full((10,), SNR_AUDIBLE_DB - 5.0), torch.full((10,), 0.1))
+
+    warnings = check_watermark_snr(diagnostics)
+
+    assert any("audible" in w for w in warnings)
+
+
+def test_check_watermark_snr_flags_exactly_zero_delta():
+    """A zero delta reads as a *large* dB value (it's the denominator), so
+    it must be called out from delta_rms, not inferred from the SNR."""
+    snr_db = watermark_snr_db(torch.randn(4, 1, 4000), torch.randn(4, 1, 4000).clone())
+    diagnostics = watermark_report(torch.full((4,), 30.0), torch.tensor([0.01, 0.01, 0.0, 0.01]))
+
+    warnings = check_watermark_snr(diagnostics)
+
+    assert any("exactly-zero" in w for w in warnings)
+    assert snr_db.isfinite().all()
+
+
+def test_check_watermark_snr_is_quiet_on_a_healthy_watermark():
+    torch.manual_seed(0)
+    diagnostics = watermark_report(
+        24.0 + 6.0 * torch.rand(50), 0.01 + 0.001 * torch.rand(50)
+    )
+
+    assert check_watermark_snr(diagnostics) == []
+    # A configured normalization target that the median sits inside passes.
+    assert check_watermark_snr(diagnostics, snr_db_range=(24.0, 36.0)) == []
+
+
+def test_check_watermark_snr_warns_on_wide_per_clip_spread():
+    """A healthy median can hide clips with no usable watermark -- the
+    spread is what makes that visible, so it gets its own gate."""
+    snr_db = torch.linspace(5.0, 60.0, 40)  # median ~32 dB, but p5..p95 is huge
+    diagnostics = watermark_report(snr_db, torch.full((40,), 0.01))
+
+    warnings = check_watermark_snr(diagnostics)
+
+    assert diagnostics["snr_db"]["p50"] == pytest.approx(32.5, abs=1.0)
+    assert any("spread" in w for w in warnings)
+
+
+def test_check_watermark_snr_asserts_against_configured_target():
+    diagnostics = watermark_report(torch.full((10,), 30.0), torch.full((10,), 0.01))
+
+    # Fixed target, +/- 1 dB: 30 dB passes against 30, fails against 25.
+    check_watermark_snr(diagnostics, snr_db_range=(30.0, 30.0))
+    check_watermark_snr(diagnostics, snr_db_range=(29.5, 29.5))
+    with pytest.raises(AssertionError, match="outside the configured"):
+        check_watermark_snr(diagnostics, snr_db_range=(25.0, 25.0))
+    with pytest.raises(AssertionError, match="outside the configured"):
+        check_watermark_snr(diagnostics, snr_db_range=(15.0, 20.0))
+
+
+def test_stock_baseline_flag_sets_config_mode():
+    assert load_eval_config(["eval_dir=."]).stock_baseline is False
+
+    cfg = load_eval_config(["eval_dir=.", "--stock-baseline", "n_eval_batches=3"])
+
+    assert cfg.stock_baseline is True
+    assert cfg.n_eval_batches == 3  # the flag doesn't disturb the dotlist overrides
+
+
+def test_apply_stock_baseline_overrides_checkpoints_and_attacks():
+    cfg = load_eval_config([
+        "eval_dir=.",
+        "--stock-baseline",
+        "generator_checkpoint=./checkpoints/generator_epoch10.pth",
+        "eval_attacks=[identity,sgmse]",
+    ])
+
+    cfg = apply_stock_baseline(cfg)
+
+    assert cfg.generator_checkpoint == STOCK_GENERATOR_CARD
+    assert cfg.detector_checkpoint == STOCK_DETECTOR_CARD
+    assert list(cfg.eval_attacks) == ["identity"]
+    assert list(cfg.held_out_attacks) == []
+
+
+def test_stock_baseline_verdict_passes_on_healthy_numbers():
+    results = {
+        "attacks": {"identity": {"detection_rate": 1.0, "bit_accuracy": 1.0}},
+        "watermark": {"snr_db": {"p50": 30.0}},
+    }
+
+    passed, lines = stock_baseline_verdict(results)
+
+    assert passed
+    assert all("PASS" in line for line in lines)
+
+
+def test_stock_baseline_verdict_checks_raw_snr_under_normalization():
+    """Under SNR normalization the post-scaling median equals the target by
+    construction, so checking it would PASS a generator emitting nothing.
+    The verdict must read raw_snr_db instead."""
+    results = {
+        "attacks": {"identity": {"detection_rate": 1.0, "bit_accuracy": 1.0}},
+        # Perfectly on-target post-scaling, but the generator emitted ~nothing.
+        "watermark": {"snr_db": {"p50": 30.0}, "raw_snr_db": {"p50": 140.0}},
+    }
+
+    passed, lines = stock_baseline_verdict(results)
+
+    assert not passed
+    assert any("raw_snr_db" in line and "FAIL" in line for line in lines)
+
+
+@pytest.mark.parametrize(
+    "detection, bit_acc, median_snr",
+    [
+        (0.5, 1.0, 30.0),  # detector doesn't fire -> harness bug
+        (1.0, 0.51, 30.0),  # message doesn't survive the round trip
+        (1.0, 1.0, 80.0),  # generator emits an effectively-zero delta
+        (1.0, 1.0, 5.0),  # perturbation is grossly too loud
+    ],
+)
+def test_stock_baseline_verdict_fails_on_each_broken_axis(detection, bit_acc, median_snr):
+    results = {
+        "attacks": {"identity": {"detection_rate": detection, "bit_accuracy": bit_acc}},
+        "watermark": {"snr_db": {"p50": median_snr}},
+    }
+
+    passed, lines = stock_baseline_verdict(results)
+
+    assert not passed
+    assert any("FAIL" in line for line in lines)
+
+
+def test_stock_baseline_verdict_fails_when_a_number_is_missing():
+    passed, lines = stock_baseline_verdict({"attacks": {}, "watermark": {}})
+
+    assert not passed
+    assert all("MISSING" in line for line in lines)
 
 
 def test_prepare_eval_batches_allows_an_idle_ranks_empty_shard():
@@ -154,7 +431,8 @@ def test_prepare_eval_batches_allows_an_idle_ranks_empty_shard():
     dataloader = [torch.randn(2, 1, 4000), torch.randn(2, 1, 4000)]
     idle = DistEnv(rank=3, world_size=4)  # shard_size(2, rank 3 of 4) == 0
 
-    assert prepare_eval_batches(generator, dataloader, cfg, torch.device("cpu"), idle) == []
+    # Nothing measured on this rank, so no watermark diagnostics either.
+    assert prepare_eval_batches(generator, dataloader, cfg, torch.device("cpu"), idle) == ([], {})
 
 
 def test_prepare_eval_batches_still_rejects_a_starved_nonempty_shard():

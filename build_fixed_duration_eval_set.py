@@ -13,7 +13,7 @@ only touches the qualifying subset (~586 of test-clean's 2620 files), not
 the whole dataset, so it's still fast.
 
 Usage:
-    python3 build_fixed_duration_eval_set.py [source_dir] [target_duration_seconds]
+    python3 build_fixed_duration_eval_set.py <source_dir> [target_duration_seconds]
 """
 
 import sys
@@ -25,9 +25,12 @@ _AUDIO_EXTENSIONS = (".flac", ".wav")
 
 
 def main() -> None:
-    source_dir = Path(
-        sys.argv[1] if len(sys.argv) > 1 else "/Users/djina/Desktop/psiml/datasets/LibriSpeech/test-clean"
-    )
+    if len(sys.argv) < 2 or len(sys.argv) > 3:
+        sys.exit(
+            "usage: python3 build_fixed_duration_eval_set.py "
+            "<source_dir> [target_duration_seconds]"
+        )
+    source_dir = Path(sys.argv[1])
     target_duration = float(sys.argv[2]) if len(sys.argv) > 2 else 10.24
 
     dest_dir = source_dir.parent / "test-clean-fixed"

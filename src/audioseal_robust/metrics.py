@@ -32,6 +32,17 @@ Perceptual (measured on watermarked vs. original, no attack):
     reimplementing SI-SNR/PESQ from scratch).
   - `visqol_score`: stubbed, see docstring below -- ViSQOL isn't pip-installable.
 
+Diagnostic (also watermarked vs. original, no attack -- but read *before*
+believing any robustness number, not as a quality score):
+  - `watermark_snr_db` / `watermark_delta_rms` / `watermark_report`: how loud
+    the watermark perturbation actually is. Near-chance detection has two very
+    different causes -- the generator emitting an effectively-zero delta, or a
+    fine delta that something downstream fails to detect -- and these separate
+    them for the price of two reductions. Deliberately NOT scale-invariant
+    (unlike `sisnr_score`): the absolute size of `x_wm - x` relative to `x` is
+    exactly the thing in question, and SI-SNR's per-clip rescaling would hide
+    a delta that is uniformly too small.
+
 All *_score functions import their backing library lazily (inside the
 function) so that importing this module doesn't require torchmetrics/pesq
 to be installed if you only need bit_accuracy/tpr_at_fpr.
@@ -82,6 +93,22 @@ def bit_accuracy(m_hat: torch.Tensor, message: torch.Tensor, threshold: float = 
     in {0, 1}."""
     decoded = (m_hat > threshold).float()
     return (decoded == message.float()).float().mean().item()
+
+
+def detection_rate(positive_scores: torch.Tensor, threshold: float = 0.5) -> float:
+    """Fraction of watermarked clips whose presence probability clears a
+    fixed `threshold`.
+
+    Unlike `tpr_at_fpr` this does NOT calibrate against the negatives, which
+    makes it the wrong number to quote for robustness -- but the right one
+    for a diagnostic: it answers "does the detector fire at all on our
+    watermarked audio" without the answer depending on how the (possibly
+    equally broken) negatives happened to score. A run where `tpr_at_fpr` is
+    near chance but `detection_rate` is ~1.0 means the detector fires on
+    everything; both near chance means it fires on nothing.
+    """
+    assert positive_scores.numel() > 0
+    return (positive_scores >= threshold).float().mean().item()
 
 
 def _threshold_at_fpr(negative_scores: torch.Tensor, target_fpr: float) -> float:
@@ -177,10 +204,138 @@ def f1_score(confusion: tp.Dict[str, int]) -> float:
     return 2 * precision * recall / (precision + recall)
 
 
+def _as_bct(x: torch.Tensor, x_wm: torch.Tensor) -> tp.Tuple[torch.Tensor, torch.Tensor]:
+    """Normalize a (B, T) or (B, C, T) pair to (B, C, T), checking they agree."""
+    if x.shape != x_wm.shape:
+        raise ValueError(f"x and x_wm must have the same shape, got {tuple(x.shape)} vs {tuple(x_wm.shape)}")
+    if x.dim() == 2:
+        return x.unsqueeze(1), x_wm.unsqueeze(1)
+    if x.dim() == 3:
+        return x, x_wm
+    raise ValueError(f"expected (B, T) or (B, C, T) audio, got {x.dim()}D tensor {tuple(x.shape)}")
+
+
+def watermark_snr_db(x: torch.Tensor, x_wm: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
+    """Per-clip watermark SNR in dB: 10 * log10(||x||^2 / ||x_wm - x||^2).
+
+    Args:
+        x: clean input, (B, C, T) or (B, T), float.
+        x_wm: generator output *before any attack*, same shape as `x`.
+        eps: floor for the squared norms, see below.
+
+    Returns a (B,) tensor of per-clip dB values.
+
+    Reduced over the channel and time axes ONLY -- never over the batch.
+    Pooling energy across the batch first would report a single ratio of
+    summed energies, in which one loud clip's signal energy masks a quiet
+    clip's missing watermark; per-clip-then-aggregate keeps that visible in
+    the spread (see `watermark_report`, which reports percentiles for exactly
+    this reason).
+
+    Both sums are floored at `eps` rather than just the denominator: flooring
+    the noise term alone still returns -inf for a digitally-silent clip
+    (0 signal energy, 0 delta), and this is a diagnostic that gets aggregated
+    -- one -inf would poison the mean and the reported min. With both floored,
+    that degenerate case reads 0 dB and the accompanying `delta_rms` (exactly
+    0.0) says which of the two zero cases it was.
+    """
+    x, x_wm = _as_bct(x, x_wm)
+    delta = x_wm - x
+    signal = x.pow(2).sum(dim=(1, 2)).clamp_min(eps)
+    noise = delta.pow(2).sum(dim=(1, 2)).clamp_min(eps)
+    return 10.0 * torch.log10(signal / noise)
+
+
+def watermark_delta_rms(x: torch.Tensor, x_wm: torch.Tensor) -> torch.Tensor:
+    """Per-clip RMS of the watermark perturbation `x_wm - x`, (B,).
+
+    The companion to `watermark_snr_db`, which saturates at a large finite
+    number (not inf) when the delta is exactly zero and so can't by itself
+    distinguish "no watermark at all" from "an extremely quiet one". This
+    reads exactly 0.0 in the former case. Absolute units (same as the audio),
+    so it is not comparable across datasets -- only against zero.
+    """
+    x, x_wm = _as_bct(x, x_wm)
+    return (x_wm - x).pow(2).mean(dim=(1, 2)).sqrt()
+
+
+def _per_clip_stats(values: torch.Tensor) -> tp.Dict[str, float]:
+    """mean/std/min/max + 5th/50th/95th percentiles of a (N,) tensor.
+
+    Population std (`unbiased=False`) so a single clip reports 0.0 rather
+    than nan -- this runs on whatever the eval set happened to produce.
+    """
+    values = values.detach().float().flatten()
+    quantiles = torch.quantile(values, torch.tensor([0.05, 0.5, 0.95], dtype=values.dtype))
+    return {
+        "mean": values.mean().item(),
+        "std": values.std(unbiased=False).item(),
+        "min": values.min().item(),
+        "max": values.max().item(),
+        "p5": quantiles[0].item(),
+        "p50": quantiles[1].item(),
+        "p95": quantiles[2].item(),
+    }
+
+
+def watermark_report(
+    snr_db: torch.Tensor,
+    delta_rms: torch.Tensor,
+    raw_snr_db: tp.Optional[torch.Tensor] = None,
+    raw_delta_rms: tp.Optional[torch.Tensor] = None,
+) -> tp.Dict[str, tp.Any]:
+    """Aggregate per-clip `watermark_snr_db` / `watermark_delta_rms` values
+    (concatenated over every eval batch) into the reported diagnostic.
+
+        {"snr_db": {mean, std, min, max, p5, p50, p95},
+         "delta_rms": <mean>, "delta_rms_min": <min>, "n_clips": <N>}
+
+    `snr_db.p50` is the headline: dB is a log scale, so a few clips landing
+    at the ~150 dB zero-delta saturation point drag the mean far more than
+    they should. The spread (p5..p95) is the second thing to read -- a wide
+    distribution means the perturbation is not being normalized per clip, so
+    a good median is hiding clips with no usable watermark.
+
+    `delta_rms_min` is reported alongside the mean so that a *subset* of
+    clips with an exactly-zero delta is still unambiguous.
+
+    `raw_snr_db` / `raw_delta_rms` are the same two measurements taken on the
+    generator's output BEFORE SNR normalization scales it (see
+    train.py:embed_watermark). Pass them whenever the embedding is
+    normalized, and read them as the actual generator-health signal: the
+    post-scaling `snr_db` is pinned to the configured target by construction
+    and therefore reports the same value for a healthy generator and for one
+    whose delta has collapsed to zero. They land under `raw_snr_db` and
+    `raw_delta_rms` / `raw_delta_rms_min`, and are simply absent when the
+    embedding is unscaled (in which case `snr_db` is already the raw number).
+    """
+    assert snr_db.numel() == delta_rms.numel() and snr_db.numel() > 0
+    report: tp.Dict[str, tp.Any] = {
+        "snr_db": _per_clip_stats(snr_db),
+        "delta_rms": delta_rms.detach().float().mean().item(),
+        "delta_rms_min": delta_rms.detach().float().min().item(),
+        "n_clips": int(snr_db.numel()),
+    }
+    if raw_snr_db is not None:
+        assert raw_snr_db.numel() == snr_db.numel()
+        report["raw_snr_db"] = _per_clip_stats(raw_snr_db)
+    if raw_delta_rms is not None:
+        assert raw_delta_rms.numel() == snr_db.numel()
+        raw_delta_rms = raw_delta_rms.detach().float()
+        report["raw_delta_rms"] = raw_delta_rms.mean().item()
+        report["raw_delta_rms_min"] = raw_delta_rms.min().item()
+    return report
+
+
 def sisnr_score(x: torch.Tensor, x_wm: torch.Tensor) -> float:
     """Scale-invariant SNR between clean `x` and watermarked `x_wm`, both
     (B, 1, T). Higher is better (less audible watermark). Cheap enough to
-    log every eval step."""
+    log every eval step.
+
+    Note this is *scale-invariant*: it rescales `x_wm` to best match `x`
+    before measuring, so it is a perceptual-quality number, not a measure of
+    how large the perturbation actually is. Use `watermark_snr_db` for the
+    latter."""
     from torchmetrics.audio.snr import ScaleInvariantSignalNoiseRatio
 
     metric = ScaleInvariantSignalNoiseRatio().to(x.device)

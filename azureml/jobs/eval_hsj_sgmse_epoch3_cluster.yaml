@@ -1,0 +1,71 @@
+$schema: https://azuremlschemas.azureedge.net/latest/commandJob.schema.json
+
+# az ml job create -f azureml/jobs/eval_hsj_sgmse_epoch3_cluster.yaml \
+#   --set compute=azureml:<compute-name>
+#
+# Arm 2 of 3. The SGMSE-trained fine-tuned generator, under HopSkipJump.
+# Identical to eval_hsj_baseline_cluster.yaml except for the generators
+# input, --generator, --label and display_name -- see that file for the full
+# rationale behind every protocol knob below. Change one here and change it in
+# all three.
+type: command
+
+experiment_name: audioseal-robust-hsj-eval
+display_name: hsj-eval-sgmse-epoch3
+description: >-
+  HopSkipJump robustness evaluation of the SGMSE-trained fine-tuned generator
+  (generator_epoch3.pth) paired with the STOCK AudioSeal detector, 400
+  positives + 400 negatives, with per-sample detector scores written to
+  rows.csv.
+
+code: ../..
+environment: azureml:audioseal-robust-diffusion@latest
+
+compute: azureml:gpu-cluster
+
+resources:
+  instance_count: 1
+  shm_size: 64g
+
+inputs:
+  librispeech:
+    type: uri_folder
+    path: azureml:librispeech-asr:1
+    mode: download
+  # Holds both fine-tuned generators; --generator below picks this arm's.
+  generators:
+    type: custom_model
+    path: azureml:psiml-finetuned-generators:1
+    mode: ro_mount
+
+outputs:
+  artifacts:
+    type: uri_folder
+    mode: rw_mount
+
+command: >-
+  bash azureml/aml_run.sh eval
+  --librispeech ${{inputs.librispeech}}
+  --generators ${{inputs.generators}}
+  --artifacts ${{outputs.artifacts}}
+  --generator generator_epoch3.pth
+  --label hsj_finetuned_sgmse_epoch3
+  --
+  batch_size=8
+  n_eval_batches=50
+  segment_duration=3.0
+  eval_attacks=[identity]
+  held_out_attacks=[hopskipjump]
+  attack.hopskipjump.checkpoint=auto
+  attack.hopskipjump.num_iterations=25
+  attack.hopskipjump.init_num_evals=20
+  attack.hopskipjump.max_num_evals=100
+  attack.hopskipjump.init_max_trials=300
+  save_row_artifacts=true
+  tracking.backend=mlflow
+
+environment_variables:
+  PYTHONUNBUFFERED: "1"
+  AZUREML_ARTIFACTS_DEFAULT_TIMEOUT: "1200"
+limits:
+  timeout: 21600

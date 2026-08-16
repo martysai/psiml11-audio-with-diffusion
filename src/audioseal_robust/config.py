@@ -20,6 +20,7 @@ which is the same override mechanism Dora/Hydra are themselves built on.
 `total_loss` computation in `train.py` -- never hardcoded.
 """
 
+import sys
 import typing as tp
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -183,6 +184,107 @@ class HopSkipJumpAttackConfig:
 
 
 @dataclass
+class PGDAttackConfig:
+    """Wires PGDAttack (attacks.py) -- fixed-budget, epsilon-constrained
+    white-box PGD against the detector. The white-box counterpart to
+    HopSkipJumpAttackConfig's black-box search.
+
+    Unlike hopskipjump this needs no enable/disable `checkpoint` gate: it
+    costs `num_steps` batched forward+backward passes per batch rather than
+    hundreds of un-batchable queries per example, so it is affordable at the
+    same batch_size/n_eval_batches as the resynthesis attacks. Eval-only all
+    the same -- see attacks.py:PGDAttack's docstring for why it must never
+    get a nonzero weight in TrainConfig's AttackWeights.
+    """
+
+    # L-infinity perturbation budget, in raw waveform amplitude on the
+    # [-1, 1] scale. 0.002 is roughly -54 dBFS peak, i.e. inaudible on
+    # speech, and is the value to sweep for a robustness curve (0.0005 /
+    # 0.001 / 0.002 / 0.005 / 0.01 covers "no effect" through "audible").
+    epsilon: float = 0.002
+    # Gradient-ascent steps inside the budget.
+    num_steps: int = 20
+    # Per-step L-infinity move. None -> Madry et al.'s 2.5 * epsilon /
+    # num_steps default (see attacks.py).
+    step_size: tp.Optional[float] = None
+    # Presence threshold the attack reads the detector's CURRENT decision
+    # off, to pick its direction per example (evade vs. forge). Matches
+    # HopSkipJumpAttackConfig.detection_threshold and AudioSeal's own default.
+    detection_threshold: float = 0.5
+    # Start from a uniform random point inside the ball rather than from the
+    # clean signal -- standard PGD practice, and it stops the attack from
+    # being deterministically stuck when the input sits exactly on a
+    # gradient plateau.
+    random_start: bool = True
+    clip_min: float = -1.0
+    clip_max: float = 1.0
+
+
+@dataclass
+class GaussianNoiseAttackConfig:
+    """Wires GaussianNoiseAttack (attacks.py) -- additive white noise at a
+    fixed per-example SNR. No weights, no detector queries, always available."""
+
+    # Signal-to-noise ratio of the added noise, in dB. Lower = stronger.
+    # 20 dB is clearly audible but leaves speech fully intelligible; sweep
+    # e.g. 40 / 30 / 20 / 10 / 5 for a robustness curve.
+    snr_db: float = 20.0
+
+
+@dataclass
+class LowpassAttackConfig:
+    """Wires LowpassAttack (attacks.py) -- second-order Butterworth low-pass."""
+
+    sample_rate: int = 16_000
+    # Cutoff in Hz. 4 kHz is narrowband-telephony-like on 16 kHz audio (it
+    # discards the entire upper half of the spectrum) while leaving speech
+    # intelligible. Sweep e.g. 8000 / 6000 / 4000 / 3000 / 2000.
+    cutoff_hz: float = 4_000.0
+
+
+@dataclass
+class SpeedAttackConfig:
+    """Wires SpeedAttack (attacks.py) -- resampling-based playback-speed
+    change. See that class's note on why `attack_sisnr` is not comparable
+    with the other attacks' for this one."""
+
+    sample_rate: int = 16_000
+    # Playback rate multiplier. 1.05 = 5% faster, around the threshold where
+    # listeners start to notice on speech. Sweep e.g. 0.9 / 0.95 / 1.05 / 1.1.
+    factor: float = 1.05
+
+
+@dataclass
+class QuantizationAttackConfig:
+    """Wires QuantizationAttack (attacks.py) -- uniform bit-depth reduction."""
+
+    # Bits per sample over full-scale [-1, 1]. 8 is a meaningful but survivable
+    # attack; sweep e.g. 12 / 10 / 8 / 6 / 4.
+    bits: int = 8
+
+
+@dataclass
+class CodecAttackConfig:
+    """Wires CodecAttack (attacks.py) -- lossy MP3/Opus round-trip through
+    the `ffmpeg` binary.
+
+    Instantiated twice in EvalAttackConfig (`codec_mp3`, `codec_opus`) since
+    the two codecs are separately interesting: MP3 is what most distributed
+    audio has been through, Opus is what most real-time/VoIP audio has been
+    through, and they discard quite different things.
+
+    Skipped automatically with a clear message when `ffmpeg` is not on PATH
+    -- see attacks.py:CodecAttack.
+    """
+
+    sample_rate: int = 16_000
+    codec: str = "mp3"  # "mp3" | "opus"
+    # Encoder bitrate. Lower = more information discarded = stronger attack.
+    # 64 kbps mono is transparent-ish for speech; sweep e.g. 128 / 64 / 32 / 16.
+    bitrate_kbps: int = 64
+
+
+@dataclass
 class AttackWeights:
     # Sampling weight for each attack branch (need not sum to 1; normalized
     # internally). A weight of 0 disables that branch. Identity is the only
@@ -231,9 +333,9 @@ class OptimConfig:
     # instead of only shrinking it when it exceeds `max_norm`.
     #
     # This exists because plain clipping silently reweights a mixed-attack
-    # recipe. The branches produce gradients of wildly different scale: on the
-    # 4x A100 run train-audioldm-mixed-0814-155734 (recipe=audioldm_mixed, so
-    # ~50/50 identity vs audioldm), the median parameter-gradient norm was
+    # recipe. The branches produce gradients of wildly different scale: in a
+    # measured 4-GPU audioldm_mixed run (~50/50 identity vs audioldm), the
+    # median parameter-gradient norm was
     #     identity 1.69   -- under max_norm=3.0, so 26/30 steps passed through
     #                        untouched
     #     audioldm 42.94  -- over it on 33/33 steps, scaled down 14.3x
@@ -380,6 +482,22 @@ class EvalAttackConfig:
     audioldm: AudioLDMAttackConfig = field(default_factory=AudioLDMAttackConfig)
     mbd: MBDAttackConfig = field(default_factory=MBDAttackConfig)
     hopskipjump: HopSkipJumpAttackConfig = field(default_factory=HopSkipJumpAttackConfig)
+    # Fixed-budget attacks (AudioMarkBench's white-box adversarial + common
+    # perturbation families). Unlike hopskipjump these need no enable gate:
+    # none of them loads external weights and none is expensive enough to
+    # need opting into. See attacks.py:_SignalLevelAttack for why this whole
+    # group, and not hopskipjump, is the one that yields meaningful ROC-AUC.
+    pgd: PGDAttackConfig = field(default_factory=PGDAttackConfig)
+    gaussian_noise: GaussianNoiseAttackConfig = field(default_factory=GaussianNoiseAttackConfig)
+    lowpass: LowpassAttackConfig = field(default_factory=LowpassAttackConfig)
+    speed: SpeedAttackConfig = field(default_factory=SpeedAttackConfig)
+    quantization: QuantizationAttackConfig = field(default_factory=QuantizationAttackConfig)
+    codec_mp3: CodecAttackConfig = field(
+        default_factory=lambda: CodecAttackConfig(codec="mp3", bitrate_kbps=64)
+    )
+    codec_opus: CodecAttackConfig = field(
+        default_factory=lambda: CodecAttackConfig(codec="opus", bitrate_kbps=32)
+    )
 
 
 @dataclass
@@ -537,6 +655,18 @@ class EvalConfig:
     compute_sisnr: bool = True
     compute_visqol: bool = False  # needs a separate ViSQOL binary build, see metrics.py
 
+    # Reference-point mode, settable as `--stock-baseline` or
+    # `stock_baseline=true`: force the run onto the unmodified pretrained
+    # AudioSeal generator+detector with no attack and no fine-tuned weights,
+    # overriding generator_checkpoint / detector_checkpoint / eval_attacks /
+    # held_out_attacks (see evaluate.py:apply_stock_baseline). Everything else
+    # -- data, batching, embedding, detection, metrics -- stays on the exact
+    # same code path, which is the point: it isolates "is the harness right"
+    # from "is the fine-tuned generator right". Exits non-zero if the stock
+    # numbers don't come out where known-good weights must
+    # (evaluate.py:stock_baseline_verdict).
+    stock_baseline: bool = False
+
     attack: EvalAttackConfig = field(default_factory=EvalAttackConfig)
     tracking: TrackingConfig = field(default_factory=TrackingConfig)
 
@@ -560,6 +690,9 @@ def _load_recipe(section: str, name: str) -> tp.Any:
         raise ValueError(f"Unknown {section} recipe {name!r}, expected one of {available}")
     return section_cfg[name]
 
+# The only non-dotlist CLI argument evaluate.py accepts, see load_eval_config.
+_STOCK_BASELINE_FLAG = "--stock-baseline"
+
 
 def load_config(cli_args: tp.Optional[tp.List[str]] = None) -> TrainConfig:
     """Build the effective config: structured schema <- config/default.yaml
@@ -580,10 +713,23 @@ def load_config(cli_args: tp.Optional[tp.List[str]] = None) -> TrainConfig:
 def load_eval_config(cli_args: tp.Optional[tp.List[str]] = None) -> EvalConfig:
     """Same override mechanism as load_config (including the recipe step --
     see that function and EvalConfig.recipe / config/recipes.yaml), just
-    against config/default_eval.yaml."""
+    against config/default_eval.yaml.
+
+    Plus one true flag, `--stock-baseline` (see EvalConfig.stock_baseline),
+    which is stripped here and rewritten into the dotlist form OmegaConf
+    understands. It gets a flag rather than only `stock_baseline=true`
+    because it is a *mode*, not a value -- it overrides several other config
+    fields -- and because it is the first thing anyone is told to run when
+    the numbers look wrong, so it should be typo-proof at the shell.
+    """
+    args = list(sys.argv[1:] if cli_args is None else cli_args)
+    dotlist = [a for a in args if a != _STOCK_BASELINE_FLAG]
+    if len(dotlist) != len(args):
+        dotlist.append("stock_baseline=true")
+
     schema = OmegaConf.structured(EvalConfig)
     file_cfg = OmegaConf.load(_DEFAULT_EVAL_YAML) if _DEFAULT_EVAL_YAML.exists() else OmegaConf.create({})
-    cli_cfg = OmegaConf.from_cli(cli_args)
+    cli_cfg = OmegaConf.from_cli(dotlist)
     recipe_name = cli_cfg.get("recipe", None) or file_cfg.get("recipe", None)
     recipe_cfg = _load_recipe("eval", recipe_name) if recipe_name else OmegaConf.create({})
     cfg = OmegaConf.merge(schema, file_cfg, recipe_cfg, cli_cfg)

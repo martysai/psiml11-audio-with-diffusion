@@ -4,7 +4,7 @@ files. Reads only each file's header (soundfile.info, no decode) so it stays
 fast even across LibriSpeech's ~28k train-clean-100 files.
 
 Usage:
-    python3 analyze_dataset_durations.py [dataset_dir]
+    python3 analyze_dataset_durations.py <dataset_dir>
 """
 
 import statistics
@@ -17,7 +17,9 @@ _AUDIO_EXTENSIONS = (".flac", ".wav")
 
 
 def main() -> None:
-    dataset_dir = Path(sys.argv[1] if len(sys.argv) > 1 else "/Users/djina/Desktop/psiml/datasets/LibriSpeech/train-clean-100")
+    if len(sys.argv) != 2:
+        sys.exit("usage: python3 analyze_dataset_durations.py <dataset_dir>")
+    dataset_dir = Path(sys.argv[1])
     files = sorted(p for ext in _AUDIO_EXTENSIONS for p in dataset_dir.rglob(f"*{ext}"))
     if not files:
         sys.exit(f"no audio files ({', '.join(_AUDIO_EXTENSIONS)}) found under {dataset_dir}")
