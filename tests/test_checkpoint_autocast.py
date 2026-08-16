@@ -17,7 +17,7 @@ bf16 while module parameters stay fp32, and replaying
 
     RuntimeError: expected scalar type BFloat16 but found Float
 
-which is exactly how the 4x A100 manifold smoke run died. On CPU the same bug
+which is exactly how the distributed GPU smoke run failed. On CPU the same bug
 is silent -- layer_norm promotes instead of raising -- and merely produces
 gradients that do not match the uncheckpointed path, so these tests assert the
 invariant directly (autocast state and dtypes agree between the two calls)

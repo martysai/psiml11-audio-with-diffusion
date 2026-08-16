@@ -1,0 +1,76 @@
+# python azureml/aml_submit.py --config azureml/configs/eval_hsj_audioldm_epoch18.yaml
+#
+# Arm 3 of 3. The AudioLDM-trained fine-tuned generator, under HopSkipJump.
+# The two fine-tuned arms (eval_hsj_sgmse_epoch3.yaml,
+# eval_hsj_audioldm_epoch18.yaml) are byte-for-byte identical to this file
+# except for `generator`, `label` and `display_name` -- that is deliberate, so
+# any difference in the numbers is attributable to the generator alone. Change
+# a protocol knob here and you must change it in all three.
+#
+# Workspace coordinates come from environment variables or Azure CLI defaults.
+
+direction: eval
+# HopSkipJump is sequential, so use a single-GPU compute target.
+compute: gpu-cluster
+environment: azureml:audioseal-robust-diffusion@latest
+
+experiment_name: audioseal-robust-hsj-eval
+display_name: hsj-eval-audioldm-epoch18
+# Prefixes every artifact: <label>_metrics.csv, <label>_roc.png,
+# <label>_hopskipjump_rows/rows.csv.
+label: hsj_finetuned_audioldm_epoch18
+description: >-
+  HopSkipJump robustness evaluation of the AudioLDM-trained fine-tuned
+  generator (generator_epoch18.pth) paired with the STOCK AudioSeal detector,
+  400 positives + 400 negatives, with per-sample detector scores written to
+  rows.csv.
+
+# Selects one .pth by filename out of the mounted generators asset.
+generator: generator_epoch18.pth
+
+inputs:
+  librispeech: azureml:librispeech-asr:1
+  # Holds both fine-tuned generators; `generator` above picks this arm's.
+  # No `checkpoints`: identity and hopskipjump load no diffusion backbone, so
+  # the 10.9 GB asset would only add mount latency.
+  generators: azureml:psiml-finetuned-generators:1
+
+# HopSkipJump costs hundreds of detector forward passes PER WAVEFORM. The
+# reference run of exactly this protocol took 1.7 h on one A100; 6 h leaves
+# room for a slower node without letting a hung job burn a day.
+timeout_minutes: 360
+
+# Forwarded verbatim to evaluate.py as `key=value` argv (EvalConfig in
+# src/audioseal_robust/config.py). Merge order: schema <- default_eval.yaml
+# <- these.
+overrides:
+  # 50 x 8 = 400 positives + 400 negatives. fpr_target=0.01 needs >=100
+  # negatives to resolve at all and ~1000 to be stable, so 400 is a
+  # deliberate compromise -- evaluate.py reports fpr_support alongside the
+  # number so the caveat travels with the result.
+  batch_size: 8
+  n_eval_batches: 50
+  segment_duration: 3.0
+  # identity measures the clean operating point (and the perceptual PESQ /
+  # SI-SNR baseline); hopskipjump is the actual attack, held out because it
+  # was never trained against.
+  eval_attacks: "[identity]"
+  held_out_attacks: "[hopskipjump]"
+  # "auto" is purely an enable gate -- HopSkipJump needs no weights file.
+  attack.hopskipjump.checkpoint: auto
+  # Full query budget, matching the reference run. Lowering any of these makes
+  # the attack weaker and the watermark look more robust than it is; that is
+  # what attack_failure_rate / tpr_at_fpr_attacked exist to expose.
+  attack.hopskipjump.num_iterations: 25
+  attack.hopskipjump.init_num_evals: 20
+  attack.hopskipjump.max_num_evals: 100
+  attack.hopskipjump.init_max_trials: 300
+  # The point of this sweep: per-example CSV with presence_pos / presence_neg
+  # (the detector's raw scores), bit_accuracy, attack_sisnr and the
+  # x / x_wm / x_att .wav files, under
+  # eval_outputs/<label>_hopskipjump_rows/. Collected to $ARTIFACTS by
+  # aml_run.sh's EXIT trap even if the job later fails.
+  save_row_artifacts: true
+  # mlflow, not wandb: metrics land on the AML run itself with no external
+  # egress and no API key in the job.
+  tracking.backend: mlflow

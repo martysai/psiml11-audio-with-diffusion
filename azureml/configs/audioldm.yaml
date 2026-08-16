@@ -3,12 +3,11 @@
 # The opposite direction from sgmse.yaml: trains against AudioLDM (AudioLDM),
 # holds SGMSE + MBD out. Static equivalent: azureml/jobs/train_audioldm.yaml.
 
-workspace:
-  subscription_id: <redacted-subscription>  # Azure ML
-  resource_group_name: gpu-resource-group
-  workspace_name: gpu-workspace
+# Workspace coordinates come from AZUREML_SUBSCRIPTION_ID,
+# AZUREML_RESOURCE_GROUP and AZUREML_WORKSPACE_NAME, or from Azure CLI defaults.
 
 direction: audioldm
+# Override with --compute for your workspace.
 compute: gpu-cluster
 environment: azureml:audioseal-robust-diffusion@latest
 

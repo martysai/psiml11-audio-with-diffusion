@@ -9,7 +9,7 @@ Reads only each file's header (soundfile.info, no decode), so it's fast even
 across LibriSpeech's ~2.6k test-clean files.
 
 Usage:
-    python3 analyze_eval_min_duration.py [dataset_dir] [min_duration_seconds]
+    python3 analyze_eval_min_duration.py <dataset_dir> [min_duration_seconds]
 """
 
 import sys
@@ -21,9 +21,12 @@ _AUDIO_EXTENSIONS = (".flac", ".wav")
 
 
 def main() -> None:
-    dataset_dir = Path(
-        sys.argv[1] if len(sys.argv) > 1 else "<user-home>/Desktop/psiml/datasets/LibriSpeech/test-clean"
-    )
+    if len(sys.argv) < 2 or len(sys.argv) > 3:
+        sys.exit(
+            "usage: python3 analyze_eval_min_duration.py "
+            "<dataset_dir> [min_duration_seconds]"
+        )
+    dataset_dir = Path(sys.argv[1])
     min_duration = float(sys.argv[2]) if len(sys.argv) > 2 else 10.24
 
     files = sorted(p for ext in _AUDIO_EXTENSIONS for p in dataset_dir.rglob(f"*{ext}"))

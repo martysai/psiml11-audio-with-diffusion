@@ -1,0 +1,129 @@
+$schema: https://azuremlschemas.azureedge.net/latest/commandJob.schema.json
+
+# az ml job create -f azureml/jobs/eval_fb_audioldm_epoch18_cluster.yaml \
+#   --set compute=azureml:<compute-name>
+#
+# Arm 3 of 3. Fine-tuned generator + stock detector, under the
+# FIXED-BUDGET attack suite. The other two arms
+# (eval_fb_baseline_cluster.yaml, eval_fb_sgmse_epoch3_cluster.yaml)
+# are identical to this file except for the generator input, --generator,
+# --label and display_name -- that is deliberate, so any difference in the
+# numbers is attributable to the generator alone. Change a protocol knob here
+# and change it in all three.
+#
+# Why this exists alongside the eval_hsj_*_cluster.yaml trio: HopSkipJump is
+# a *minimum-norm* attack -- it binary-searches to the decision boundary and
+# stops, so every attacked example lands at presence ~= 0.5 by construction.
+# The three HSJ arms bear this out: 99.4-99.6% of all 800 scores fell within
+# +-0.01 of 0.5, and the pos/neg gap was +0.00109 / +0.00111 / +0.00109 --
+# identical to three significant figures across three different generators,
+# because that number is HSJ's search tolerance and not a property of any
+# model. ROC-AUC is rank-based and margin-blind, so it happily reported 0.116
+# off that 4th-decimal noise.
+#
+# The attacks below are fixed-budget instead: each perturbs by a set amount
+# (epsilon, SNR, cutoff, bit depth, bitrate) and stops, wherever that leaves
+# the score. Local n=64 shows 0-1.6% of scores near 0.5 (vs HSJ's 99.5%) and
+# AUCs spread across 0.10-0.98, which is what makes them comparable between
+# arms. Report HSJ as cost-to-break (SI-SNR / queries) and these as
+# AUC / TPR@1%FPR.
+#
+type: command
+
+experiment_name: audioseal-robust-fixed-budget-eval
+display_name: fb-eval-audioldm-epoch18
+description: >-
+  Fixed-budget robustness evaluation (PGD + signal-level) of the AudioLDM-based
+  fine-tuned generator at epoch 18 (generator_epoch18.pth) + stock detector,
+  1000 positives + 1000 negatives, with per-sample detector scores written
+  to rows.csv.
+
+code: ../..
+environment: azureml:audioseal-robust-diffusion@latest
+
+compute: azureml:gpu-cluster
+
+resources:
+  # These attacks are single-device; use a single-GPU compute target.
+  instance_count: 1
+  shm_size: 64g
+
+inputs:
+  librispeech:
+    type: uri_folder
+    path: azureml:librispeech-asr:1
+    # download, not ro_mount -- data.py:WavDirDataset walks the tree once per
+    # audio extension per split, and directory listings over blobfuse are
+    # network round-trips.
+    mode: download
+  # Holds both fine-tuned generators; --generator below picks this arm's.
+  generators:
+    type: custom_model
+    path: azureml:psiml-finetuned-generators:1
+    mode: ro_mount
+
+outputs:
+  artifacts:
+    type: uri_folder
+    # rw_mount so per-sample rows and .wav artifacts land incrementally rather
+    # than only on a clean exit.
+    mode: rw_mount
+
+# Overrides after `--` go to evaluate.py (EvalConfig in
+# src/audioseal_robust/config.py).
+#
+# 125 x 8 = 1000 positives + 1000 negatives, up from the HSJ trio's 400.
+# fpr_target=0.01 needs >=100 negatives to resolve at all and ~1000 to be
+# stable; the HSJ runs could not afford that because HSJ costs hundreds of
+# un-batchable detector queries per waveform, whereas every attack here is a
+# fixed number of batched passes. evaluate.py reports fpr_support alongside
+# the number either way.
+#
+# identity is the clean operating point (and the perceptual PESQ / SI-SNR
+# baseline). Everything else is held out: none of these attacks was ever
+# trained against, in any arm, so held_out is the honest bucket for all of
+# them -- including on the two fine-tuned arms, which saw only SGMSE /
+# AudioLDM resynthesis during training.
+#
+# No attack.*.checkpoint gate here (unlike hopskipjump/mbd): none of these
+# loads external weights. Defaults are the sweep midpoints documented in
+# config.py -- pgd epsilon=0.002 (~-54 dBFS, inaudible), gaussian_noise
+# snr_db=20, lowpass cutoff_hz=4000, quantization bits=8, speed factor=1.05,
+# codecs at 64 kbps. Sweeping any of them is a config override, not a code
+# change.
+#
+# No curve pass is emitted: evaluate.py only traces t* for
+# _STRENGTH_AWARE_ATTACKS (sgmse, audioldm), and none is selected here, so
+# n_curve_batches is a no-op regardless of its value.
+#
+# save_row_artifacts=true is the point of this sweep: per-example CSV with
+# presence_pos / presence_neg (the detector's raw scores), bit_accuracy,
+# attack_sisnr and the x / x_wm / x_att .wav files, under
+# eval_outputs/<label>_<attack>_rows/. Those raw scores are what let us
+# report the pos/neg separation, not just the rank-based AUC that made the
+# HSJ numbers so misleading.
+command: >-
+  bash azureml/aml_run.sh eval
+  --librispeech ${{inputs.librispeech}}
+  --generators ${{inputs.generators}}
+  --artifacts ${{outputs.artifacts}}
+  --generator generator_epoch18.pth
+  --label fb_finetuned_audioldm_epoch18
+  --
+  batch_size=8
+  n_eval_batches=125
+  segment_duration=3.0
+  eval_attacks=[identity]
+  held_out_attacks=[gaussian_noise,lowpass,quantization,speed,pgd,codec_mp3,codec_opus]
+  save_row_artifacts=true
+  tracking.backend=mlflow
+
+environment_variables:
+  PYTHONUNBUFFERED: "1"
+  AZUREML_ARTIFACTS_DEFAULT_TIMEOUT: "1200"
+limits:
+  # 4h. Every attack here is a fixed number of batched passes -- 9 passes over
+  # 1000 examples, of which only PGD (20 forward+backward per batch) and the
+  # two codecs (an ffmpeg round-trip per example) are more than trivial DSP.
+  # The margin covers a slower node without letting a hung job burn a day.
+  timeout: 14400

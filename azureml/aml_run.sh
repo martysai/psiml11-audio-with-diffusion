@@ -38,7 +38,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
 usage() {
-  echo "usage: bash azureml/aml_run.sh <audioldm|sgmse> --librispeech DIR --checkpoints DIR --artifacts DIR [--train-dir DIR] [--valid-dir DIR] [--eval-dir DIR] [-- overrides...]" >&2
+  echo "usage: bash azureml/aml_run.sh <audioldm|sgmse|eval> --librispeech DIR --checkpoints DIR --artifacts DIR [--train-dir DIR] [--valid-dir DIR] [--eval-dir DIR] [--generators DIR] [--generator NAME] [--label NAME] [-- overrides...]" >&2
   exit 2
 }
 
@@ -49,11 +49,19 @@ shift
 LIBRISPEECH=""
 CHECKPOINTS=""
 ARTIFACTS=""
+# direction=eval only. --generators is the mounted model asset holding the
+# fine-tuned .pth files; --generator selects one by filename within it. Left
+# empty, evaluate.py's own default (the stock audioseal_wm_16bits card) stands,
+# which is exactly the baseline arm.
+GENERATORS=""
+GENERATOR_NAME=""
+LABEL_ARG=""
 # Per-split overrides. These are CLI flags rather than environment variables
 # because AzureML only expands ${{inputs.*}} inside a job's `command` -- set
 # one in `environment_variables` and the container receives the literal
 # string "${{inputs.trainfixed}}/...", which is exactly how
-# <redacted-run> failed. Passing them here puts them in
+# A prior job failed when these values were passed through the environment.
+# Passing them here puts them in
 # the command, where substitution happens.
 TRAIN_DIR_ARG=""
 VALID_DIR_ARG=""
@@ -66,12 +74,22 @@ while [ $# -gt 0 ]; do
     --train-dir)   TRAIN_DIR_ARG="${2:?--train-dir needs a value}"; shift 2 ;;
     --valid-dir)   VALID_DIR_ARG="${2:?--valid-dir needs a value}"; shift 2 ;;
     --eval-dir)    EVAL_DIR_ARG="${2:?--eval-dir needs a value}";   shift 2 ;;
+    --generators)  GENERATORS="${2:?--generators needs a value}";   shift 2 ;;
+    --generator)   GENERATOR_NAME="${2:?--generator needs a value}"; shift 2 ;;
+    --label)       LABEL_ARG="${2:?--label needs a value}";         shift 2 ;;
     --)            shift; break ;;
     *)             echo "unknown argument: $1" >&2; usage ;;
   esac
 done
-[ -n "$LIBRISPEECH" ] && [ -n "$CHECKPOINTS" ] && [ -n "$ARTIFACTS" ] || usage
-# Everything still in "$@" is forwarded verbatim to train.py.
+case "$DIRECTION" in
+  eval)
+    # No diffusion backbone is loaded, so --checkpoints is optional here.
+    [ -n "$LIBRISPEECH" ] && [ -n "$ARTIFACTS" ] || usage ;;
+  *)
+    [ -n "$LIBRISPEECH" ] && [ -n "$CHECKPOINTS" ] && [ -n "$ARTIFACTS" ] || usage ;;
+esac
+# Everything still in "$@" is forwarded verbatim to train.py (or, for
+# direction=eval, to evaluate.py).
 
 # --- Absorb mount-layout ambiguity ------------------------------------------
 # Registering a folder as a uri_folder/custom_model asset does not guarantee
@@ -89,7 +107,14 @@ descend_to() {  # descend_to <root> <expected-child> -- echoes the right level
 }
 
 DATA_ROOT="$(descend_to "$LIBRISPEECH" "train-clean-100")"
-CKPT_ROOT="$(descend_to "$CHECKPOINTS" "audioldm")"
+# An eval-only job may be handed a data asset that has no train-clean-100 at
+# all (the eval split is the only one it reads), in which case descend_to
+# returns the root unchanged -- which is right, but only if test-clean is
+# there. Retry on the split this direction actually opens.
+if [ "$DIRECTION" = "eval" ] && [ ! -d "$DATA_ROOT/test-clean" ]; then
+  DATA_ROOT="$(descend_to "$LIBRISPEECH" "test-clean")"
+fi
+CKPT_ROOT="$(descend_to "${CHECKPOINTS:-$LIBRISPEECH}" "audioldm")"
 
 # --- Discover the actual checkpoint filenames -------------------------------
 # Not hardcoded: the AudioLDM release ships the latent checkpoint under
@@ -109,6 +134,22 @@ ALDM_CKPT="${ALDM_CKPT_OVERRIDE:-${aldm_cands[0]:-$CKPT_ROOT/audioldm/data/check
 # that order ever changes.
 ALDM_CONFIG="$REPO_ROOT/src/audioldm_train/config/2023_08_23_reproduce_audioldm/audioldm_original.yaml"
 
+# --- Resolve the generator under test (direction=eval) ----------------------
+# Empty GENERATOR_NAME means the stock AudioSeal card, which evaluate.py's
+# config already defaults to -- that is the baseline arm, not a missing value.
+GENERATOR_PATH=""
+if [ -n "$GENERATOR_NAME" ]; then
+  [ -n "$GENERATORS" ] || { echo "--generator needs --generators (the mounted model asset)" >&2; exit 1; }
+  # The asset is a flat folder of .pth files, so locate the file itself rather
+  # than using descend_to, which keys off an expected child *directory*.
+  GENERATOR_PATH="$(find "$GENERATORS" -name "$GENERATOR_NAME" -type f -print -quit 2>/dev/null || true)"
+  if [ -z "$GENERATOR_PATH" ]; then
+    echo "generator '$GENERATOR_NAME' not found under $GENERATORS" >&2
+    echo "  available: $(find "$GENERATORS" -name '*.pth' -type f -printf '%f ' 2>/dev/null)" >&2
+    exit 1
+  fi
+fi
+
 # --- Writable scratch for caches --------------------------------------------
 SCRATCH="${AZ_BATCHAI_JOB_TEMP_DIR:-${TMPDIR:-/tmp}}/audioseal-robust"
 export HF_HOME="$SCRATCH/hf"
@@ -118,12 +159,17 @@ export XDG_CACHE_HOME="$SCRATCH/cache"
 mkdir -p "$HF_HOME" "$TORCH_HOME" "$MPLCONFIGDIR" "$XDG_CACHE_HOME"
 
 # --- Preflight (fails the job in seconds, not hours) ------------------------
-PYTHONPATH="$REPO_ROOT/src" python3 azureml/preflight.py \
-  --direction "$DIRECTION" \
-  --data-root "$DATA_ROOT" \
-  --sgmse-checkpoint "$SGMSE_CKPT" \
-  --audioldm-checkpoint "$ALDM_CKPT" \
-  --audioldm-config "$ALDM_CONFIG"
+preflight_args=(--direction "$DIRECTION" --data-root "$DATA_ROOT")
+if [ "$DIRECTION" = "eval" ]; then
+  [ -n "$GENERATOR_PATH" ] && preflight_args+=(--generator "$GENERATOR_PATH")
+else
+  preflight_args+=(
+    --sgmse-checkpoint "$SGMSE_CKPT"
+    --audioldm-checkpoint "$ALDM_CKPT"
+    --audioldm-config "$ALDM_CONFIG"
+  )
+fi
+PYTHONPATH="$REPO_ROOT/src" python3 azureml/preflight.py "${preflight_args[@]}"
 
 # --- Wire run_diffusion_swap.sh's env-var contract --------------------------
 # Each split can be overridden with --train-dir/--valid-dir/--eval-dir. That
@@ -180,12 +226,8 @@ mkdir -p "$CHECKPOINT_DIR"
 #           hangs until its timeout rather than failing -- strictly worse than
 #           logging to stdout.
 #   mlflow  the default inside any AzureML job. MLflow's tracking URI is
-#           injected by the runtime, so metrics land on the Studio run with no
-#           outbound network access at all. This is the ONLY correct choice on
-#           a compliant cluster (managed compute): wandb is an external
-#           endpoint, and tracking.py's WandbTracker uploads audio samples and
-#           figures, not just scalars -- that is training data leaving the
-#           compliance boundary, not just telemetry.
+#           injected by the runtime, so metrics land on the Studio run without
+#           requiring a third-party tracking service.
 #   none    outside AML with no key: console logging.
 #
 # Set TRACKING_BACKEND explicitly to override the detection.
@@ -224,7 +266,7 @@ case "$TRACKING_BACKEND" in
     if [ -n "${AZUREML_RUN_ID:-}" ]; then
       tracking_args+=(tracking.run_name="$AZUREML_RUN_ID")
     fi
-    echo "tracking: mlflow -> the AzureML run (no external egress)"
+    echo "tracking: mlflow -> the AzureML run"
     ;;
   none)
     tracking_args+=(tracking.backend=none)
@@ -300,6 +342,37 @@ echo "tracking backend     : $TRACKING_BACKEND"
 echo "launcher             : $LAUNCHER (NPROC=$NPROC)"
 echo "train.py overrides   : $* ${tracking_args[*]}"
 echo "=============================================================="
+
+# --- direction=eval: no training, evaluate an existing generator ------------
+# run_diffusion_swap.sh always trains first and then evaluates the checkpoint
+# it just produced, so it cannot score an already-trained generator. Call
+# evaluate.py directly instead, reusing everything above (mount resolution,
+# preflight, caches, tracking, the collect trap).
+if [ "$DIRECTION" = "eval" ]; then
+  # $LAUNCHER carries arguments ("torchrun --standalone --nproc_per_node=4"),
+  # so it has to word-split -- same treatment run_diffusion_swap.sh gives it.
+  read -ra launcher_eval <<< "${LAUNCHER:-python3}"
+  eval_args=(
+    eval_dir="$EVAL_DIR"
+    device=cuda
+  )
+  [ -n "$LABEL_ARG" ] && eval_args+=(label="$LABEL_ARG")
+  # Unset = evaluate.py's default generator_checkpoint, the stock
+  # audioseal_wm_16bits card. That IS the baseline arm.
+  [ -n "$GENERATOR_PATH" ] && eval_args+=(generator_checkpoint="$GENERATOR_PATH")
+
+  echo "generator under test : ${GENERATOR_PATH:-<stock audioseal_wm_16bits>}"
+  echo "evaluate.py overrides: ${eval_args[*]} ${tracking_args[*]} $*"
+  echo "=============================================================="
+
+  # "$@" last so a config's overrides beat these defaults.
+  MPLBACKEND=Agg PYTHONPATH=src "${launcher_eval[@]}" -m audioseal_robust.evaluate \
+    "${eval_args[@]}" \
+    "${tracking_args[@]}" \
+    "$@"
+  echo "Done -- see \$ARTIFACTS/eval_outputs for metrics, plots and per-sample rows."
+  exit 0
+fi
 
 # `bash`, not ./ -- run_diffusion_swap.sh is mode 100644 in git (unlike
 # run_smoke_eval.sh at 100755), so it is not executable in the snapshot.

@@ -1,0 +1,99 @@
+$schema: https://azuremlschemas.azureedge.net/latest/commandJob.schema.json
+
+# az ml job create -f azureml/jobs/eval_hsj_baseline_cluster.yaml \
+#   --set compute=azureml:<compute-name>
+#
+# Arm 1 of 3. Stock AudioSeal generator + stock detector, under HopSkipJump.
+# The other two arms (eval_hsj_sgmse_epoch3_cluster.yaml,
+# eval_hsj_audioldm_epoch18_cluster.yaml) are identical to this file except
+# for the generator input, --generator, --label and display_name -- that is
+# deliberate, so any difference in the numbers is attributable to the
+# generator alone. Change a protocol knob here and change it in all three.
+#
+type: command
+
+experiment_name: audioseal-robust-hsj-eval
+display_name: hsj-eval-baseline
+description: >-
+  HopSkipJump robustness evaluation of the STOCK AudioSeal watermark
+  (audioseal_wm_16bits + audioseal_detector_16bits), 400 positives + 400
+  negatives, with per-sample detector scores written to rows.csv.
+
+code: ../..
+environment: azureml:audioseal-robust-diffusion@latest
+
+compute: azureml:gpu-cluster
+
+resources:
+  # HopSkipJump is sequential; use a single-GPU compute target.
+  instance_count: 1
+  shm_size: 64g
+
+inputs:
+  librispeech:
+    type: uri_folder
+    path: azureml:librispeech-asr:1
+    # download, not ro_mount -- data.py:WavDirDataset walks the tree once per
+    # audio extension per split, and directory listings over blobfuse are
+    # network round-trips.
+    mode: download
+  # No `checkpoints` input: identity and hopskipjump load no diffusion
+  # backbone, so mounting the 10.9 GB asset would only add startup latency.
+  # No `generators` input either -- this arm evaluates the stock AudioSeal
+  # card, which needs no file.
+
+outputs:
+  artifacts:
+    type: uri_folder
+    # rw_mount so per-sample rows and .wav artifacts land incrementally rather
+    # than only on a clean exit.
+    mode: rw_mount
+
+# Overrides after `--` go to evaluate.py (EvalConfig in
+# src/audioseal_robust/config.py).
+#
+# 50 x 8 = 400 positives + 400 negatives. fpr_target=0.01 needs >=100
+# negatives to resolve at all and ~1000 to be stable, so 400 is a deliberate
+# compromise -- evaluate.py reports fpr_support alongside the number so the
+# caveat travels with the result.
+#
+# identity measures the clean operating point (and the perceptual PESQ /
+# SI-SNR baseline); hopskipjump is the actual attack, held out because it was
+# never trained against. attack.hopskipjump.checkpoint=auto is purely an
+# enable gate -- HopSkipJump needs no weights file.
+#
+# The query budget (num_iterations / init_num_evals / max_num_evals /
+# init_max_trials) matches the reference run. Lowering any of them makes the
+# attack weaker and the watermark look more robust than it is.
+#
+# save_row_artifacts=true is the point of this sweep: per-example CSV with
+# presence_pos / presence_neg (the detector's raw scores), bit_accuracy,
+# attack_sisnr and the x / x_wm / x_att .wav files, under
+# eval_outputs/<label>_hopskipjump_rows/.
+command: >-
+  bash azureml/aml_run.sh eval
+  --librispeech ${{inputs.librispeech}}
+  --artifacts ${{outputs.artifacts}}
+  --label hsj_baseline
+  --
+  batch_size=8
+  n_eval_batches=50
+  segment_duration=3.0
+  eval_attacks=[identity]
+  held_out_attacks=[hopskipjump]
+  attack.hopskipjump.checkpoint=auto
+  attack.hopskipjump.num_iterations=25
+  attack.hopskipjump.init_num_evals=20
+  attack.hopskipjump.max_num_evals=100
+  attack.hopskipjump.init_max_trials=300
+  save_row_artifacts=true
+  tracking.backend=mlflow
+
+environment_variables:
+  PYTHONUNBUFFERED: "1"
+  AZUREML_ARTIFACTS_DEFAULT_TIMEOUT: "1200"
+limits:
+  # 6h. HopSkipJump costs hundreds of detector forward passes PER WAVEFORM;
+  # the reference run of exactly this protocol took 1.7h on one A100. The
+  # margin covers a slower node without letting a hung job burn a day.
+  timeout: 21600

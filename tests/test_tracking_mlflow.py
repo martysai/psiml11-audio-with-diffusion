@@ -66,7 +66,7 @@ def azureml_run(tracking_uri, clean_mlflow_state, monkeypatch):
     mlflow.set_tracking_uri(tracking_uri)
     client = mlflow.tracking.MlflowClient(tracking_uri)
     experiment_id = client.create_experiment(f"azureml-owned-{uuid.uuid4().hex[:8]}")
-    run = client.create_run(experiment_id, run_name="train-audioldm-cluster-0814")
+    run = client.create_run(experiment_id, run_name="train-audioldm-distributed")
     monkeypatch.setenv("MLFLOW_RUN_ID", run.info.run_id)
     return client, experiment_id, run
 
@@ -97,7 +97,7 @@ def test_does_not_rename_the_ambient_run(azureml_run, tracking_uri):
     MLflowTracker(OUR_EXPERIMENT, "a-different-run-name", tracking_uri, {}).finish()
 
     after = client.get_run(run.info.run_id)
-    assert after.data.tags.get("mlflow.runName") == "train-audioldm-cluster-0814"
+    assert after.data.tags.get("mlflow.runName") == "train-audioldm-distributed"
 
 
 def test_finish_does_not_end_a_run_it_does_not_own(azureml_run, tracking_uri):
