@@ -51,8 +51,10 @@ Two fine-tuned generators are on the Hub, grouped in
 | [`msaidov/audioseal-robust-audioldm-16bits`](https://huggingface.co/msaidov/audioseal-robust-audioldm-16bits) | AudioLDM (latent-diffusion resynthesis), 50/50 with identity | SGMSE, MBD | full `train-clean-100` |
 
 Both are 16 kHz, 16-bit payload, and work with the **stock**
-`audioseal_detector_16bits` detector. Each repo ships the exact training config
-read back out of the checkpoint itself.
+`audioseal_detector_16bits` detector. The published `generator.pth` files are
+portable AudioSeal checkpoints, so consumers only need the upstream `audioseal`
+package; the raw training checkpoints are preserved separately as
+`generator_train_ckpt.pth`.
 
 ## Quickstart: watermark audio with a robust generator
 
@@ -67,21 +69,8 @@ from huggingface_hub import hf_hub_download
 
 REPO = "msaidov/audioseal-robust-sgmse-16bits"   # or ...-audioldm-16bits
 
-# 1. Build the stock architecture, then load our fine-tuned weights over it.
-generator = AudioSeal.load_generator("audioseal_wm_16bits", nbits=16)
-state = torch.load(hf_hub_download(REPO, "generator.pth"),
-                   map_location="cpu", weights_only=False)["model"]
-
-# Checkpoints carry either flat or `inner_conv`-wrapped conv keys depending on
-# which Python trained them (AudioCraft SEANet <3.10 vs. Moshi SEANet >=3.10).
-model_inner = any(".inner_conv." in k for k in generator.state_dict())
-ckpt_inner = any(".inner_conv." in k for k in state)
-if model_inner and not ckpt_inner:
-    from audioseal.loader import convert_state_dict_for_scriptable_model
-    state = convert_state_dict_for_scriptable_model(state)
-elif ckpt_inner and not model_inner:
-    state = {k.replace(".inner_conv.", "."): v for k, v in state.items()}
-generator.load_state_dict(state)
+# 1. Load the published portable generator checkpoint.
+generator = AudioSeal.load_generator(hf_hub_download(REPO, "generator.pth"))
 
 # 2. Watermark a 16 kHz mono clip.
 wav, sr = torchaudio.load("speech.wav")          # (channels, samples)
@@ -207,7 +196,9 @@ Recipes ([`config/recipes.yaml`](src/audioseal_robust/config/recipes.yaml)):
 | `sgmse_audioldm_mixed` | 0.5 / 0.25 / 0.25 | trains against **both**, since robustness did not transfer between them zero-shot |
 
 Checkpoints land in a timestamped subfolder as `generator_epochN.pth`, each
-storing `{"model": state_dict, "xp.cfg": config}`.
+storing `{"model": state_dict, "xp.cfg": config}`. Raw training checkpoints are
+not publishable as-is; see [`docs/PUBLISHING.md`](docs/PUBLISHING.md) for the
+export step that produces portable AudioSeal checkpoints.
 
 **Multi-GPU** is DDP via `torchrun`, and single-GPU behaviour is unchanged
 (every distributed helper is a no-op at `world_size=1`):
@@ -265,7 +256,7 @@ src/audioseal/          AudioSeal generator/detector (from facebookresearch/audi
 src/sgmse/              vendored SGMSE score model            (see VENDORED.md)
 src/audioldm_train/     vendored AudioLDM latent diffusion    (see VENDORED.md)
 azureml/                Azure ML environment, data assets, job specs
-docs/                   MULTI_GPU.md (this pipeline); TRAINING.md (upstream AudioSeal/Dora)
+docs/                   MULTI_GPU.md; PUBLISHING.md; TRAINING.md (upstream AudioSeal/Dora)
 tests/                  pytest suite, incl. real multi-process torchrun workers
 run_*.sh                ready-made launchers (smoke, 10h, 100h, 4-GPU, eval sweeps)
 ```

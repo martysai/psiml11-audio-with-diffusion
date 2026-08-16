@@ -65,6 +65,7 @@ from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
 
 from audioseal import AudioSeal
+from audioseal.loader import align_state_dict_to_model
 from audioseal.models import AudioSealDetector, AudioSealWM
 
 from .attacks import (
@@ -216,7 +217,12 @@ def build_generator(cfg: TrainConfig, device: torch.device) -> AudioSealWM:
     generator = AudioSeal.load_generator(cfg.generator.checkpoint, nbits=cfg.nbits, device=device)
     if cfg.generator.resume_from:
         state = torch.load(cfg.generator.resume_from, map_location=device, weights_only=False)
-        generator.load_state_dict(state["model"])
+        # Not a bare load_state_dict: the checkpoint carries whichever conv
+        # naming the interpreter that *wrote* it used (flat below Python 3.10,
+        # "inner_conv"-wrapped at or above -- see builder.py), which need not be
+        # this one's. Resuming an AzureML run on Colab, or vice versa, otherwise
+        # fails with Missing/Unexpected key(s) on every conv layer.
+        generator.load_state_dict(align_state_dict_to_model(generator, state["model"]))
         logger.info("resumed generator weights from %s", cfg.generator.resume_from)
     generator.train()
     return generator

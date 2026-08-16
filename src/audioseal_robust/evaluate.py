@@ -61,7 +61,7 @@ from omegaconf import OmegaConf
 from tqdm import tqdm
 
 from audioseal import AudioSeal
-from audioseal.loader import convert_state_dict_for_scriptable_model
+from audioseal.loader import align_state_dict_to_model
 from audioseal.loader import load_state_dict as audioseal_load_state_dict
 from audioseal.models import AudioSealDetector, AudioSealWM
 
@@ -218,39 +218,15 @@ def load_generator_under_test(checkpoint: str, nbits: int, device: torch.device)
         logger.info("loading fine-tuned generator from %s", path)
         state = torch.load(path, map_location=device, weights_only=False)
         generator = build_untrained_generator(nbits=nbits, device=device)
-        # Same conversion AudioSeal.load_generator/load_detector apply
-        # internally (see loader.py) before their own load_state_dict call --
-        # train.py's checkpoints (torch.save({"model": generator.state_dict()...}))
-        # can use either the pre-torchscripting-update flat conv naming
-        # (".conv.weight"/".conv.bias", saved by a Python <3.10 process) or
-        # this Python (>=3.10) build's Moshi-based SEANet naming (wrapped in
-        # an extra "inner_conv" level, see builder.py's Python-version
-        # SEANet selection) -- whichever Python trained the checkpoint.
-        # convert_state_dict_for_scriptable_model only ever converts
-        # flat->inner_conv (and only running on Python >=3.10), so it can't
-        # fix the reverse case (an inner_conv checkpoint loaded by a
-        # Python <3.10 build, which only has flat convs) -- confirmed by
-        # hand: raised "Missing/Unexpected key(s)" for every conv layer with
-        # a checkpoint saved on a newer Python than the eval process. Decide
-        # the direction from the actual model/checkpoint keys instead of
-        # inferring it from sys.version_info, so this works regardless of
-        # which Python trained vs. which Python is evaluating.
-        raw_state_dict = state["model"]
-        model_has_inner_conv = any(
-            ".inner_conv." in k for k in generator.state_dict().keys()
+        # train.py writes whichever conv naming the *training* interpreter's
+        # SEANet used (flat below Python 3.10, "inner_conv"-wrapped at or above
+        # it -- see builder.py), and this eval process may well be on the other
+        # side of that split. align_state_dict_to_model reconciles both
+        # directions off the actual keys; see its docstring for why
+        # convert_state_dict_for_scriptable_model alone is not enough.
+        audioseal_load_state_dict(
+            generator, align_state_dict_to_model(generator, state["model"])
         )
-        checkpoint_has_inner_conv = any(
-            ".inner_conv." in k for k in raw_state_dict.keys()
-        )
-        if model_has_inner_conv and not checkpoint_has_inner_conv:
-            state_dict = convert_state_dict_for_scriptable_model(raw_state_dict)
-        elif checkpoint_has_inner_conv and not model_has_inner_conv:
-            state_dict = {
-                k.replace(".inner_conv.", "."): v for k, v in raw_state_dict.items()
-            }
-        else:
-            state_dict = raw_state_dict
-        audioseal_load_state_dict(generator, state_dict)
         return generator
     logger.info("loading generator checkpoint/card %r", checkpoint)
     return AudioSeal.load_generator(checkpoint, nbits=nbits, device=device)
