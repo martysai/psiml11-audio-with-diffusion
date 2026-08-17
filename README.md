@@ -281,6 +281,18 @@ This project's own code is MIT. It vendors, unmodified except where each
 No third-party model weights are redistributed here or in the released
 checkpoints; SGMSE and AudioLDM are used strictly as training-time attacks.
 
+## Team
+
+**Students**
+
+1. Đurđina Filipović
+2. Ana Karalazić
+
+**Mentors**
+
+1. Marat Saidov
+2. Viliana Devbunova
+
 ## Acknowledgements
 
 Built as a student project at **[PSIML 11](https://psiml.pfe.rs/)** — Practical
